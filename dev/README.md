@@ -13,6 +13,8 @@ State lives in `<git-common-dir>/artel-dev/` (`board.json`, `journal.md`, `curso
     python3 dev/board.py integrate ID --branch B --session S  # ID must be claimed by S; fetch, merge --no-ff into main, run tests/, push; rolls back on failure, Ctrl-C or SIGTERM
     python3 dev/board.py ci [--sha SHA]                       # all runs of the sha on main: 0 all ok, 1 any failed, 2 no run yet, 4 pending, 5 error
     python3 dev/board.py done ID [--sha S]                    # mark done by hand (controller tasks: 16, 25)
+    python3 dev/board.py reopen ID --reason R [--session S]  # done/stuck -> open (red CI, review findings after merge); dependents wait again
+    python3 dev/board.py init --from docs/plan.md --refresh   # after a plan edit: re-read titles, waves, deps, line ranges; keep task states; new tasks open
 
 Plan format: `### Task N: title` headings (`**RISKY ...**` in the title or bold in the wave table = risky) plus the `| Wn | ... |` wave table. Deps: every task of the previous wave, plus `a -> b` chains in a wave cell; a `**Depends on:** Task 3, 4` line in a task section overrides. "controller task" titles are never claimed by peers.
 `integrate` works in the main worktree (first in `git worktree list`): on `main`, no tracked changes (untracked ignored), equal to `origin/main` after `git fetch` (else it refuses and prints the fix). Integrations hold their own lock, so `claim`/`note` stay responsive while tests run (timeout 20 min, whole process group killed). Network git calls time out after 120 s.

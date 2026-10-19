@@ -283,6 +283,88 @@ class ReleaseFail(TmpCase):
         self.assertIn("A FAIL T1: tests red", j)
 
 
+class ReopenRefresh(TmpCase):
+    def test_reopen_done_task_blocks_dependents_again(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "done", "1", "--sha", "abc", expect=0)
+        cli(self.repo, "reopen", "1", "--reason", "CI red on win",
+            "--session", "main", expect=0)
+        t = self.tasks()[1]
+        self.assertEqual((t["state"], t["merge_sha"]), ("open", None))
+        r = cli(self.repo, "claim", "--session", "B", expect=0)
+        self.assertIn("id: 1", r.stdout)
+        self.assertIn("main REOPEN T1: CI red on win",
+                      (self.store() / "journal.md").read_text())
+
+    def test_reopen_refuses_open_and_claimed(self):
+        self.init()
+        cli(self.repo, "reopen", "1", "--reason", "x", expect=1)
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "reopen", "1", "--reason", "x", expect=1)
+
+    def test_reopen_stuck_resets_fails(self):
+        self.init()
+        for s in ("A", "B"):
+            cli(self.repo, "claim", "--session", s, expect=0)
+            cli(self.repo, "fail", "1", "--reason", "red", expect=0)
+        self.assertEqual(self.tasks()[1]["state"], "stuck")
+        cli(self.repo, "reopen", "1", "--reason", "owner fixed plan", expect=0)
+        self.assertEqual(self.tasks()[1]["fails"], 0)
+
+    def test_reopen_warns_about_claimed_dependents(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "done", "1", expect=0)
+        cli(self.repo, "claim", "--session", "A", expect=0)  # T2
+        r = cli(self.repo, "reopen", "1", "--reason", "x", expect=0)
+        self.assertIn("T2 claimed", r.stderr)
+
+    def test_refresh_keeps_states_and_adds_tasks(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "done", "1", "--sha", "abc", expect=0)
+        cli(self.repo, "claim", "--session", "A", expect=0)  # T2
+        plan = FAKE_PLAN.replace("| W2 | **2 Second** · 3 Third |",
+                                 "| W2 | **2 Second** · 3 Third · 6 Fix |")
+        plan = plan.replace("## Review routing",
+                            "### Task 6: Fix of one\n\nbody six\n\n"
+                            "## Review routing")
+        plan = "intro line\n" + plan
+        (self.repo / "docs" / "plan.md").write_text(plan)
+        r = cli(self.repo, "init", "--from", "docs/plan.md", "--refresh",
+                expect=0)
+        self.assertIn("added T6", r.stdout)
+        t = self.tasks()
+        self.assertEqual((t[1]["state"], t[1]["merge_sha"]), ("done", "abc"))
+        self.assertEqual((t[2]["state"], t[2]["session"]), ("claimed", "A"))
+        self.assertEqual(t[6]["state"], "open")
+        self.assertIn(6, t[4]["deps"])
+        old = board.parse_plan(FAKE_PLAN)[0]["plan_lines"]
+        self.assertEqual(t[1]["plan_lines"], [old[0] + 1, old[1] + 1])
+        self.assertIn("PLAN T-: board refreshed",
+                      (self.store() / "journal.md").read_text())
+
+    def test_refresh_refuses_to_drop_a_non_open_task(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        plan = FAKE_PLAN.replace("| W1 | 1 First |\n", "")
+        plan = plan.replace("deps", "deps")
+        self.assertIn("### Task 1:", plan)
+        start = plan.index("### Task 1:")
+        plan = plan[:start] + plan[plan.index("### Task 2:"):]
+        (self.repo / "docs" / "plan.md").write_text(plan)
+        r = cli(self.repo, "init", "--from", "docs/plan.md", "--refresh",
+                expect=1)
+        self.assertIn("T1", r.stderr)
+        self.assertEqual(self.tasks()[1]["state"], "claimed")
+
+    def test_force_and_refresh_are_exclusive(self):
+        self.init()
+        cli(self.repo, "init", "--from", "docs/plan.md", "--force",
+            "--refresh", expect=2)
+
+
 class Notes(TmpCase):
     def test_note_format_and_limits(self):
         self.init()
