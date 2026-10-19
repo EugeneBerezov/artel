@@ -111,9 +111,12 @@ def _resolve(spec: str):
     module_name, _, func_name = spec.partition(":")
     try:
         module = importlib.import_module(module_name)
-        return getattr(module, func_name)
-    except (ImportError, AttributeError):
-        return None
+    except ModuleNotFoundError as exc:
+        # only "the target itself is missing"; a broken import inside it is a real bug
+        if exc.name and (module_name == exc.name or module_name.startswith(exc.name + ".")):
+            return None
+        raise
+    return getattr(module, func_name, None)
 
 
 def main(argv: list[str] | None = None) -> int:
