@@ -252,16 +252,22 @@ common:  claude -p --model {model} --output-format stream-json --verbose
          --disable-slash-commands --strict-mcp-config
          --exclude-dynamic-system-prompt-sections
          --append-system-prompt-file {unattended_notice}
+         (prompt on stdin: the variadic --allowedTools/--disallowedTools
+          flags swallow a positional prompt)
 writer:  --permission-mode acceptEdits
          --allowedTools "Bash(artel note *) Bash(artel add *) Bash(artel heavy *)
                          Bash(git add *) Bash(git commit *) Bash(git status *)
                          Bash(git diff *)" {project_tools}
 reviewer/attacker:
+         --permission-mode default
          --disallowedTools "Edit Write NotebookEdit"
          --allowedTools "Bash(artel note *) Bash(git diff *) Bash(git log *)
                          Bash(git show *) Bash(git status *)" {project_read_tools}
 ```
 
+Every profile passes `--permission-mode` explicitly: `-p` inherits the
+user's `defaultMode` from `~/.claude/settings.json`, and in `auto` mode a
+reviewer could write files through shell redirection (spike Q4).
 With `--permission-prompts none` anything not allowed is denied, so the
 project lists its check commands. artel never defaults to
 `bypassPermissions`. Allowing a command that runs project scripts
@@ -438,6 +444,17 @@ Order of work: a live spike first (§14), then board + CLI, runner + slots,
 stages + transitions, verify + integrate, notifier.
 
 ## 14. Live checks before code (spike)
+
+Done 2026-10-19 — results in `docs/spike-2026-10-19.md`: structured result in
+`result.structured_output` (two turns minimum); one `rate_limit_event` per
+run with `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`;
+`--append-system-prompt-file` works in `-p`; reviewer read-only only with
+`--permission-mode default`; writer edits and commits in
+`.claude/worktrees/artel-<n>`; first-call cache creation ≈ 27.5k tokens with
+the lean profile (≈ 19 % less than default), ≈ 10× cheaper when cached.
+Question 7 is open: test with a throwaway `CLAUDE.md` that demands approval.
+
+Original questions:
 
 On a real Claude Code (≥ 2.1.304) run, record:
 1. Whether `--json-schema` works together with `--output-format stream-json`,
