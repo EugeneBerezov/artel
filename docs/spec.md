@@ -68,7 +68,7 @@ outbound HTTPS to the configured notifier.
 
 ### 3.1 Task states and transitions
 
-States: `proposed`, `open`, `attacking`, `writing`, `reviewing`, `fixing`,
+States: `proposed`, `vetting`, `awaiting_approval`, `open`, `attacking`, `writing`, `reviewing`, `fixing`,
 `verifying`, `verified`, `blocked`, `awaiting_accept`, `done`, `rejected`,
 `stuck`. A stage state (`attacking` … `verifying`) means the stage is **due**;
 a separate `running` flag (agent or command pid) says it is in progress.
@@ -80,7 +80,14 @@ counter. Every transition not in the table is an error and is not taken.
 |---|---|---|---|
 | — | `add` by a human | open | |
 | — | `add` by an agent (`artel add`) | proposed | |
-| proposed | `approve` | open | |
+| proposed | picked | vetting | |
+| vetting | adequate, not risky, `autoapprove` allows | open | |
+| vetting | adequate, risky | attacking (`then=awaiting_approval`) | |
+| vetting | adequate, `autoapprove = "none"` | awaiting_approval | |
+| vetting | inadequate | rejected | reason recorded; `approve` still allowed |
+| vetting | `fail`, invalid result, timeout | same state | `attempts += 1`; `stuck` at the cap |
+| attacking (`then=awaiting_approval`) | done without blocker | awaiting_approval | summaries attached |
+| proposed, awaiting_approval, rejected (by vet) | `approve` | open | |
 | proposed, open, blocked, stuck, awaiting_accept | `reject` | rejected | branch deleted |
 | open | picked, task has `--attack` | attacking | |
 | open | picked, no `--attack` | writing | |
@@ -168,8 +175,9 @@ otherwise a fresh agent starts:
   fresh writer per task) is not yet reached;
 - for a new task: it is in the same area as the session's last task when
   `same_area_only = true` (default);
-- the session's current context (input + cache tokens of its last API call,
-  read from the stream) is below `writer_max_context` (default 60 000 tokens);
+- if `writer_max_context` is set, the session's current context (input +
+  cache tokens of its last API call, read from the stream) is below it. It is
+  **unset by default**: no number is assumed before it is measured;
 - the same slot is free (Claude Code stores sessions per working directory),
   and the session can still be resumed — a failed resume falls back to fresh.
 
@@ -177,6 +185,30 @@ Reviewers and attackers are **always** fresh, not configurable: their value
 is independence from the writer. Every continuation and every rotation is
 recorded with its reason (`artel show`: "fix resumed writer session: same
 slot, context 41k < 60k").
+
+**Measuring before choosing.** artel records, per stage, the context size of
+the first and last API call, turns, duration and usage. `artel stats` prints
+medians and 90th percentiles per stage kind and model, and what a continued
+session would have cost versus a fresh one on the recorded tasks. Thresholds
+(`writer_max_context`, `strong_diff_lines`, `stage_timeout`) are chosen from
+these numbers; `artel init` shows the current defaults and asks for the key
+policies (agents, review model, rotation, auto-approval) instead of setting
+them silently.
+
+**Vetting proposed tasks.** Every `proposed` task (added by an agent; in
+v0.2 also by the planner) first gets a `vet` stage: a fresh agent (`review`
+model) checks adequacy in the spirit of a reflection pass — is the task
+needed, is it a duplicate of an open or done task, does it contradict the
+project's recorded decisions, is its scope sane, and is it **risky** (any of
+`risk_signals`, default: deletes data, touches quotas or money, changes a
+protocol or public contract, is visible to end users). Outcomes:
+- inadequate → `rejected` with the reason (the human can still `approve`);
+- adequate, not risky, `autoapprove = "non_risky"` (default) → `open`;
+- adequate and risky → `attacking` (strong model), then `awaiting_approval`
+  with the vet and attack summaries; the human runs `artel approve` or
+  `reject`.
+`autoapprove = "none"` sends every adequate task to `awaiting_approval`;
+`"all"` opens adequate risky tasks too (after the attack).
 
 **Minor findings** never block. They stay in the task record (`artel show`);
 with `propose_minors = true` they also become `proposed` tasks.
@@ -364,10 +396,12 @@ slots_dir = ".claude/worktrees"   # relative to the main worktree
 slot_keep = ["node_modules"]
 log_keep_tasks = 50
 propose_minors = false
+autoapprove = "non_risky"         # "none" | "non_risky" | "all" — for proposed tasks, after vetting
+risk_signals = ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"]
 
 [rotation]                        # writers only; reviewers are always fresh
 writer_max_tasks = 1              # 1 = fresh writer for every task
-writer_max_context = 60000        # tokens; rotate to a fresh agent above this
+writer_max_context = 0            # tokens; 0 = no threshold (default until measured, see `artel stats`)
 same_area_only = true             # continue only within the same area
 fix_resumes_writer = true         # review fixes continue the writer's session
 
@@ -495,7 +529,16 @@ fake agent. A release is published only when the matrix is green.
 - Telegram notifier against a local fake HTTP endpoint (URL configurable for
   tests): `getMe` failure disables it; no `getUpdates` is ever sent.
 
-## 14. v0.1 scope
+## 14. Roadmap after v0.1
+
+- **v0.2 — goals.** `artel goal TEXT --done-when CRITERIA`: a planner stage
+  (strong model, fresh) decomposes the goal into tasks with areas,
+  dependencies and acceptance criteria; they enter as `proposed` and pass
+  vetting (§4). When the goal's tasks are done, a goal-check stage verifies the
+  criteria and proposes missing tasks, up to `goal_rounds`.
+- `base` integration mode, `propose_minors`, `done_digest`, other agent CLIs.
+
+## 14a. v0.1 scope
 
 In: everything above except `base` integration mode, `propose_minors`,
 `done_digest` (send `done` immediately or not at all), log filters. `artel config`, `artel templates export` and the README (§10–§11) are in.
