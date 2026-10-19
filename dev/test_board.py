@@ -3,10 +3,13 @@ import contextlib
 import io
 import json
 import os
+import signal
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -97,7 +100,7 @@ def cli(repo, *args, env=None, expect=None):
     e.pop("ARTEL_DEV_SESSION", None)
     e.update(env or {})
     r = subprocess.run([sys.executable, BOARD_PY, "--repo", str(repo), *args],
-                       text=True, capture_output=True, env=e)
+                       text=True, encoding="utf-8", capture_output=True, env=e)
     if expect is not None and r.returncode != expect:
         raise AssertionError(
             f"{args}: rc={r.returncode} want {expect}\n{r.stdout}\n{r.stderr}")
@@ -342,7 +345,7 @@ class Integrate(TmpCase):
     def test_success_merges_pushes_and_marks_done(self):
         self.start()
         self.branch_with("dev/T1", "one.txt", "1\n")
-        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         sha = r.stdout.strip().splitlines()[-1]
         self.assertEqual(sha, git(self.repo, "rev-parse", "HEAD"))
@@ -364,7 +367,7 @@ class Integrate(TmpCase):
         git(self.repo, "commit", "-am", "main edit")
         git(self.repo, "push", "origin", "main")
         head = git(self.repo, "rev-parse", "HEAD")
-        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
         self.assertEqual(r.returncode, 1)
         self.assertIn("onflict", r.stdout + r.stderr)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
@@ -386,7 +389,7 @@ class Integrate(TmpCase):
         git(self.repo, "push", "origin", "main")
         head = git(self.repo, "rev-parse", "HEAD")
         self.branch_with("dev/T1", "one.txt", "1\n")
-        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
         self.assertEqual(r.returncode, 1)
         self.assertIn("FAIL", r.stdout + r.stderr)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
@@ -404,18 +407,18 @@ class Integrate(TmpCase):
         git(self.repo, "commit", "-m", "tests")
         git(self.repo, "push", "origin", "main")
         self.branch_with("dev/T1", "one.txt", "1\n")
-        cli(self.repo, "integrate", "1", "--branch", "dev/T1", expect=0)
+        cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A", expect=0)
 
     def test_refuses_dirty_main_and_wrong_branch(self):
         self.start()
         self.branch_with("dev/T1", "one.txt", "1\n")
         (self.repo / "base.txt").write_text("dirty\n")
-        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
         self.assertEqual(r.returncode, 1)
         self.assertIn("clean", r.stdout + r.stderr)
         git(self.repo, "checkout", "--", "base.txt")
         git(self.repo, "checkout", "dev/T1")
-        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
         self.assertEqual(r.returncode, 1)
         self.assertIn("main", r.stdout + r.stderr)
 
@@ -424,7 +427,7 @@ class Integrate(TmpCase):
         self.branch_with("dev/T1", "one.txt", "1\n")
         wt = Path(self.tmp) / "wt"
         git(self.repo, "worktree", "add", "-b", "scratch", str(wt))
-        cli(wt, "integrate", "1", "--branch", "dev/T1", expect=0)
+        cli(wt, "integrate", "1", "--branch", "dev/T1", "--session", "A", expect=0)
         self.assertTrue((self.repo / "one.txt").exists())
 
     def test_push_failure_rolls_back(self):
@@ -435,10 +438,216 @@ class Integrate(TmpCase):
         hook.write_text("#!/bin/sh\nexit 1\n")
         hook.chmod(0o755)
         head = git(self.repo, "rev-parse", "HEAD")
-        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
         self.assertEqual(r.returncode, 1)
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
         self.assertEqual(self.tasks()[1]["state"], "claimed")
+
+
+class IntegrateSafety(TmpCase):
+    def start(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        git(self.repo, "checkout", "-b", "dev/T1")
+        (self.repo / "one.txt").write_text("1\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "work")
+        git(self.repo, "checkout", "main")
+
+    def add_slow_test(self):
+        (self.repo / "tests").mkdir()
+        (self.repo / "tests" / "test_slow.py").write_text(
+            "import os, subprocess, time, unittest\n"
+            "class T(unittest.TestCase):\n"
+            "    def test_slow(self):\n"
+            "        p = subprocess.Popen(['sleep', '300'])\n"
+            "        open('child.pid', 'w').write(str(p.pid))\n"
+            "        open('started', 'w').write('x')\n"
+            "        time.sleep(300)\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "slow tests")
+        git(self.repo, "push", "origin", "main")
+
+    def assert_rolled_back(self, head):
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertFalse((self.repo / "one.txt").exists())
+        self.assertEqual(git(self.remote, "rev-parse", "main"), head)
+        self.assertEqual(self.tasks()[1]["state"], "claimed")
+
+    def test_sigterm_during_tests_rolls_back_and_kills_children(self):
+        self.start()
+        self.add_slow_test()
+        head = git(self.repo, "rev-parse", "HEAD")
+        p = subprocess.Popen(
+            [sys.executable, BOARD_PY, "--repo", str(self.repo), "integrate",
+             "1", "--branch", "dev/T1", "--session", "A"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            env=dict(os.environ, **GIT_ENV))
+        marker = self.repo / "started"
+        for _ in range(300):
+            if marker.exists():
+                break
+            time.sleep(0.1)
+        self.assertTrue(marker.exists(), "tests never started")
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=60)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("rolled back", err)
+        self.assert_rolled_back(head)
+        self.assert_dead(int((self.repo / "child.pid").read_text()))
+
+    def assert_dead(self, pid):
+        for _ in range(50):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                return
+            time.sleep(0.1)
+        self.fail("child process %d survived" % pid)
+
+    def test_test_timeout_kills_whole_process_group(self):
+        self.start()
+        self.add_slow_test()
+        head = git(self.repo, "rev-parse", "HEAD")
+        args = board.build_parser().parse_args(
+            ["--repo", str(self.repo), "integrate", "1", "--branch",
+             "dev/T1", "--session", "A"])
+        err = io.StringIO()
+        with mock.patch.object(board, "TEST_TIMEOUT", 3), \
+                contextlib.redirect_stderr(err):
+            code = board.cmd_integrate(args)
+        self.assertEqual(code, 1)
+        self.assertIn("timed out", err.getvalue())
+        self.assert_rolled_back(head)
+        self.assert_dead(int((self.repo / "child.pid").read_text()))
+
+    def test_unexpected_exception_rolls_back_and_propagates(self):
+        self.start()
+        head = git(self.repo, "rev-parse", "HEAD")
+        args = board.build_parser().parse_args(
+            ["--repo", str(self.repo), "integrate", "1", "--branch",
+             "dev/T1", "--session", "A"])
+        real = board.git
+
+        def boom(cwd, *a, **kw):
+            if a[:1] == ("push",):
+                raise KeyboardInterrupt
+            return real(cwd, *a, **kw)
+
+        with mock.patch.object(board, "git", boom), \
+                contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                board.cmd_integrate(args)
+        self.assert_rolled_back(head)
+
+    def test_push_rejected_because_origin_moved_has_clear_message(self):
+        self.start()
+        head = git(self.repo, "rev-parse", "HEAD")
+        args = board.build_parser().parse_args(
+            ["--repo", str(self.repo), "integrate", "1", "--branch",
+             "dev/T1", "--session", "A"])
+        real = board.git
+
+        def reject(cwd, *a, **kw):
+            if a[:1] == ("push",):
+                return 1, " ! [rejected] main -> main (fetch first)\n"
+            return real(cwd, *a, **kw)
+
+        err = io.StringIO()
+        with mock.patch.object(board, "git", reject), \
+                contextlib.redirect_stderr(err):
+            self.assertEqual(board.cmd_integrate(args), 1)
+        self.assertIn("origin/main moved", err.getvalue())
+        self.assertIn("git pull --ff-only origin main", err.getvalue())
+        self.assert_rolled_back(head)
+
+    def test_refuses_when_main_behind_origin(self):
+        self.start()
+        other = Path(self.tmp) / "other"
+        git(self.tmp, "clone", str(self.remote), str(other))
+        (other / "x.txt").write_text("x\n")
+        git(other, "add", "-A")
+        git(other, "commit", "-m", "elsewhere")
+        git(other, "push", "origin", "main")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1",
+                "--session", "A")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("behind origin/main", r.stderr)
+        self.assertIn("git pull --ff-only origin main", r.stderr)
+        self.assertFalse((self.repo / "one.txt").exists())
+
+    def test_refuses_when_main_ahead_of_origin(self):
+        self.start()
+        (self.repo / "y.txt").write_text("y\n")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "unpushed")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1",
+                "--session", "A")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("ahead of origin/main", r.stderr)
+        self.assertIn("git push origin main", r.stderr)
+
+    def test_requires_task_claimed_by_that_session(self):
+        self.start()
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1",
+                "--session", "B")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not claimed by B", r.stderr)
+        self.assertFalse((self.repo / "one.txt").exists())
+        cli(self.repo, "integrate", "1", "--branch", "dev/T1", expect=2)
+
+
+class Encoding(TmpCase):
+    C_LOCALE = {"LC_ALL": "C", "LANG": "C", "PYTHONCOERCECLOCALE": "0",
+                "PYTHONUTF8": "0", "PYTHONIOENCODING": ""}
+
+    def test_cyrillic_note_and_tail_under_c_locale(self):
+        self.init()
+        text, basis = "Русская заметка", "основание"
+        cli(self.repo, "note", "NOTE", "1", text, "--basis", basis,
+            "--session", "A", env=self.C_LOCALE, expect=0)
+        r = cli(self.repo, "tail", "--session", "B", env=self.C_LOCALE,
+                expect=0)
+        self.assertIn(text, r.stdout)
+        self.assertIn(basis, r.stdout)
+        raw = (self.store() / "journal.md").read_bytes().decode("utf-8")
+        self.assertIn(text, raw)
+
+    def test_cyrillic_task_title_roundtrip(self):
+        plan = FAKE_PLAN.replace("First thing", "Первая задача")
+        (self.repo / "docs" / "plan.md").write_text(plan, encoding="utf-8")
+        cli(self.repo, "init", "--from", "docs/plan.md", env=self.C_LOCALE,
+            expect=0)
+        r = cli(self.repo, "status", env=self.C_LOCALE, expect=0)
+        self.assertIn("Первая задача", r.stdout)
+
+
+class ForceBackup(TmpCase):
+    def test_force_backs_up_and_wipes_state_journal_cursors(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "note", "FACT", "1", "keep me", "--session", "A",
+            expect=0)
+        cli(self.repo, "tail", "--session", "B", expect=0)
+        r = cli(self.repo, "init", "--from", "docs/plan.md", "--force",
+                expect=0)
+        self.assertIn("backed up", r.stdout)
+        backups = list(self.store().glob("backup-*"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("keep me", (backups[0] / "journal.md").read_text())
+        self.assertTrue((backups[0] / "cursors" / "B").exists())
+        self.assertEqual(self.tasks()[1]["state"], "open")
+        self.assertFalse((self.store() / "journal.md").exists())
+        self.assertFalse((self.store() / "cursors").exists())
+        cli(self.repo, "note", "NOTE", "1", "fresh", "--session", "A",
+            expect=0)
+        r = cli(self.repo, "tail", "--session", "B", expect=0)
+        self.assertIn("fresh", r.stdout)
+        self.assertNotIn("keep me", r.stdout)
+
+    def test_done_validates_session(self):
+        self.init()
+        cli(self.repo, "done", "1", "--session", "bad name", expect=1)
 
 
 class Ci(unittest.TestCase):
@@ -471,18 +680,33 @@ class Ci(unittest.TestCase):
                           "branch=main&per_page=5", seen["url"])
             return code, out.getvalue()
 
-    def test_latest_pending_is_2(self):
+    def test_latest_pending_is_4(self):
         code, out = self.run_ci()
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 4)
         self.assertIn("aaaaaaa in_progress", out)
-        self.assertIn("https://example/3", out)
+        self.assertIn("pending", out)
+        self.assertNotIn("https://example/3", out)  # other commit
+
+    def test_all_runs_of_the_sha_count(self):
+        def run(sha, status, concl):
+            return {"head_sha": sha * 40, "status": status,
+                    "conclusion": concl, "html_url": "u"}
+        ok, bad = run("a", "completed", "success"), run("a", "completed",
+                                                         "failure")
+        pend = run("a", "queued", None)
+        self.assertEqual(self.run_ci(runs={"workflow_runs": [ok, ok]})[0], 0)
+        self.assertEqual(self.run_ci(runs={"workflow_runs": [ok, bad]})[0], 1)
+        self.assertEqual(self.run_ci(runs={"workflow_runs": [pend, bad]})[0], 1)
+        self.assertEqual(self.run_ci(runs={"workflow_runs": [ok, pend]})[0], 4)
 
     def test_sha_filter_success_and_failure(self):
         self.assertEqual(self.run_ci("--sha", "bbbbbbb")[0], 0)
         self.assertEqual(self.run_ci("--sha", "ccc")[0], 1)
 
     def test_no_match_is_2(self):
-        self.assertEqual(self.run_ci("--sha", "ddd")[0], 2)
+        code, out = self.run_ci("--sha", "ddd")
+        self.assertEqual(code, 2)
+        self.assertIn("no run yet", out)
         self.assertEqual(self.run_ci(runs={"workflow_runs": []})[0], 2)
 
     def test_missing_token_file(self):

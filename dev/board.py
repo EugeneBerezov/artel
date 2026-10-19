@@ -11,6 +11,8 @@ import fcntl
 import json
 import os
 import re
+import shutil
+import signal
 import subprocess
 import sys
 import urllib.request
@@ -22,6 +24,7 @@ MAX_TEXT_BYTES = 400
 MAX_BASIS_BYTES = 200
 MAX_FAILS = 2
 TEST_TIMEOUT = 20 * 60
+GIT_TIMEOUT = 120
 TRAILER = "Co-Authored-By: Claude Sonnet 5.5 <noreply@anthropic.com>"
 KINDS = ("FACT", "FAIL", "NOTE", "SPEC-GAP")
 GITHUB_REPO = "EugeneBerezov/artel"
@@ -30,7 +33,7 @@ SESSION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
 
 EXIT_ERROR = 1
 EXIT_NOTHING = 3
-EXIT_ENV = 4  # ci: token missing / HTTP failure
+EXIT_ENV = 5  # ci: token missing / HTTP failure
 
 
 class BoardError(Exception):
@@ -152,22 +155,41 @@ def now_iso():
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def run(cmd, cwd, timeout=None):
-    """Run a command, merging stderr into stdout. Returns (rc, output)."""
-    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+def _kill_group(proc):
     try:
-        r = subprocess.run(cmd, cwd=cwd, env=env, text=True, errors="replace",
-                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                           timeout=timeout)
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout or ""
-        if isinstance(out, bytes):
-            out = out.decode(errors="replace")
-        return 124, out + "\n[timed out after %ss]" % timeout
-    return r.returncode, r.stdout
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+    try:
+        proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        pass
 
 
-def git(cwd, *args, timeout=None):
+def run(cmd, cwd, timeout=None):
+    """Run a command in its own process group, stderr merged into stdout.
+
+    Never reads stdin. On timeout or any interruption (Ctrl-C, SIGTERM) the
+    whole group is killed. Returns (rc, output); rc 124 on timeout.
+    """
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    proc = subprocess.Popen(cmd, cwd=cwd, env=env, stdin=subprocess.DEVNULL,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace",
+                            start_new_session=True)
+    try:
+        out, _ = proc.communicate(timeout=timeout)
+        return proc.returncode, out
+    except subprocess.TimeoutExpired:
+        _kill_group(proc)
+        out, _ = proc.communicate()
+        return 124, (out or "") + "\n[timed out after %ss]" % timeout
+    except BaseException:
+        _kill_group(proc)
+        raise
+
+
+def git(cwd, *args, timeout=GIT_TIMEOUT):
     return run(["git", *args], cwd, timeout)
 
 
@@ -198,13 +220,13 @@ class Store:
 
     def load(self):
         try:
-            return json.loads(self.board_path.read_text())
+            return json.loads(self.board_path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             raise BoardError("no board; run: board.py init --from docs/plan.md")
 
     def save(self, board):
         tmp = self.board_path.with_suffix(".tmp")
-        with open(tmp, "w") as f:
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(board, f, indent=1, ensure_ascii=False)
             f.write("\n")
             f.flush()
@@ -253,7 +275,20 @@ def cmd_init(args):
     with store.lock():
         if store.exists() and not args.force:
             raise BoardError("board already exists (use --force to replace "
-                             "it, which resets all task state)")
+                             "it: state, journal and cursors are moved to "
+                             "a backup-<time> directory)")
+        if store.exists():
+            backup = store.dir / ("backup-" + now_iso().replace(":", ""))
+            n = 1
+            while backup.exists():
+                n += 1
+                backup = store.dir / ("backup-%s-%d" % (
+                    now_iso().replace(":", ""), n))
+            backup.mkdir()
+            for name in ("board.json", "journal.md", "cursors"):
+                if (store.dir / name).exists():
+                    shutil.move(str(store.dir / name), str(backup / name))
+            print("previous state backed up to %s" % backup)
         store.save({"version": 1, "source": args.plan, "created": now_iso(),
                     "tasks": tasks})
     print("initialised %d tasks from %s" % (len(tasks), args.plan))
@@ -363,7 +398,9 @@ def cmd_done(args):
         t = find_task(board, args.id)
         if t["state"] == "done":
             raise BoardError("T%d is already done" % args.id)
-        who = args.session or t["session"] or "-"
+        who = t["session"] or "-"
+        if args.session:
+            who = check_session(args.session)
         t["state"], t["merge_sha"] = "done", args.sha
         t["session"], t["claimed_at"] = None, None
         store.save(board)
@@ -406,14 +443,14 @@ def cmd_tail(args):
         start = 0
         if not args.all:
             try:
-                start = int(cursor.read_text().strip() or 0)
+                start = int(cursor.read_text(encoding="utf-8").strip() or 0)
             except (FileNotFoundError, ValueError):
                 start = 0
             if start > len(data):
                 start = 0
         sys.stdout.write(data[start:].decode("utf-8", errors="replace"))
         if not args.all:
-            cursor.write_text(str(len(data)))
+            cursor.write_text(str(len(data)), encoding="utf-8")
 
 
 def cmd_status(args):
@@ -455,16 +492,63 @@ def _tail_lines(text, n=40):
     return "\n".join(text.strip().splitlines()[-n:])
 
 
+def _sync_problem(main):
+    """Fetch origin; return a refusal message if local main != origin/main."""
+    rc, out = git(main, "fetch", "origin")
+    if rc != 0:
+        return "git fetch origin failed:\n" + _tail_lines(out, 10)
+    rc, local = git(main, "rev-parse", "HEAD")
+    rc2, remote = git(main, "rev-parse", "--verify", "-q",
+                      "refs/remotes/origin/" + MAIN_BRANCH)
+    if rc != 0 or rc2 != 0:
+        return "cannot resolve origin/%s" % MAIN_BRANCH
+    if local.strip() == remote.strip():
+        return None
+    rc, out = git(main, "rev-list", "--left-right", "--count",
+                  "HEAD...origin/" + MAIN_BRANCH)
+    ahead, behind = (out.split() + ["?", "?"])[:2]
+    if ahead == "0":
+        fix = "run: cd %s && git pull --ff-only origin %s" % (main, MAIN_BRANCH)
+        kind = "behind"
+    elif behind == "0":
+        fix = "run: cd %s && git push origin %s" % (main, MAIN_BRANCH)
+        kind = "ahead of"
+    else:
+        fix = ("reconcile by hand in %s (git log --oneline --graph HEAD "
+               "origin/%s)" % (main, MAIN_BRANCH))
+        kind = "diverged from"
+    return ("main is %s origin/%s (ahead %s, behind %s); %s"
+            % (kind, MAIN_BRANCH, ahead, behind, fix))
+
+
+def _remote_has(main, sha):
+    rc, _ = git(main, "fetch", "origin")
+    if rc != 0:
+        return False
+    rc, _ = git(main, "merge-base", "--is-ancestor", sha,
+                "refs/remotes/origin/" + MAIN_BRANCH)
+    return rc == 0
+
+
+def _terminate(signum, frame):
+    raise SystemExit(128 + signum)
+
+
 def cmd_integrate(args):
+    session = check_session(args.session)
     store = Store(args.repo)
     # Serialises integrations without blocking claim/note/tail for up to
-    # TEST_TIMEOUT: the board lock is only taken for the final bookkeeping.
+    # TEST_TIMEOUT: the board lock is only taken for the bookkeeping.
     with store.lock("integrate.lock"):
         with store.lock():
             task = find_task(store.load(), args.id)
             if task["state"] == "done":
                 raise BoardError("T%d is already done" % args.id)
-            title, session = task["title"], task["session"] or "-"
+            if task["state"] != "claimed" or task["session"] != session:
+                raise BoardError("T%d is not claimed by %s (state %s, holder "
+                                 "%s)" % (args.id, session, task["state"],
+                                          task["session"] or "-"))
+            title = task["title"]
         main = main_worktree(args.repo)
         rc, out = git(main, "symbolic-ref", "--short", "-q", "HEAD")
         if rc != 0 or out.strip() != MAIN_BRANCH:
@@ -478,36 +562,27 @@ def cmd_integrate(args):
                       args.branch + "^{commit}")
         if rc != 0:
             raise BoardError("unknown branch %r" % args.branch)
+        problem = _sync_problem(main)
+        if problem:
+            raise BoardError(problem)
         rc, head = git(main, "rev-parse", "HEAD")
         head = head.strip()
 
-        def rollback(why, output):
-            git(main, "merge", "--abort")
-            git(main, "reset", "--hard", head)
-            print("integrate T%d failed: %s\n%s" % (
-                args.id, why, _tail_lines(output)), file=sys.stderr)
+        old_term = signal.signal(signal.SIGTERM, _terminate)
+        try:
+            sha = _merge_test_push(main, args, title, head)
+        finally:
+            signal.signal(signal.SIGTERM, old_term)
+        if sha is None:
             return EXIT_ERROR
-
-        rc, out = git(main, "merge", "--no-ff", args.branch, "-m",
-                      "Merge T%d: %s" % (args.id, title), "-m", TRAILER)
-        if rc != 0:
-            why = ("merge conflict" if "onflict" in out else "merge failed")
-            return rollback(why, out)
-        rc, new = git(main, "rev-parse", "HEAD")
-        if new.strip() == head:
-            return rollback("nothing to merge (branch already in main)", out)
-        if (Path(main) / "tests").is_dir():
-            rc, out = run([sys.executable, "-m", "unittest", "discover", "-s",
-                           "tests", "-q"], main, timeout=TEST_TIMEOUT)
-            if rc != 0:
-                return rollback("tests failed (rc=%d)" % rc, out)
-        rc, out = git(main, "push", "origin", MAIN_BRANCH)
-        if rc != 0:
-            return rollback("push failed", out)
-        sha = new.strip()
         with store.lock():
             board = store.load()
             t = find_task(board, args.id)
+            if t["state"] != "claimed" or t["session"] != session:
+                print("warning: T%d changed hands while integrating (now %s, "
+                      "holder %s); marking it done anyway, the merge is "
+                      "pushed" % (args.id, t["state"], t["session"] or "-"),
+                      file=sys.stderr)
             t["state"], t["merge_sha"] = "done", sha
             t["session"], t["claimed_at"] = None, None
             store.save(board)
@@ -515,6 +590,65 @@ def cmd_integrate(args):
                           "merged %s into main" % args.branch, basis=sha)
     print(sha)
     return 0
+
+
+def _merge_test_push(main, args, title, head):
+    """Merge, test and push. Returns the merge sha, or None after a rollback.
+
+    Any exception (Ctrl-C, SIGTERM, bug) rolls main back to `head` before it
+    propagates, unless the push already reached origin.
+    """
+    def rollback(why, output):
+        git(main, "merge", "--abort")
+        git(main, "reset", "--hard", head)
+        print("integrate T%d failed: %s\n%s" % (
+            args.id, why, _tail_lines(output)), file=sys.stderr)
+
+    new = None
+    pushed = False
+    try:
+        rc, out = git(main, "merge", "--no-ff", args.branch, "-m",
+                      "Merge T%d: %s" % (args.id, title), "-m", TRAILER)
+        if rc != 0:
+            rollback("merge conflict" if "onflict" in out else "merge failed",
+                     out)
+            return None
+        rc, new = git(main, "rev-parse", "HEAD")
+        new = new.strip()
+        if new == head:
+            rollback("nothing to merge (branch already in main)", out)
+            return None
+        if (Path(main) / "tests").is_dir():
+            rc, out = run([sys.executable, "-m", "unittest", "discover", "-s",
+                           "tests", "-q"], main, timeout=TEST_TIMEOUT)
+            if rc != 0:
+                rollback("tests failed (rc=%d)" % rc, out)
+                return None
+        rc, out = git(main, "push", "origin", MAIN_BRANCH)
+        if rc != 0:
+            if "rejected" in out and re.search(
+                    r"fetch first|non-fast-forward|stale info", out):
+                why = ("push rejected: origin/%s moved while testing; in %s "
+                       "run: git pull --ff-only origin %s, then integrate "
+                       "again" % (MAIN_BRANCH, main, MAIN_BRANCH))
+            else:
+                why = "push failed"
+            rollback(why, out)
+            return None
+        pushed = True
+        return new
+    except BaseException:
+        if not pushed:
+            if new and _remote_has(main, new):
+                print("warning: interrupted during push, but the merge %s is "
+                      "on origin/%s; main left as is" % (new[:7], MAIN_BRANCH),
+                      file=sys.stderr)
+            else:
+                git(main, "merge", "--abort")
+                git(main, "reset", "--hard", head)
+                print("interrupted: main rolled back to %s" % head[:7],
+                      file=sys.stderr)
+        raise
 
 
 def fetch_json(url, token):
@@ -531,7 +665,7 @@ def cmd_ci(args, fetch=None, token_path=None):
     fetch = fetch or fetch_json
     path = Path(token_path or TOKEN_PATH)
     try:
-        token = path.read_text().strip()
+        token = path.read_text(encoding="utf-8").strip()
     except OSError as e:
         raise BoardError("cannot read token file %s: %s" % (path, e.strerror))
     if not token:
@@ -546,16 +680,23 @@ def cmd_ci(args, fetch=None, token_path=None):
     runs = data.get("workflow_runs", [])
     if args.sha:
         runs = [r for r in runs if r.get("head_sha", "").startswith(args.sha)]
+    elif runs:
+        runs = [r for r in runs if r.get("head_sha") == runs[0].get("head_sha")]
     for r in runs:
         print("%s %s %s %s" % (r.get("head_sha", "")[:7], r.get("status"),
                                r.get("conclusion") or "-", r.get("html_url")))
     if not runs:
-        print("no matching runs")
+        print("no run yet")
         return 2
-    latest = runs[0]
-    if latest.get("status") != "completed":
-        return 2
-    return 0 if latest.get("conclusion") == "success" else 1
+    pending = [r for r in runs if r.get("status") != "completed"]
+    failed = [r for r in runs if r.get("status") == "completed"
+              and r.get("conclusion") != "success"]
+    if failed:
+        return 1
+    if pending:
+        print("pending")
+        return 4
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -613,6 +754,7 @@ def build_parser():
     s = sub.add_parser("integrate", help="merge a task branch into main, test, push")
     s.add_argument("id", type=int)
     s.add_argument("--branch", required=True)
+    s.add_argument("--session", required=True)
     s.set_defaults(fn=cmd_integrate)
 
     s = sub.add_parser("ci", help="GitHub Actions result for main")
@@ -621,8 +763,23 @@ def build_parser():
     return p
 
 
+def _argv_text(value):
+    """Undo surrogateescape from a non-UTF-8 locale: argv bytes -> UTF-8 text."""
+    try:
+        value.encode("utf-8")
+        return value
+    except UnicodeEncodeError:
+        return os.fsencode(value).decode("utf-8", errors="replace")
+
+
 def main(argv=None):
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
     args = build_parser().parse_args(argv)
+    for key, value in vars(args).items():
+        if isinstance(value, str):
+            setattr(args, key, _argv_text(value))
     try:
         return args.fn(args) or 0
     except BoardError as e:
