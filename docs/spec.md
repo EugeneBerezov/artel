@@ -158,6 +158,26 @@ invalid result is `fail`.
 `--strong` or `--attack`, or the diff exceeds `strong_diff_lines` (default
 300). The attack stage always uses the strong model.
 
+**Session rotation (writers only).** By default every stage is a fresh
+process. The user can let a writer session continue instead, with
+`claude -p --resume <session-id>`; the runner records each writer's session
+id, slot and last context size. A session continues only if **all** hold,
+otherwise a fresh agent starts:
+- the stage is `fix` and `fix_resumes_writer = true` (default), or the stage
+  is `write` of the next task and `writer_max_tasks` (default **1**, i.e. a
+  fresh writer per task) is not yet reached;
+- for a new task: it is in the same area as the session's last task when
+  `same_area_only = true` (default);
+- the session's current context (input + cache tokens of its last API call,
+  read from the stream) is below `writer_max_context` (default 60 000 tokens);
+- the same slot is free (Claude Code stores sessions per working directory),
+  and the session can still be resumed — a failed resume falls back to fresh.
+
+Reviewers and attackers are **always** fresh, not configurable: their value
+is independence from the writer. Every continuation and every rotation is
+recorded with its reason (`artel show`: "fix resumed writer session: same
+slot, context 41k < 60k").
+
 **Minor findings** never block. They stay in the task record (`artel show`);
 with `propose_minors = true` they also become `proposed` tasks.
 
@@ -345,6 +365,12 @@ slot_keep = ["node_modules"]
 log_keep_tasks = 50
 propose_minors = false
 
+[rotation]                        # writers only; reviewers are always fresh
+writer_max_tasks = 1              # 1 = fresh writer for every task
+writer_max_context = 60000        # tokens; rotate to a fresh agent above this
+same_area_only = true             # continue only within the same area
+fix_resumes_writer = true         # review fixes continue the writer's session
+
 [models]
 write = "sonnet"
 review = "sonnet"
@@ -486,6 +512,9 @@ run with `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`;
 `.claude/worktrees/artel-<n>`; first-call cache creation ≈ 27.5k tokens with
 the lean profile (≈ 19 % less than default), ≈ 10× cheaper when cached.
 Question 7 is open: test with a throwaway `CLAUDE.md` that demands approval.
+Question 8 (new): `--resume <session-id>` in `-p` mode with stream-json and
+`--json-schema` — does it resume from the same slot, and what does the first
+call of a resumed session cost (cache read vs creation)?
 
 Original questions:
 
