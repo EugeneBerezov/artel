@@ -272,6 +272,8 @@ def cmd_init(args):
     except OSError as e:
         raise BoardError("cannot read plan: %s" % e)
     tasks = parse_plan(text)
+    if args.refresh:
+        return _refresh(store, args.plan, tasks)
     with store.lock():
         if store.exists() and not args.force:
             raise BoardError("board already exists (use --force to replace "
@@ -330,6 +332,68 @@ def cmd_claim(args):
         store.journal(session, "CLAIM", t["id"], t["title"])
         print(describe(board, t, session))
     return 0
+
+
+PLAN_FIELDS = ("title", "wave", "deps", "risky", "controller", "plan_lines")
+
+
+def _refresh(store, plan, parsed):
+    """Re-read the plan into an existing board, keeping every task's state.
+
+    Titles, waves, deps, flags and line ranges follow the plan; new tasks
+    start open; a task gone from the plan is dropped only if it is open.
+    """
+    with store.lock():
+        board = store.load()
+        old = {t["id"]: t for t in board["tasks"]}
+        new_ids = {t["id"] for t in parsed}
+        gone = sorted(i for i in old if i not in new_ids)
+        busy = [i for i in gone if old[i]["state"] != "open"]
+        if busy:
+            raise BoardError("tasks %s are not open but missing from the "
+                             "plan" % ["T%d" % i for i in busy])
+        tasks, added = [], []
+        for t in parsed:
+            if t["id"] in old:
+                kept = old[t["id"]]
+                kept.update({k: t[k] for k in PLAN_FIELDS})
+                tasks.append(kept)
+            else:
+                tasks.append(t)
+                added.append(t["id"])
+        board["tasks"], board["source"] = tasks, plan
+        store.save(board)
+        text = "board refreshed from %s: %d tasks" % (plan, len(tasks))
+        if added:
+            text += ", added %s" % " ".join("T%d" % i for i in added)
+        if gone:
+            text += ", removed %s" % " ".join("T%d" % i for i in gone)
+        store.journal("-", "PLAN", "-", text)
+    print(text)
+
+
+def cmd_reopen(args):
+    """done/stuck -> open: a merged task needs more work (red CI, review)."""
+    store = Store(args.repo)
+    with store.lock():
+        board = store.load()
+        t = find_task(board, args.id)
+        if t["state"] not in ("done", "stuck"):
+            raise BoardError("T%d is %s; reopen takes done or stuck tasks"
+                             % (args.id, t["state"]))
+        who = check_session(args.session) if args.session else "-"
+        if t["state"] == "stuck":
+            t["fails"] = 0
+        t["state"], t["merge_sha"] = "open", None
+        t["session"], t["claimed_at"] = None, None
+        store.save(board)
+        store.journal(who, "REOPEN", args.id, args.reason)
+        held = [d for d in board["tasks"] if args.id in d["deps"]
+                and d["state"] in ("claimed", "done")]
+    print("T%d -> open" % args.id)
+    if held:
+        print("warning: dependents already %s" % ", ".join(
+            "T%d %s" % (d["id"], d["state"]) for d in held), file=sys.stderr)
 
 
 def _nothing_claimable(tasks, by_id):
@@ -710,8 +774,17 @@ def build_parser():
 
     s = sub.add_parser("init", help="parse the plan into a board")
     s.add_argument("--from", dest="plan", required=True, metavar="PLAN")
-    s.add_argument("--force", action="store_true")
+    g = s.add_mutually_exclusive_group()
+    g.add_argument("--force", action="store_true")
+    g.add_argument("--refresh", action="store_true",
+                   help="re-read the plan, keep task states")
     s.set_defaults(fn=cmd_init)
+
+    s = sub.add_parser("reopen", help="done or stuck task back to open")
+    s.add_argument("id", type=int)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--session")
+    s.set_defaults(fn=cmd_reopen)
 
     s = sub.add_parser("claim", help="take the next claimable task")
     s.add_argument("--session", required=True)
