@@ -1,6 +1,6 @@
 # artel — specification
 
-**Status:** draft 4, 2026-10-19 (after three adversarial reviews) ·
+**Status:** draft 5, 2026-10-19 (three adversarial reviews, live spike, all platforms) ·
 **Package:** `artel-agents` (PyPI name `artel` is reserved) · **Command:** `artel`
 
 artel runs coding agents in parallel on one git repository. A single
@@ -46,9 +46,10 @@ file exchange between agents, macOS-only storage.
 6. Project-agnostic: project specifics live in `artel.toml` and templates.
 7. Zero dependencies: Python ≥ 3.11 standard library (macOS ships 3.9 —
    install a newer one).
+8. Every platform where terminal Claude Code runs: Linux, macOS, Windows
+   (native, with Git for Windows) and WSL — one pure-Python package (§12).
 
-**Non-goals (v0.1):** several agents solving the same task; a UI; Windows
-hosts; agent CLIs other than Claude Code (the command is an adapter; others
+**Non-goals (v0.1):** several agents solving the same task; a UI; agent CLIs other than Claude Code (the command is an adapter; others
 later); listening sockets. The only network traffic artel itself makes is
 outbound HTTPS to the configured notifier.
 
@@ -57,7 +58,7 @@ outbound HTTPS to the configured notifier.
 | Term | Meaning |
 |---|---|
 | **board** | SQLite database at `<git-common-dir>/artel/board.db` (from `git rev-parse --path-format=absolute --git-common-dir`). Shared by all worktrees, never committed. |
-| **runner** | `artel run`: the only process that changes task state, starts agents and moves branches. One per board, enforced by `fcntl.flock` on `<git-common-dir>/artel/runner.lock`. Uses no model tokens. |
+| **runner** | `artel run`: the only process that changes task state, starts agents and moves branches. One per board, enforced by an OS file lock on `<git-common-dir>/artel/runner.lock` (§12). Uses no model tokens. |
 | **slot** | A reusable worktree, default `<main-worktree>/.claude/worktrees/artel-<n>` (Claude Code protects every path containing a `.git` segment, so slots cannot live inside `.git`; `init` adds the directory to `.git/info/exclude`). One per parallel agent, reused across tasks. |
 | **integration branch** | `artel/integration` (default mode): where verified work lands. Task branches start from its tip. The human merges it into the base branch when they choose. |
 | **task** | Title, body, area, priority, dependencies, flags (`--attack`, `--strong`, `--review N`, `--merge`), counters. Branch `artel/<id>`. |
@@ -422,7 +423,39 @@ minutes. Sections:
 8. Troubleshooting: stuck tasks, stale heavy lock, disk guard, a second
    runner, reading logs.
 
-## 12. Testing
+## 12. Platforms
+
+One distribution for all platforms: a pure-Python wheel (`pipx install
+artel-agents` or `uv tool install artel-agents`), plus an optional single-file
+`artel.pyz` (stdlib `zipapp`) attached to GitHub releases. No compiled parts.
+Everything OS-specific lives in one module (`artel/platform.py`) with one
+implementation per OS family and a test suite that runs on all of them.
+
+| Concern | POSIX (Linux, macOS, WSL) | Windows (native) |
+|---|---|---|
+| Runner lock | `fcntl.flock` | `msvcrt.locking` on the lock file |
+| Agent and command process tree | new session (`start_new_session=True`), `os.killpg` SIGTERM → SIGKILL | `CREATE_NEW_PROCESS_GROUP`, `CTRL_BREAK_EVENT` → `taskkill /T /F /PID` |
+| Liveness of a recorded pid (reconcile) | `os.kill(pid, 0)` | `OpenProcess` via `ctypes` |
+| Stop request to the runner | SIGINT / SIGTERM | Ctrl+C / Ctrl+Break; `artel stop` also writes a stop file the runner polls |
+| Finding the agent CLI | `shutil.which("claude")` | `shutil.which` resolves `claude.exe` / `claude.cmd` |
+| Shell for `setup` / `verify` / `heavy_lock` | `sh -c` | `bash -c` from Git for Windows (Claude Code on Windows requires it); `shell` setting overrides (`bash`, `sh`, `pwsh`, `cmd`) |
+| Free disk | `shutil.disk_usage` | same |
+| Paths | `pathlib`; git paths normalized with `--path-format=absolute` | same; long paths need `core.longpaths=true`, `init` checks and warns |
+
+Rules that hold everywhere:
+- All text I/O is UTF-8 explicitly (`encoding="utf-8"` on every `open` and
+  `subprocess` call); never the locale default (cp1251 / cp1252 on Windows).
+- Command settings accept a string (run through the configured shell) or a
+  list (run directly, no shell) — lists are the portable form.
+- No symlinks, no executable-bit assumptions, no `/tmp` — temporary files go
+  under `<git-common-dir>/artel/tmp`.
+- Line endings: artel writes `\n`; it never rewrites files in the repository.
+
+CI: GitHub Actions matrix — `ubuntu-latest`, `macos-latest`,
+`windows-latest` × Python 3.11 and 3.13 — runs the whole test suite with the
+fake agent. A release is published only when the matrix is green.
+
+## 13. Testing
 
 - `unittest` only. The agent command is an adapter; tests use a fake agent
   that emits stream-json (structured results, `rate_limit_event`s), commits,
@@ -436,14 +469,14 @@ minutes. Sections:
 - Telegram notifier against a local fake HTTP endpoint (URL configurable for
   tests): `getMe` failure disables it; no `getUpdates` is ever sent.
 
-## 13. v0.1 scope
+## 14. v0.1 scope
 
 In: everything above except `base` integration mode, `propose_minors`,
 `done_digest` (send `done` immediately or not at all), log filters. `artel config`, `artel templates export` and the README (§10–§11) are in.
-Order of work: a live spike first (§14), then board + CLI, runner + slots,
+Order of work: a live spike first (§15), then board + CLI, runner + slots,
 stages + transitions, verify + integrate, notifier.
 
-## 14. Live checks before code (spike)
+## 15. Live checks before code (spike)
 
 Done 2026-10-19 — results in `docs/spike-2026-10-19.md`: structured result in
 `result.structured_output` (two turns minimum); one `rate_limit_event` per
