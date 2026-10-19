@@ -13,7 +13,8 @@ class ZipappTest(unittest.TestCase):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             tmp_path = Path(tmp)
             result = subprocess.run(
-                [sys.executable, str(REPO_ROOT / "tools" / "build_pyz.py"), "--out", str(tmp_path / "artel.pyz")],
+                [sys.executable, str(REPO_ROOT / "tools" / "build_pyz.py"), "--out", str(tmp_path / "artel.pyz"),
+                 "--staging", str(tmp_path / "stage")],
                 cwd=tmp_path, capture_output=True, encoding="utf-8", errors="replace")
             self.assertEqual(result.returncode, 0, result.stderr)
             pyz = tmp_path / "artel.pyz"
