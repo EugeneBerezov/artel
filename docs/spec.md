@@ -196,19 +196,16 @@ invalid result is `fail`.
 `--strong` or `--attack`, or the diff exceeds `strong_diff_lines` (default
 300). The attack stage always uses the strong model.
 
-**Persistent writers (default, as in DeLM).** Each slot has one long-lived
-writer agent with its own session, like DeLM's peers: it takes task after
-task (write and fix stages) and keeps its context between them, reading the
-journal for what its peers learned. Preferred mechanism: one live process
-`claude -p --input-format stream-json --output-format stream-json`, to which
-the runner sends each next stage as a new user message; fallback:
-`claude -p --resume <session-id>` in the same slot. The runner records each
-writer's session id, slot and context size. A writer continues only if
-**all** hold, otherwise a fresh writer starts in that slot:
-- `writer_max_tasks` (default **0** = unlimited) is not yet reached, and for
-  a `fix` stage `fix_resumes_writer = true` (default);
+**Session rotation (writers only).** By default every stage is a fresh
+process. The user can let a writer session continue instead, with
+`claude -p --resume <session-id>`; the runner records each writer's session
+id, slot and last context size. A session continues only if **all** hold,
+otherwise a fresh agent starts:
+- the stage is `fix` and `fix_resumes_writer = true` (default), or the stage
+  is `write` of the next task and `writer_max_tasks` (default **1**, i.e. a
+  fresh writer per task) is not yet reached;
 - for a new task: it is in the same area as the session's last task when
-  `same_area_only = true` (default **false**);
+  `same_area_only = true` (default);
 - if `writer_max_context` is set, the session's current context (input +
   cache tokens of its last API call, read from the stream) is below it. It is
   **unset by default**: no number is assumed before it is measured;
@@ -434,9 +431,9 @@ autoapprove = "non_risky"         # "none" | "non_risky" | "all" — for propose
 risk_signals = ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"]
 
 [rotation]                        # writers only; reviewers are always fresh
-writer_max_tasks = 0              # 0 = persistent writer per slot (DeLM); 1 = fresh writer for every task
+writer_max_tasks = 1              # 1 = fresh writer for every task
 writer_max_context = 0            # tokens; 0 = no threshold (default until measured, see `artel stats`)
-same_area_only = false            # true = continue only within the same area
+same_area_only = true             # continue only within the same area
 fix_resumes_writer = true         # review fixes continue the writer's session
 
 [models]
@@ -589,10 +586,7 @@ run with `unifiedWindows.{five_hour,seven_day}.{utilization,resetsAt}`;
 `.claude/worktrees/artel-<n>`; first-call cache creation ≈ 27.5k tokens with
 the lean profile (≈ 19 % less than default), ≈ 10× cheaper when cached.
 Question 7 is open: test with a throwaway `CLAUDE.md` that demands approval.
-Question 8 (blocks the default writer mode, check first): a live
-`claude -p --input-format stream-json` process receiving several user
-messages in turn — does each get a structured result, and do usage and
-`rate_limit_event`s arrive per message? Fallback: `--resume <session-id>` in `-p` mode with stream-json and
+Question 8 (new): `--resume <session-id>` in `-p` mode with stream-json and
 `--json-schema` — does it resume from the same slot, and what does the first
 call of a resumed session cost (cache read vs creation)?
 

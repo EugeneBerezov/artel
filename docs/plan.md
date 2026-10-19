@@ -1,14 +1,5 @@
 # artel v0.1 Implementation Plan (rev 2)
 
-
-> **Rev 2.1 (2026-10-19, owner decision):** writers are persistent per slot by
-> default, as in DeLM (spec §4 "Persistent writers"); reviewers stay fresh.
-> The live check of a persistent `claude -p --input-format stream-json`
-> process (spec §15 Q8) moves from T25 to the start: it runs right after T1,
-> before T9 (adapter) and T13 (stages), because both depend on it. T26
-> (rotation) becomes core, not optional; if the live process does not work,
-> the `--resume` fallback is used, and only if both fail does v0.1 ship with
-> fresh writers.
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task is sized for one fresh Sonnet writer run followed by a fresh reviewer; tasks marked **RISKY** get their review on the strong model (Opus). The **second review of a task is a closure check only** (spec §4): for each finding of the first review, closed or not with basis; new findings only at blocker severity, no new topics.
 
 **Goal:** Build `artel` v0.1: a single deterministic runner that drives fresh Claude Code agent processes through vet / attack / write / review / fix stages on one git repository, verifies on the merged tree, fast-forwards an integration branch, and notifies the human — on Linux, macOS, Windows (native, Git for Windows) and WSL.
