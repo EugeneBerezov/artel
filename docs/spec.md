@@ -1,6 +1,6 @@
 # artel — specification
 
-**Status:** draft 3, 2026-10-19 (after two adversarial reviews) ·
+**Status:** draft 4, 2026-10-19 (after three adversarial reviews) ·
 **Package:** `artel-agents` (PyPI name `artel` is reserved) · **Command:** `artel`
 
 artel runs coding agents in parallel on one git repository. A single
@@ -69,33 +69,49 @@ outbound HTTPS to the configured notifier.
 
 States: `proposed`, `open`, `attacking`, `writing`, `reviewing`, `fixing`,
 `verifying`, `verified`, `blocked`, `awaiting_accept`, `done`, `rejected`,
-`stuck`. Every transition not in the table is an error and is not taken.
+`stuck`. A stage state (`attacking` … `verifying`) means the stage is **due**;
+a separate `running` flag (agent or command pid) says it is in progress.
+Requeue (`stop --now`, reconcile after a crash, usage limit `rejected`) only
+clears `running`: the state stays and the stage runs again later, with no
+counter. Every transition not in the table is an error and is not taken.
 
 | From | Event | To | Counters / effects |
 |---|---|---|---|
+| — | `add` by a human | open | |
+| — | `add` by an agent (`artel add`) | proposed | |
 | proposed | `approve` | open | |
 | proposed, open, blocked, stuck, awaiting_accept | `reject` | rejected | branch deleted |
 | open | picked, task has `--attack` | attacking | |
 | open | picked, no `--attack` | writing | |
 | attacking | outcome `pass` / `findings` without blocker | writing | findings appended to the task |
 | attacking | `ask` or blocker finding | blocked (`asked_by=attack`) | |
-| writing, fixing | `ready` with new commits | reviewing | `round += 1` |
-| writing, fixing | `ready` without new commits, `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `stuck` if `attempts = max_attempts` |
-| any running stage | usage limit `rejected` | previous state | no counter; board paused |
-| any running stage | `ask` | blocked (`asked_by=<stage>`) | branch kept, slot freed |
-| reviewing | `pass` or only minor findings | verifying | |
-| reviewing | blocker/major, `round < review_rounds` | fixing | |
-| reviewing | blocker/major, `round = review_rounds` | blocked (`asked_by=review`) | ASK lists open findings |
-| blocked | `answer` | the stage in `asked_by` (`review` → fixing) | answer appended to the task |
-| blocked, stuck | `rework --note` | fixing | `review_rounds += 1` for this task; `stuck` also resets `attempts` |
+| attacking, reviewing | `fail`, invalid result, timeout | same state | `attempts += 1`; `stuck` if `attempts ≥ max_attempts` |
+| writing, fixing (`fix_kind=review`) | `ready` with new commits | reviewing | `round += 1` |
+| fixing (`fix_kind=verify`) | `ready` with new commits | verifying | no round |
+| writing, fixing | `ready` without new commits, `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `round = 0`, `verify_fixes = 0`; `stuck` if `attempts ≥ max_attempts` |
+| any stage | `ask` | blocked (`asked_by=<stage>`) | branch kept, slot freed |
+| reviewing | `pass` or only minor findings | verifying | open findings of earlier rounds must be in `closed` |
+| reviewing | blocker/major, `round < review_rounds` | fixing (`fix_kind=review`) | |
+| reviewing | blocker/major, `round ≥ review_rounds` | blocked (`asked_by=review`) | ASK lists open findings |
+| blocked (`asked_by=attack`) | `answer` | attacking | answer appended to the task |
+| blocked (`asked_by=write` / `fix`) | `answer` | same stage | answer appended |
+| blocked (`asked_by=review`) | `answer` | fixing (`fix_kind=review`) | `review_rounds += 1` for this task; answer appended |
+| blocked (`asked_by=verify`) | `answer` | fixing (`fix_kind=verify`) | `max_verify_fixes += 1` for this task |
+| blocked, stuck | `rework --note` | fixing (`fix_kind=review`) | `review_rounds += 1`; `stuck` also resets `attempts` |
 | verifying | verify green, `merge=auto` | verified | |
-| verifying | verify green, `merge=ask` | awaiting_accept | |
-| verifying | merge conflict or verify red, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1`; the fix goes straight back to verifying, no review round |
+| verifying | verify green, `merge=ask` | awaiting_accept | slot freed; the branch keeps the verified commit |
+| verifying | merge conflict, verify red or `verify_timeout`, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1` |
 | verifying | same, cap reached | blocked (`asked_by=verify`) | |
 | awaiting_accept | `accept` | verified | |
 | verified | integration fast-forward succeeds | done | branch deleted, slot freed |
+| verified | fast-forward impossible (integration moved, e.g. while awaiting accept) | verifying | no counter: re-merge and re-verify |
 
 Defaults: `max_attempts = 2`, `review_rounds = 2`, `max_verify_fixes = 2`.
+
+**Base moved with a conflict.** If merging the base into `artel/integration`
+(§5) conflicts, the runner pauses the board (`paused: base_conflict`) and
+notifies; the human resolves the merge on `artel/integration` and runs
+`artel resume`. No agent touches this merge in v0.1.
 
 ### 3.2 Journal entry kinds
 
@@ -180,15 +196,18 @@ Loop:
    stage: `git switch --detach` in the slot.
 7. **Verify** (one task at a time). In the slot: merge `artel/integration`
    into the task branch, recheck `setup_inputs`, run `verify` under
-   `heavy_lock`.
+   `heavy_lock` with `verify_timeout`. `setup` and `verify` run in their own
+   process groups, recorded like agents, so reconcile and timeouts terminate
+   them the same way (SIGTERM, `kill_grace`, SIGKILL).
 8. **Integrate.** Fast-forward `artel/integration` to the verified commit
    (`git update-ref` with the old value as a guard). Only the runner moves this
-   branch, and verify + integrate are serialized, so the fast-forward cannot
-   race. `DONE`, delete the task branch, notify per `notify_on`.
+   branch; if the fast-forward is impossible (the task waited in
+   `awaiting_accept` while others integrated), the task goes back to
+   verifying (§3.1). `DONE`, delete the task branch, notify per `notify_on`.
 
-**Base moved.** When the human merges into the base, or the base gets new
-commits, the runner merges the base into `artel/integration` before the next
-pick (as a verify step; conflict → `blocked` system task for the human).
+**Base moved.** When the base gets new commits, the runner merges the base
+into `artel/integration` before the next pick, runs `verify` on the result,
+and fast-forwards; a conflict or a red verify pauses the board (§3.1).
 
 `SIGINT`/`SIGTERM` → stop picking, let running stages finish; `artel stop
 --now` terminates them and requeues without counting attempts.
@@ -252,7 +271,7 @@ project lists its check commands. artel never defaults to
 ## 7. Notifications
 
 Events: `blocked`, `stuck`, `paused` (limit or disk, with reset time),
-`resumed`, `done`, `runner_stopped`. `notify_on` selects them (default: all
+`resumed`, `done`, `runner_stopped`. `[notify] on` selects them (default: all
 except `done`, which is sent as a digest every `done_digest` minutes).
 
 Two notifiers, both optional:
@@ -288,6 +307,8 @@ artel accept ID                     merge a task waiting in awaiting_accept
 artel rework ID --note TEXT         one more fix + closure round with your note
 artel run [-n N] | artel stop [--now] | artel pause | artel resume
 artel notify test
+artel config [explain KEY | set KEY VALUE]   effective settings and their sources
+artel templates export              copy built-in prompts into the project
 ```
 
 Agent: `artel note`, `artel add`, `artel heavy` (§6).
@@ -306,6 +327,8 @@ review_rounds = 2
 max_verify_fixes = 2
 merge = "auto"                    # or "ask"
 stage_timeout = "90m"
+setup_timeout = "20m"
+verify_timeout = "30m"
 kill_grace = "30s"
 context_budget = 8000             # bytes
 limit_stop = "allowed_warning"    # or "rejected"
