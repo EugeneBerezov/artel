@@ -81,14 +81,16 @@ counter. Every transition not in the table is an error and is not taken.
 | — | `add` by a human | open | |
 | — | `add` by an agent (`artel add`) | proposed | |
 | proposed | picked | vetting | |
-| vetting | adequate, not risky, `autoapprove` allows | open | |
-| vetting | adequate, risky | attacking (`then=awaiting_approval`) | |
-| vetting | adequate, `autoapprove = "none"` | awaiting_approval | |
+| vetting | adequate, not risky, `autoapprove` ∈ {`non_risky`, `all`} | open | |
+| vetting | adequate, not risky, `autoapprove = "none"` | awaiting_approval | |
+| vetting | adequate, risky, `autoapprove` ∈ {`none`, `non_risky`} | attacking (`then=awaiting_approval`) | |
+| vetting | adequate, risky, `autoapprove = "all"` | attacking (`then=open`) | |
 | vetting | inadequate | rejected | reason recorded; `approve` still allowed |
 | vetting | `fail`, invalid result, timeout | same state | `attempts += 1`; `stuck` at the cap |
 | attacking (`then=awaiting_approval`) | done without blocker | awaiting_approval | summaries attached |
+| attacking (`then=open`) | done without blocker | open | summaries attached |
 | proposed, awaiting_approval, rejected (by vet) | `approve` | open | |
-| proposed, open, blocked, stuck, awaiting_accept | `reject` | rejected | branch deleted |
+| proposed, vetting, awaiting_approval, open, blocked, stuck, awaiting_accept | `reject` | rejected | branch deleted if any; a running stage is terminated first |
 | open | picked, task has `--attack` | attacking | |
 | open | picked, no `--attack` | writing | |
 | attacking | outcome `pass` / `findings` without blocker | writing | findings appended to the task |
@@ -96,25 +98,54 @@ counter. Every transition not in the table is an error and is not taken.
 | attacking, reviewing | `fail`, invalid result, timeout | same state | `attempts += 1`; `stuck` if `attempts ≥ max_attempts` |
 | writing, fixing (`fix_kind=review`) | `ready` with new commits | reviewing | `round += 1` |
 | fixing (`fix_kind=verify`) | `ready` with new commits | verifying | no round |
+| fixing (`fix_kind=conflict`) | `ready` with the merge committed | reviewing | closure check of the resolution; no round added |
 | writing, fixing | `ready` without new commits, `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `round = 0`, `verify_fixes = 0`; `stuck` if `attempts ≥ max_attempts` |
-| any stage | `ask` | blocked (`asked_by=<stage>`) | branch kept, slot freed |
+| any stage | `ask` | blocked (`asked_by=<stage>`, `cause=ask`) | branch kept, slot freed |
+| any stage | `setup` fails before the agent starts | same state | no counter; `running` cleared; board paused (`setup_failed`), notify — an environment fault never costs committed work |
+| any stage | internal runner error in the stage job | same state | FAIL entry with the error tail; `running` cleared; `attempts += 1`; `stuck` at the cap; notify |
 | reviewing | `pass` or only minor findings | verifying | open findings of earlier rounds must be in `closed` |
 | reviewing | blocker/major, `round < review_rounds` | fixing (`fix_kind=review`) | |
-| reviewing | blocker/major, `round ≥ review_rounds` | blocked (`asked_by=review`) | ASK lists open findings |
+| reviewing | blocker/major, `round ≥ review_rounds` | blocked (`asked_by=review`, `cause=cap`) | ASK lists open findings |
 | blocked (`asked_by=attack`) | `answer` | attacking | answer appended to the task |
 | blocked (`asked_by=write` / `fix`) | `answer` | same stage | answer appended |
-| blocked (`asked_by=review`) | `answer` | fixing (`fix_kind=review`) | `review_rounds += 1` for this task; answer appended |
+| blocked (`asked_by=review`, `cause=ask`) | `answer` | reviewing | answer appended; no round added |
+| blocked (`asked_by=review`, `cause=cap`) | `answer` | fixing (`fix_kind=review`) | `review_rounds += 1` for this task; answer appended |
+| blocked (`asked_by=vet`) | `answer` | vetting | answer appended |
 | blocked (`asked_by=verify`) | `answer` | fixing (`fix_kind=verify`) | `max_verify_fixes += 1` for this task |
-| blocked, stuck | `rework --note` | fixing (`fix_kind=review`) | `review_rounds += 1`; `stuck` also resets `attempts` |
+| blocked, stuck (task has a branch) | `rework --note` | fixing (`fix_kind=review`) | `review_rounds += 1`; `stuck` also resets `attempts` |
+| stuck (no branch: vet or attack before code) | `rework --note` | the stuck stage | `attempts = 0`; note appended |
 | verifying | verify green, `merge=auto` | verified | |
 | verifying | verify green, `merge=ask` | awaiting_accept | slot freed; the branch keeps the verified commit |
-| verifying | merge conflict, verify red or `verify_timeout`, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1` |
+| verifying | merge conflict, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=conflict`) | `verify_fixes += 1`; the runner leaves the merge in progress (`merge --no-commit`) for the agent to resolve and commit |
+| verifying | verify red or `verify_timeout`, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1` |
 | verifying | same, cap reached | blocked (`asked_by=verify`) | |
 | awaiting_accept | `accept` | verified | |
 | verified | integration fast-forward succeeds | done | branch deleted, slot freed |
 | verified | fast-forward impossible (integration moved, e.g. while awaiting accept) | verifying | no counter: re-merge and re-verify |
 
 Defaults: `max_attempts = 2`, `review_rounds = 2`, `max_verify_fixes = 2`.
+
+**Single writer.** Human commands (`answer`, `approve`, `reject`, `accept`,
+`rework`, `pause`, `resume`, `stop`) do not change task state themselves:
+they append a request to a `requests` table, and the runner applies it on its
+next tick through the table above. Without a running runner, requests wait;
+`artel status` lists them. `resume` clears only manual and `base_conflict`
+pauses; limit, disk and setup pauses end by themselves (`resume --force`
+clears any).
+
+**Slots for stages without a branch.** `vet` and attack-before-code run in a
+free slot detached at the integration tip, with the read-only profile.
+
+**Leaving a slot.** After every stage the runner aborts any merge in progress
+and runs `git reset --hard` + `git clean -ffdx` (keeping `slot_keep`) before
+`git switch --detach`. These commands refuse to run on any path that is not
+a registered slot under `slots_dir`.
+
+**Recorded processes** carry their start time; reconcile terminates a
+recorded pid only if its start time still matches (pid reuse).
+
+**Empty `verify`** is allowed but shown as a warning in `artel status`, and
+`artel init` asks for it.
 
 **Base moved with a conflict.** If merging the base into `artel/integration`
 (§5) conflicts, the runner pauses the board (`paused: base_conflict`) and
