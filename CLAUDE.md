@@ -12,7 +12,7 @@ standard library only. Apache-2.0. Everything in this repository is in English.
   decisions (PD-*) for spec gaps.
 - `docs/spike-2026-10-19.md` — measured facts about `claude -p`.
 - Do not edit `docs/spec.md` or `docs/plan.md` while implementing. A gap or a
-  contradiction → `python dev/board.py note SPEC-GAP <id> "<text>"`, follow
+  contradiction → `python3 dev/board.py note SPEC-GAP <id> "<text>"`, follow
   the plan's provisional choice, mention it in the commit message.
 
 **Read only what your task needs:** the plan's Global Constraints, your task
@@ -26,15 +26,15 @@ orchestrator: a shared queue and journal in `<git-common-dir>/artel-dev/`,
 driven by `dev/board.py`. Your session name is given in the first message
 (`You are s1`). Loop:
 
-1. `python dev/board.py tail --session <S>` — read what your peer learned.
+1. `python3 dev/board.py tail --session <S>` — read what your peer learned.
    Do not redo anything a FAIL entry says failed.
-2. `python dev/board.py claim --session <S>` — take the next task.
+2. `python3 dev/board.py claim --session <S>` — take the next task.
    Nothing claimable → say so and wait for the owner.
 3. `git worktree add .claude/worktrees/<S>-T<id> -b dev/T<id> main` and work
    only there. Never edit files in the main checkout: it belongs to
    `integrate`.
 4. Implement with tests first (`unittest`). Run the tests you touched, then the
-   whole suite: `python -m unittest discover -s tests -q`.
+   whole suite: `python3 -m unittest discover -s tests -q`.
 5. **Review by a fresh sub-agent** (Agent tool, model set explicitly):
    `sonnet`, or `opus` if `claim` said the task is risky. Give it the task
    section, the cited spec sections and `git diff main...HEAD`; it must not
@@ -42,18 +42,18 @@ driven by `dev/board.py`. Your session name is given in the first message
    (were the findings closed, new blockers only). Still open after round 2 →
    ask the owner.
 6. Commit on `dev/T<id>`, then
-   `python dev/board.py integrate <id> --branch dev/T<id>` — merges into
+   `python3 dev/board.py integrate <id> --branch dev/T<id> --session <S>` — merges into
    `main`, runs the suite, pushes (standing permission: `main` only, never
    force).
-7. `python dev/board.py ci --sha <merge sha>` — the CI matrix (Linux, macOS,
+7. `python3 dev/board.py ci --sha <merge sha>` — the CI matrix (Linux, macOS,
    Windows). Red on another OS → fix it in a new branch as the same task.
-8. `python dev/board.py note FACT|FAIL <id> "…" --session <S>` for anything
+8. `python3 dev/board.py note FACT|FAIL <id> "…" --session <S>` for anything
    your peer should know (≤ 400 bytes, with `--basis`). Remove the worktree.
    Next task.
 
 Tasks marked controller (T16, T25: live checks with a real `claude`) are not
 handed out by `claim`; the owner's main session runs them with the owner's
-consent and marks them with `python dev/board.py done <id>`.
+consent and marks them with `python3 dev/board.py done <id>`.
 
 Your context grows across tasks; that is intended. When it gets heavy, tell
 the owner to restart you — all state is in the board, the journal and git.
