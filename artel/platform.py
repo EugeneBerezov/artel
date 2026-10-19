@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -128,17 +129,31 @@ def register_tree(proc: subprocess.Popen) -> None:
         return
     info = _ExtendedLimits()
     info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-    _k32.SetInformationJobObject(job, _JobObjectExtendedLimitInformation, ctypes.byref(info),
-                                 ctypes.sizeof(info))
-    handle = _k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, proc.pid)
+    ok = _k32.SetInformationJobObject(job, _JobObjectExtendedLimitInformation, ctypes.byref(info),
+                                      ctypes.sizeof(info))
+    handle = _k32.OpenProcess(_PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, proc.pid) if ok else None
+    assigned = False
     if handle:
         try:
-            if not _k32.AssignProcessToJobObject(job, handle):
-                _k32.CloseHandle(job)
-                return
+            assigned = bool(_k32.AssignProcessToJobObject(job, handle))
         finally:
             _k32.CloseHandle(handle)
+    if not assigned:
+        _k32.CloseHandle(job)
+        return
+    _close_job(proc.pid, terminate=False)   # pid reuse: never leak the older handle
     _JOBS[proc.pid] = job
+
+
+def _close_job(pid: int, terminate: bool) -> bool:
+    """Windows: drop the job registered for pid, killing its members if asked. True if a job existed."""
+    job = _JOBS.pop(pid, None)
+    if not job:
+        return False
+    if terminate:
+        _k32.TerminateJobObject(job, 1)
+    _k32.CloseHandle(job)
+    return True
 
 
 def group_of(proc: subprocess.Popen) -> int:
@@ -151,6 +166,8 @@ def group_of(proc: subprocess.Popen) -> int:
 
 
 def soft_terminate(pid: int, group: int) -> None:
+    if pid <= 0 or group <= 1:
+        return
     try:
         if IS_WINDOWS:
             os.kill(pid, signal.CTRL_BREAK_EVENT)
@@ -162,12 +179,12 @@ def soft_terminate(pid: int, group: int) -> None:
 
 def hard_kill(pid: int, group: int) -> None:
     if IS_WINDOWS:
-        job = _JOBS.pop(pid, None)
-        if job:
-            _k32.TerminateJobObject(job, 1)
-            _k32.CloseHandle(job)
+        if _close_job(pid, terminate=True):
+            return
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True,
                        encoding="utf-8", errors="ignore")
+        return
+    if group <= 1:
         return
     try:
         os.killpg(group, signal.SIGKILL)
@@ -178,6 +195,8 @@ def hard_kill(pid: int, group: int) -> None:
 def tree_alive(pid: int, group: int) -> bool:
     if IS_WINDOWS:
         return pid_alive(pid)
+    if group <= 1:
+        return False
     try:
         os.killpg(group, 0)
         return True
@@ -188,10 +207,12 @@ def tree_alive(pid: int, group: int) -> bool:
 
 
 def pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
     if IS_WINDOWS:
         handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
-            return False
+            return ctypes.get_last_error() == 5   # ERROR_ACCESS_DENIED: exists, not ours
         try:
             code = wintypes.DWORD()
             return bool(_k32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == _STILL_ACTIVE
@@ -217,6 +238,8 @@ def _not_zombie(pid: int) -> bool:
 
 def process_fingerprint(pid: int) -> str | None:
     if IS_WINDOWS:
+        if not pid_alive(pid):   # an open handle keeps an exited process queryable
+            return None
         handle = _k32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
         if not handle:
             return None
@@ -238,7 +261,7 @@ def process_fingerprint(pid: int) -> str | None:
             return None
         return fields[19]                           # field 22: starttime
     out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
-                         encoding="utf-8", errors="replace")
+                         encoding="utf-8", errors="replace", env={**os.environ, "LC_ALL": "C"})
     value = out.stdout.strip()
     return value or None
 
@@ -253,9 +276,13 @@ def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None =
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         if not tree_alive(pid, group):
-            return True
+            break
+        if not IS_WINDOWS and not _not_zombie(pid):
+            break   # leader exited but is unreaped (the caller's own child): killpg(0) would never fail
         time.sleep(0.05)
-    if tree_alive(pid, group):
+    # Finish with a hard kill: it sweeps stragglers that ignored the soft stop (POSIX group, Windows job)
+    # and releases the job handle; it is harmless when nothing is left.
+    if IS_WINDOWS or tree_alive(pid, group):
         hard_kill(pid, group)
     return True
 
@@ -290,8 +317,11 @@ def git_bash_candidates(exec_path: str, env: Mapping[str, str]) -> list[Path]:
 
 
 def find_git_bash() -> str:
-    exec_path = subprocess.run(["git", "--exec-path"], capture_output=True, encoding="utf-8",
-                               errors="replace").stdout.strip()
+    try:
+        exec_path = subprocess.run(["git", "--exec-path"], capture_output=True, encoding="utf-8",
+                                   errors="replace").stdout.strip()
+    except OSError:
+        raise ArtelError("cannot find git on PATH; install Git for Windows (https://gitforwindows.org)")
     for candidate in git_bash_candidates(exec_path, os.environ):
         if candidate.exists():
             return str(candidate)
@@ -350,7 +380,7 @@ def write_wrapper(stem: Path, argv: Sequence[str]) -> list[str]:
         body = "@" + " ".join(f'"{a}"' for a in argv) + " %*\r\n"
     else:
         path = stem
-        body = "exec " + " ".join(f'"{a}"' for a in argv) + ' "$@"\n'
+        body = "exec " + " ".join(shlex.quote(a) for a in argv) + ' "$@"\n'
     with open(path, "w", encoding="utf-8", newline="") as fh:
         fh.write(body if IS_WINDOWS else "#!/bin/sh\n" + body)
     if not IS_WINDOWS:
@@ -365,6 +395,10 @@ def free_bytes(path: Path) -> int:
 def long_paths_warning(repo_git: Callable[..., str], *, windows: bool = IS_WINDOWS) -> str | None:
     if not windows:
         return None
-    if repo_git("config", "core.longpaths").strip() == "true":
+    try:
+        value = repo_git("config", "core.longpaths").strip()   # git exits 1 when the key is unset
+    except ArtelError:
+        value = ""
+    if value == "true":
         return None
     return "git core.longpaths is not enabled; deep paths may fail. Fix: git config core.longpaths true"

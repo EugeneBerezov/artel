@@ -141,7 +141,7 @@ class StopHandlerTest(unittest.TestCase):
     def test_soft_terminate_runs_callback(self):
         code = ("import sys, time\nfrom artel.platform import install_stop_handlers\n"
                 "def cb():\n    print('stopped', flush=True)\n    sys.exit(0)\n"
-                "install_stop_handlers(cb)\nprint('up', flush=True)\ntime.sleep(60)\n")
+                "install_stop_handlers(cb)\nprint('up', flush=True)\n[time.sleep(0.1) for _ in range(600)]\n")
         proc = subprocess.Popen(py_cmd(code), stdout=subprocess.PIPE, encoding="utf-8",
                                 env=subprocess_env(), cwd=REPO_ROOT, **P.popen_kwargs())
         P.register_tree(proc)
