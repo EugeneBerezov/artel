@@ -51,6 +51,10 @@ driven by `dev/board.py`. Your session name is given in the first message
    your peer should know (≤ 400 bytes, with `--basis`). Remove the worktree.
    Next task.
 
+Tasks marked controller (T16, T25: live checks with a real `claude`) are not
+handed out by `claim`; the owner's main session runs them with the owner's
+consent and marks them with `python dev/board.py done <id>`.
+
 Your context grows across tasks; that is intended. When it gets heavy, tell
 the owner to restart you — all state is in the board, the journal and git.
 
