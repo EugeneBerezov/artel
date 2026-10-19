@@ -60,3 +60,7 @@ class RepoTestCase(unittest.TestCase):
         git(where, "add", rel)
         git(where, "commit", "-q", "-m", message)
         return git(where, "rev-parse", "HEAD")
+
+
+IGNORE_SOFT_STOP = ("import signal\n"
+                    "signal.signal(getattr(signal, 'SIGBREAK', signal.SIGTERM), signal.SIG_IGN)\n")
