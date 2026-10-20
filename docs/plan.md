@@ -1353,7 +1353,7 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
           effects=("append_answer",)),
       Row("R29b", ("stuck",), "rework", "fixing", when=("has_branch",),
           sets=("fix_kind=review", "extra_review_rounds+1", "attempts=0", "stuck_from=none", "answered=1",
-                "fix_base=tip"),
+                "fix_base=tip", "accepted=0"),
           effects=("append_answer",)),
       Row("R30", ("stuck",), "rework", "@stuck_from", when=("no_branch",),
           sets=("attempts=0", "stuck_from=none", "answered=1"), effects=("append_answer",)),
@@ -1365,9 +1365,9 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
       Row("R33", ("verifying",), "verify_red", "fixing", when=("vfix<cap",),
           sets=("fix_kind=verify", "verify_fixes+1", "accepted=0", "fix_base=tip"), cause="max_verify_fixes"),
       Row("R34a", ("verifying",), "verify_red", "blocked", when=("vfix>=cap",),
-          sets=("asked_by=verify", "cause=cap"), cause="max_verify_fixes"),
+          sets=("asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
       Row("R34b", ("verifying",), "verify_conflict", "blocked", when=("vfix>=cap",),
-          sets=("asked_by=verify", "cause=cap"), cause="max_verify_fixes"),                   # PD-39
+          sets=("asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),                   # PD-39
       Row("R35", ("awaiting_accept",), "accept", "verified", sets=("accepted=1",)),           # PD-36
       Row("R36", ("verified",), "ff_ok", "done", effects=("delete_branch",)),
       Row("R37", ("verified",), "ff_impossible", "verifying"),
@@ -2197,9 +2197,11 @@ Full test list: `test_ensure_integration_branch_idempotent`; `test_verify_green_
             #    integrate.base_needs_update — start the base job when no verify/base job runs and a slot is
             #    free (its pid/group/fingerprint/slot go to meta base_running from on_start, PD-34) — and in
             #    every case pick nothing new this tick while the base update is pending or running
-            # 5. busy = ids of tasks with a live Job; pick.select(tasks, deps, free_slots=..., verify_busy=...,
-            #    busy=busy) — so a task whose job has not yet set `running` is never dispatched twice;
-            #    drop proposed tasks while "vet" is not in stages.SUPPORTED_STAGES (they wait until Task 21);
+            # 5. busy = ids of tasks with a live Job; while "vet" is not in stages.SUPPORTED_STAGES, remove
+            #    proposed tasks from the list BEFORE select (they wait until Task 21; filtering after select
+            #    would let them take the free slots and starve open tasks); pick.select(tasks, deps,
+            #    free_slots=..., verify_busy=..., busy=busy) — so a task whose job has not yet set `running`
+            #    is never dispatched twice;
             #    for each selected task that has a branch, slots.checked_out_elsewhere(repo, task_branch(id))
             #    → skip it before any transition (PD-8; nothing applied, no attempt);
             #    apply `pick` for open tasks (R10a/b) and, when "vet" is in SUPPORTED_STAGES, for proposed
@@ -2291,7 +2293,9 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
       # only these two methods exist; there is no getUpdates code path
   class CommandNotifier:
       def __init__(self, command: Command, shell: str)
-      def send_event(self, e: Event) -> bool      # procs.command_argv(command, shell); event JSON (UTF-8) on stdin; 30 s timeout
+      def send_event(self, e: Event) -> bool      # procs.run_tree(procs.command_argv(command, shell), ...) — so a
+                                                  # string command with shell="cmd" goes through platform.command_line;
+                                                  # event JSON (UTF-8) on stdin; 30 s timeout
   class Dispatcher:
       @classmethod
       def from_config(cls, cfg, env: Mapping[str, str]) -> "Dispatcher"
@@ -2371,7 +2375,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
       # unless force (error text otherwise: "pause <reason> ends by itself; use resume --force");
       # stop → hooks.stop(now) and delete the stop file. TransitionError → finish_request(error=…).
   ```
-  Runner change: `tick()` starts with `requests.apply_pending(self.repo, self.board, self.cfg, self)` and also reads/clears the stop file (PD-26); `Runner.start` (after taking the lock) deletes a stale stop file and finishes pending `stop` requests with error `stale: no runner` (PD-26 amended); `Runner.terminate(task_id)` sets the job's stop event, joins it, and clears `running` without a counter.
+  Runner change: `tick()` starts with `requests.apply_pending(self.repo, self.board, self.cfg, self)` and also reads/clears the stop file (PD-26); `Runner.start` (after taking the lock) deletes a stale stop file and finishes pending `stop` requests with error `stale: no runner` (PD-26 amended); `Runner.terminate(task_id)` sets the job's stop event, joins it, and clears `running` without a counter; `Runner.stop(now)` is added as the `RunnerHooks.stop` method and calls `request_stop(now)`.
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_requests.py` on `E2ECase` from `tests/e2e.py`).
   Full list: `test_commands_only_enqueue` (no runner: state unchanged, request pending, message says no runner); `test_runner_applies_on_next_tick`; `test_answer_writes_answer_entry_and_resumes` (blocked/write → writing, answered); `test_answer_reviewer_question_returns_to_review` (R25 through a request); `test_invalid_request_recorded_as_error` (answer on an open task → request error, state unchanged); `test_approve_rejected_by_vet_only`; `test_reject_while_running_terminates_first` (fake agent sleeping → reject → job terminated, pid dead, state rejected, branch deleted, attempts unchanged); `test_reject_reason_recorded` (PD-19); `test_rework_stuck_with_and_without_branch`; `test_accept_moves_to_verified_then_done`; `test_pause_manual_then_resume`; `test_resume_does_not_clear_limit_pause_without_force`; `test_stop_request_and_stop_file` (either one stops picking; `now` terminates and requeues without counting); `test_stop_without_runner_leaves_nothing` (no request, no stop file; a runner started afterwards keeps running); `test_stale_stop_file_cleared_at_start` (a stop file and a pending stop request left from before → the new runner does not exit; the request is finished with `stale: no runner`); `test_reject_without_reason_stores_empty_string`.
@@ -2464,7 +2468,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
 
 **Spec:** §4 "Vetting proposed tasks" (fresh agent on the `review` model; adequacy: needed, duplicate of an open or done task, contradicts recorded decisions, sane scope; risky = any `risk_signals`; outcomes per `autoapprove`), §3.1 vet rows (R03–R08 and R27/R30 of Task 7), "Slots for stages without a branch", PD-27, PD-32.
 
-**Context for the writer:** Global Constraints + Spike facts + PD-27, PD-32 + this task.
+**Context for the writer:** Global Constraints + Spike facts + PD-27, PD-32, PD-37 + this task.
 
 **Files:**
 - Modify: `artel/stages.py` (add `"vet"` to `SUPPORTED_STAGES`; vet inputs; vet classification and recording), `artel/prompts.py` (only if `render` needs a vet-specific helper)
@@ -2568,7 +2572,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 - Create: `artel/cmd_init.py`, `tests/test_cmd_init.py`
 
 **Interfaces:**
-- Consumes: `Repo`, `platform.long_paths_warning`, `platform.shell_argv`, `platform.which`, `open_board`, `config.render_toml`, `load_config`, `templates.export(only_missing=True)`, `integrate.ensure_integration_branch`, `notify.check_and_enable`.
+- Consumes (`long_paths_warning` takes a str-returning callable: pass `lambda *a: repo.git(*a).stdout.strip()`): `Repo`, `platform.long_paths_warning`, `platform.shell_argv`, `platform.which`, `open_board`, `config.render_toml`, `load_config`, `templates.export(only_missing=True)`, `integrate.ensure_integration_branch`, `notify.check_and_enable`.
 - Produces (`artel.cmd_init`):
   ```python
   @dataclass(frozen=True)
@@ -2712,7 +2716,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 
 **Spec:** §11 (all eight sections, reviewed like code), §10 (defaults visible), §6 (safety statements that the README must make), §7 (what Telegram sends), §12 (install per platform, Windows needs Git for Windows, `core.longpaths`, list-form commands), §14a.
 
-**Depends on:** Task 24
+**Depends on:** Task 24, 25, 26 (Task 26 skipped → the controller marks it `done --note skipped`)
 
 (Task 26 may be skipped, so this task depends on the last task that always runs; the README describes rotation only if Task 26 is done.)
 
