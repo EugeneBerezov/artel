@@ -292,6 +292,18 @@ def _clip(text: str, limit: int = journal.TEXT_LIMIT) -> str:
     return journal.truncate_utf8(" ".join(text.split()), limit)
 
 
+def _clip_tail(prefix: str, text: str, limit: int = journal.TEXT_LIMIT) -> str:
+    """prefix + text, whitespace folded; when too long the START of `text` is cut, because the end of a
+    traceback names the error."""
+    text = " ".join(text.split())
+    room = limit - len(prefix.encode("utf-8"))
+    raw = text.encode("utf-8")
+    if len(raw) <= room:
+        return prefix + text
+    marker = "…".encode("utf-8")
+    return prefix + (marker + raw[-(room - len(marker)):]).decode("utf-8", errors="ignore")
+
+
 def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) -> None:
     author = f"agent:{plan.stage}"
     common = dict(task_id=task.id, stage=plan.stage, round=plan.round)
@@ -397,8 +409,8 @@ def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Tr
     task = board.get_task(task_id)
     stage = STATE_TO_STAGE.get(task.state, task.state)   # verifying has no agent stage; its state names the job
     try:
-        journal.append(board, "FAIL", _clip("internal error: " + error_tail), author="runner", task_id=task_id,
-                       stage=stage)
+        journal.append(board, "FAIL", _clip_tail("internal error: ", error_tail), author="runner",
+                       task_id=task_id, stage=stage)
         tr = transitions.apply(board, task_id, "internal_error", Limits.from_cfg(task, cfg),
                                has_branch=repo.branch_exists(task_branch(task_id)),
                                tip=repo.rev(task_branch(task_id)))
