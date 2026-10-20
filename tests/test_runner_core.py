@@ -1,3 +1,5 @@
+import argparse
+import io
 import json
 import os
 import subprocess
@@ -7,10 +9,11 @@ import time
 import unittest
 from unittest import mock
 
-from artel import events, integrate, journal, platform, slots, stages
+from artel import events, integrate, journal, platform, procs, slots, stages
+from artel import runner as runner_module
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION
-from artel.runner import Runner
+from artel.runner import Job, Runner
 from tests.e2e import E2ECase
 from tests.helpers import git, py_cmd, subprocess_env
 
@@ -158,12 +161,13 @@ class RunnerCoreTest(E2ECase):
     def test_setup_failure_pauses_and_keeps_branch(self):
         self.write_toml({"commands.setup": py_cmd("import sys; sys.exit(3)")})
         self.scenario({"write": WRITE, "review": PASS})
-        first = self.add_task("first")
-        second = self.add_task("second", area=["other"])
+        first = self.add_task("first", area=["one"])
         r = self.runner(max_agents=2)
         r.start()
         try:
             self.drive(r, lambda: self.board.get_meta("pause_reason") == "setup_failed")
+            self.assertTrue(self.board.get_meta("pause_detail"))   # M17
+            second = self.add_task("second", area=["other"])   # disjoint: only the pause gate can keep it open
             for _ in range(5):   # nothing new is picked while paused
                 r.tick()
                 r.wait(0.05)
@@ -173,6 +177,7 @@ class RunnerCoreTest(E2ECase):
             self.assertTrue(self.repo.branch_exists(f"artel/{first}"))
             self.assertIn("paused", kinds(self))
             self.assertEqual(self.calls(), [])   # the agent never started
+            self.assertSlotsCleanAndDetached()   # M08: the half-done job left its slot quietly
         finally:
             r.shutdown()
 
@@ -354,7 +359,8 @@ class RunnerCoreTest(E2ECase):
     def test_event_json(self):
         e = events.Event("done", 3, "t", "done")
         self.assertEqual(e.to_json(), '{"kind": "done", "task_id": 3, "title": "t", "state": "done"}')
-        self.assertEqual(events.EVENT_KINDS[-1], "error")
+        self.assertEqual(events.EVENT_KINDS, ("blocked", "stuck", "awaiting_accept", "paused", "resumed", "done",
+                                              "runner_stopped", "error"))   # catches a missing or reordered kind
         events.null_notify(e)
 
 
@@ -679,6 +685,33 @@ class RunnerHardeningTest(E2ECase):
         finally:
             r.shutdown()
 
+    def test_a_soft_stop_lets_the_running_stage_finish(self):
+        # catches M07 (`if self.stopping and not self.jobs` -> `if self.stopping`): running stages would be abandoned
+        slow_write = [{"sleep": 1.0}] + WRITE
+        self.scenario({"write": slow_write, "review": PASS})
+        tid = self.add_task("Add hello")
+        r = self.runner(max_agents=1)
+        result = []
+        thread = threading.Thread(target=lambda: result.append(r.run_forever()))
+        thread.start()
+        try:
+            self.wait_until(lambda: self.board.get_task(tid).running)
+            r.request_stop(now=False)
+            thread.join(60)
+            self.assertFalse(thread.is_alive())
+        finally:
+            r.request_stop(now=True)
+            thread.join(10)
+        self.assertEqual(result, [0])
+        task = self.board.get_task(tid)
+        self.assertEqual(task.state, "reviewing")    # the write stage completed and was recorded, not requeued
+        self.assertEqual(len(self.calls()), 1)       # ...and nothing new was started after the soft stop
+        self.assertEqual(task.attempts, 0)
+        self.assertFalse(task.running)
+        other = platform.FileLock(self.repo.lock_path)
+        self.assertTrue(other.acquire())             # a fresh handle: the lock really was released
+        other.release()
+
     def test_start_prepares_the_shim_and_clears_runner_pid_on_shutdown(self):
         r = self.make_runner()
         self.assertTrue((self.repo.artel_dir / "bin").is_dir())
@@ -699,6 +732,166 @@ class RunnerHardeningTest(E2ECase):
         self.wait_until(lambda: not any(platform.pid_alive(p) for p in pids), timeout=15)
         task = self.board.get_task(tid)
         self.assertEqual((task.state, task.attempts, task.running), ("verifying", 0, False))   # requeued, no counter
+
+
+class HeldTaskAreaTest(E2ECase):
+    def _held_then_tick(self, state):
+        a = self.add_task("A", area=["src"])
+        b = self.add_task("B", area=["src"])
+        git(self.repo_path, "branch", f"artel/{a}", INTEGRATION)
+        t = self.board.get_task(a)
+        self.board.update_task(a, expect_state="open", expect_version=t.version, state=state, round=1)
+        git(self.repo_path, "worktree", "add", str(self.tmp / "human"), f"artel/{a}")
+        r = self.runner(max_agents=2)
+        r.start()
+        try:
+            r.tick()
+            self.assertEqual([j for j in r.jobs if j.task_id == a], [])   # a held task is never a candidate
+            return self.board.get_task(b).state
+        finally:
+            r.shutdown()
+
+    def test_held_verified_task_keeps_its_area(self):
+        self.assertEqual(self._held_then_tick("verified"), "open")
+
+    def test_held_reviewing_task_keeps_its_area(self):
+        self.assertEqual(self._held_then_tick("reviewing"), "open")
+
+
+class RunnerReopenTest(E2ECase):
+    """Reopen of Task 15 (reviews/T15-2.md, plan 'Reopened 2026-10-20')."""
+
+    def test_a_held_done_dependency_does_not_block_its_dependent(self):
+        # catches the pre-filter: a `done` task whose branch a human recreated vanished, dependents waited forever
+        a = self.add_task("A", area=["x"])
+        b = self.add_task("B", area=["y"], after=[a])
+        git(self.repo_path, "branch", f"artel/{a}", INTEGRATION)
+        t = self.board.get_task(a)
+        self.board.update_task(a, expect_state="open", expect_version=t.version, state="done")
+        git(self.repo_path, "worktree", "add", str(self.tmp / "human"), f"artel/{a}")
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            r.tick()
+            self.assertEqual(self.board.get_task(b).state, "writing")
+        finally:
+            r.shutdown()
+
+    def test_awaiting_accept_notified_with_reason(self):
+        # catches notifying only blocked/stuck
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello", merge="ask")
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            self.drive(r, lambda: self.board.get_task(tid).state == "awaiting_accept")
+            self.drive(r, lambda: "awaiting_accept" in kinds(self))
+        finally:
+            r.shutdown()
+        (e,) = [x for x in self.events if x.kind == "awaiting_accept"]
+        self.assertEqual(e.task_id, tid)
+        self.assertIn("merge=ask", e.text)
+
+    def test_start_twice_raises(self):
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            with self.assertRaisesRegex(ArtelError, "runner already started"):
+                r.start()
+            self.assertTrue(self.board.get_meta("runner_pid"))   # the refused start released nothing
+        finally:
+            r.shutdown()
+
+    def test_shutdown_warns_about_a_job_that_will_not_stop_and_releases_the_lock(self):
+        # catches an unbounded join
+        r = self.runner(max_agents=1, kill_grace="1s")
+        r.start()
+        release = threading.Event()
+        stuck = threading.Thread(target=release.wait, daemon=True)
+        stuck.start()
+        r.jobs.append(runner_job(stuck))
+        err = io.StringIO()
+        with mock.patch.object(procs, "JOIN_DEADLINE", 0.2), mock.patch("sys.stderr", err):
+            started = time.monotonic()
+            r.shutdown()
+        release.set()
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertIn("warning: job stage #7 did not stop", err.getvalue())
+        other = platform.FileLock(self.repo.lock_path)
+        self.assertTrue(other.acquire())   # a fresh handle: the lock really was released
+        other.release()
+
+    def test_a_raising_notifier_in_the_base_failure_records_one_fail(self):
+        # catches _base_failed running twice (notify raised -> _collect -> _finish_failed -> _base_failed)
+        self.commit_file("base-news.txt", "news\n", "base moved on")
+        with mock.patch.object(integrate, "base_update", side_effect=RuntimeError("base broke")):
+            r = self.runner(max_agents=1)
+            r.start()
+            r.notify = mock.Mock(side_effect=RuntimeError("notifier down"))
+            try:
+                self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+                for _ in range(3):
+                    r.tick()
+                    r.wait(0.05)
+            finally:
+                r.shutdown()
+        rows = self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'").fetchall()
+        self.assertEqual(len([x for x in rows if x["text"].startswith("internal error in the base job")]), 1)
+
+    def test_an_error_in_collect_does_not_end_the_runner(self):
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            with mock.patch.object(Runner, "_collect", side_effect=RuntimeError("collect broke")):
+                r.tick()
+                r.tick()
+            rows = self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'").fetchall()
+            self.assertEqual(len(rows), 1)   # recorded once per text
+            self.assertIn("collecting results", rows[0]["text"])
+            r.tick()   # and the next tick works
+        finally:
+            r.shutdown()
+
+    def test_a_job_that_ends_after_the_tick_started_is_not_a_lost_wakeup(self):
+        # catches wait() clearing the flag after the job's wakeup: the tick must clear before it collects
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            done = threading.Thread(target=lambda: None)
+            done.start()
+            done.join()
+            r._wake.set()                 # a wakeup from before this tick
+            r.tick()
+            self.assertFalse(r._wake.is_set())
+            r._wake.set()                 # a job finishing during/after the tick
+            started = time.monotonic()
+            r.wait(5)
+            self.assertLess(time.monotonic() - started, 1)   # wait() must not swallow it
+            self.assertTrue(r._wake.is_set())
+        finally:
+            r.shutdown()
+
+    def test_run_command_maps_n_to_max_agents(self):
+        captured = {}
+
+        class Spy(Runner):
+            def run_forever(self_):
+                captured["max_agents"] = self_.cfg["max_agents"]
+                return 0
+
+        args = argparse.Namespace(n=3)
+        cwd = os.getcwd()
+        os.chdir(self.repo_path)
+        try:
+            with mock.patch.object(runner_module, "Runner", Spy):
+                self.assertEqual(runner_module.run_command(args), 0)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(captured["max_agents"], 3)
+
+
+def runner_job(thread):
+    return Job("stage", 7, 1, thread, threading.Event())
 
 
 def pick_module():
