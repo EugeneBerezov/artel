@@ -191,3 +191,6 @@
 - 2026-10-20T04:30:39Z main REVIEW T13: cross-review of s2's merge [basis: 6f65d99775c18be1c746ed423ad6ffee437bacbc]
 - 2026-10-20T04:40:30Z s2 FACT T13: T13 follow-up merged (6f65d99) CI green: s1's dev/T13b hardening (minors 3,6,7 + mutants) merged with the PD-46 round; CLOSE entry author is 'artel' per PD-46. [basis: CI run 39369945188]
 - 2026-10-20T04:40:43Z main REVIEW-PASS T13: Follow-up merges s1's dev/T13b: branchless per pinned rule (then set or no branch), prepare inside try, denials of requeued runs recorded, PD-46 supersede, Round2Test for mutants; CI green run 39369945188. [basis: 6f65d99775c18be1c746ed423ad6ffee437bacbc]
+- 2026-10-20T05:27:13Z s1 DONE T15: merged dev/T15 into main [basis: 7604e6200a87184a1f1b01125ac5158f342be2d3]
+- 2026-10-20T05:27:26Z s2 REVIEW T15: cross-review of s1's merge [basis: 7604e6200a87184a1f1b01125ac5158f342be2d3]
+- 2026-10-20T05:28:29Z s2 RELEASE T15: review released: owner stop; review unfinished

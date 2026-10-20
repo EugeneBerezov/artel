@@ -15,7 +15,7 @@ owner, and what is open. Raw review files and a journal snapshot are in
 | W3 | T6, T7, T8, T9 | done, cross-reviewed, CI green |
 | W4 | T10, T11, T12, T29 (T7 test hardening) | done, cross-reviewed, CI green |
 | W5 | T13, T14 | done, cross-reviewed, CI green |
-| W6 | T15 runner core + e2e slice | in progress at checkpoint time (s1); see "After the checkpoint" |
+| W6 | T15 runner core + e2e slice | merged 7604e62 (05:27 UTC); **cross-review NOT done** (s2 stopped mid-review), CI at stop time pending |
 | W6 | T16 live slice check | controller task, needs the owner's consent; blocks W7 |
 | W7–W11 | T17–T27 | open |
 
@@ -87,6 +87,18 @@ map "database is locked" to `BoardBusy`; T10 runs `git worktree prune` on
 every prepare (should be reconcile only), post-checkout hooks run in slots;
 T14 does not detect a human rewind of `artel/integration`; T9 fake-agent
 fidelity gaps.
+
+## After the checkpoint (stop at ~05:30 UTC)
+
+- T15 merged by s1 as 7604e62; the owner stopped the team while s2 was
+  cross-reviewing it. The review was released unfinished (a partial
+  `reviews/T15-1.md` may exist). **First job of the new team: the T15
+  cross-review (opus, risky) and its CI** (`board.py ci --sha 7604e62…`).
+- The repository is public since 2026-10-20; the T15 run is the first one
+  after the switch — confirm in Settings → Billing that it consumed no
+  included minutes.
+- Leftover worktrees of the old s1 (`.claude/worktrees/s1-*`) hold no unmerged
+  work except possibly WIP named in a journal NOTE; check before removing.
 
 ## How to resume
 
