@@ -120,6 +120,9 @@ class TreeTest(unittest.TestCase):
         proc = self.spawn("print('x')")
         proc.wait(timeout=10)
         self.assertTrue(wait_dead(proc.pid))
+        deadline = time.monotonic() + 10   # the Windows job's ActiveProcesses lags the exit by a moment
+        while P.tree_alive(proc.pid, P.group_of(proc)) and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.assertFalse(P.tree_alive(proc.pid, P.group_of(proc)))
 
     def test_terminate_skips_on_fingerprint_mismatch(self):
