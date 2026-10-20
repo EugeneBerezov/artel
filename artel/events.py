@@ -3,7 +3,8 @@ import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
-EVENT_KINDS = ("blocked", "stuck", "paused", "resumed", "done", "runner_stopped", "error")   # error: PD-38
+EVENT_KINDS = ("blocked", "stuck", "awaiting_accept", "paused", "resumed", "done", "runner_stopped",
+               "error")   # error: PD-38
 
 
 @dataclass(frozen=True)

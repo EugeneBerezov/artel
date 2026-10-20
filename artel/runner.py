@@ -6,6 +6,7 @@ request handling to Task 18, vetting to Task 21.
 """
 import json
 import os
+import sys
 import threading
 import time
 import traceback
@@ -13,7 +14,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import agent_claude, cmd_agent, config as config_mod, integrate, journal, pick, platform, slots, stages
+from artel import agent_claude, cmd_agent, config as config_mod, integrate, journal, pick, platform, procs, slots, stages
 from artel import transitions
 from artel.board import Board, open_board
 from artel.errors import ArtelError
@@ -55,12 +56,15 @@ class Runner:
         self._lock = platform.FileLock(repo.lock_path)
         self._wake = threading.Event()
         self._closed = False
+        self._started = False
         self._last_tick_error: str | None = None
         self._integrate_skip: dict[int, float] = {}   # task id -> clock() until which integrate is not retried
 
     # lifecycle ----------------------------------------------------------------------------------------------
 
     def start(self) -> None:
+        if self._started:
+            raise ArtelError("runner already started")
         if not self._lock.acquire():
             raise ArtelError(f"another artel runner holds {self.repo.lock_path}")
         try:
@@ -74,6 +78,7 @@ class Runner:
             integrate.ensure_integration_branch(self.repo, self.cfg["base"])
             slots.ensure_slots(self.repo, self.board, self.cfg, self.cfg["max_agents"])
             self.reconcile()
+            self._started = True
         except BaseException:
             self._release()
             raise
@@ -110,8 +115,11 @@ class Runner:
         self._closed = True
         self.request_stop(now=True)
         try:
+            grace = self.cfg["kill_grace"]
             for job in list(self.jobs):
-                job.thread.join()
+                job.thread.join(grace + procs.JOIN_DEADLINE)   # the stop event was set by request_stop
+                if job.thread.is_alive():
+                    print(f"warning: job {job.kind} #{job.task_id} did not stop", file=sys.stderr)
             if self.board is not None:
                 self._collect()
         finally:
@@ -119,7 +127,6 @@ class Runner:
 
     def wait(self, timeout: float) -> None:
         self._wake.wait(timeout)
-        self._wake.clear()
 
     def run_forever(self) -> int:
         self.start()
@@ -200,18 +207,31 @@ class Runner:
     # the tick -----------------------------------------------------------------------------------------------
 
     def tick(self) -> None:
-        self._collect()
-        self._integrate_verified()
+        self._wake.clear()   # before collecting: a job that ends from here on sets it again, no lost wakeup
+        if self._guarded("collecting results", self._collect):
+            return
+        self._guarded("integrating", self._integrate_verified)
         if self.board.get_meta("pause_reason") or self.stopping:
             return
         if self._guarded("the base check", self._base_moved):
             return
         self._guarded("picking work", self._pick_and_start)
 
+    def _emit(self, event: Event) -> None:
+        """A raising notifier must not undo or repeat the bookkeeping around it (no second FAIL, no second charge)."""
+        try:
+            self.notify(event)
+        except Exception:   # noqa: BLE001
+            self._guarded("the notifier", self._reraise)
+
+    @staticmethod
+    def _reraise() -> None:
+        raise
+
     def _guarded(self, what: str, fn):
         """An unexpected error in one step of the tick must not end the runner; it is recorded once per text."""
         try:
-            return fn()
+            return fn() or False
         except Exception:   # noqa: BLE001
             tail = traceback.format_exc()
             text = stages._clip_tail(f"internal error in {what}: ", tail)
@@ -226,7 +246,8 @@ class Runner:
             try:
                 self._finish(job)
             except Exception:   # noqa: BLE001 - one task's bookkeeping must not stop the runner
-                self._finish_failed(job, traceback.format_exc())
+                tail = traceback.format_exc()
+                self._guarded("finishing a job", lambda: self._finish_failed(job, tail))
 
     def _finish_failed(self, job: Job, tail: str) -> None:
         """The result of a job could not be applied. A task job is charged like any internal error, so the
@@ -242,7 +263,7 @@ class Runner:
                 return
             stage = stages.STATE_TO_STAGE.get(task.state, task.state)
             tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, tail)
-            self.notify(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,
+            self._emit(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,
                               f"internal error in {stage}; see artel show {job.task_id}"))
             self._after_transition(job.task_id, tr, "internal error")
         except Exception:   # noqa: BLE001
@@ -268,7 +289,7 @@ class Runner:
                 return
             outcome = integrate.finish_base_update(self.repo, board, self.cfg, job.result)
             if outcome == "paused":
-                self.notify(Event("paused", text=board.get_meta("pause_detail")))
+                self._emit(Event("paused", text=board.get_meta("pause_detail")))
             return
         if job.busy is not None:                      # PD-8: skipped, nothing applied, no attempt
             board.clear_running(job.task_id)
@@ -277,7 +298,7 @@ class Runner:
             task = board.get_task(job.task_id)
             stage = stages.STATE_TO_STAGE.get(task.state, task.state)
             tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, job.error)
-            self.notify(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,
+            self._emit(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,
                               f"internal error in {stage}; see artel show {job.task_id}"))   # PD-38: no traceback
             self._after_transition(job.task_id, tr, "internal error")
             return
@@ -299,7 +320,7 @@ class Runner:
         detail = stages._clip_tail("internal error: ", error)
         board.set_meta("pause_reason", "base_conflict")                        # PD-34
         board.set_meta("pause_detail", detail)
-        self.notify(Event("paused", text=detail))
+        self._emit(Event("paused", text=detail))
 
     def _after_transition(self, task_id: int, tr, detail: str) -> None:
         if tr is None:
@@ -310,9 +331,11 @@ class Runner:
             text = journal.truncate_utf8(f"setup failed for task {task_id}: {detail}", journal.TEXT_LIMIT)
             board.set_meta("pause_reason", "setup_failed")
             board.set_meta("pause_detail", text)
-            self.notify(Event("paused", task_id, task.title, task.state, text))
+            self._emit(Event("paused", task_id, task.title, task.state, text))
+        if tr.to_state == "awaiting_accept":
+            self._emit(Event("awaiting_accept", task_id, task.title, tr.to_state, tr.cause or None))
         if tr.to_state in BLOCKING_STATES:
-            self.notify(Event(tr.to_state, task_id, task.title, tr.to_state, tr.cause or None))
+            self._emit(Event(tr.to_state, task_id, task.title, tr.to_state, tr.cause or None))
 
     def _integrate_verified(self) -> None:
         board = self.board
@@ -327,7 +350,7 @@ class Runner:
                 self._record_finish_failure(task.id, traceback.format_exc())
                 continue
             if outcome == "done":
-                self.notify(Event("done", task.id, task.title, "done"))
+                self._emit(Event("done", task.id, task.title, "done"))
 
     def _free_slots(self) -> list[int]:
         used = {j.slot for j in self.jobs}
@@ -355,8 +378,7 @@ class Runner:
         if "vet" not in stages.SUPPORTED_STAGES:   # they wait for Task 21; filtering after select would starve open tasks
             tasks = [t for t in tasks if t.state != "proposed"]
         busy = {j.task_id for j in self.jobs if j.task_id is not None}
-        held = self._held_elsewhere(tasks)                       # PD-8: skipped before any transition, no slot wasted
-        tasks = [t for t in tasks if t.id not in held]
+        busy |= self._held_elsewhere(tasks)   # PD-8: never a candidate, but still holds its area; no slot wasted
         selected = pick.select(tasks, board.all_deps(), free_slots=len(free),
                                verify_busy=any(j.kind == "verify" for j in self.jobs), busy=busy)
         for task in selected:
