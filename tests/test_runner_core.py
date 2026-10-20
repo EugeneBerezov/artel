@@ -141,7 +141,17 @@ class RunnerCoreTest(E2ECase):
                 raise RuntimeError("boom in the worker")
             return real(*a, **kw)
 
-        with mock.patch.object(stages, "run_stage", flaky):
+        # the tick that collects the failed job would pick the task again at once: hold picking until the
+        # assertions below are done, so they never look at the second job
+        release = threading.Event()
+        real_pick = Runner._pick_and_start
+
+        def gated_pick(runner):
+            if calls and not release.is_set():
+                return
+            real_pick(runner)
+
+        with mock.patch.object(stages, "run_stage", flaky), mock.patch.object(Runner, "_pick_and_start", gated_pick):
             r = self.runner(max_agents=1)
             r.start()
             try:
@@ -154,6 +164,9 @@ class RunnerCoreTest(E2ECase):
                 err = [e for e in self.events if e.kind == "error"][0]
                 self.assertNotIn("Traceback", err.text)           # PD-38: never the traceback
                 self.assertIn(f"artel show {tid}", err.text)
+                self.assertEqual(err.state, task.state)            # M16: the event names the task's state
+                self.assertSlotsCleanAndDetached()                 # M08: the half-done job left its slot quietly
+                release.set()
                 self.drive(r, lambda: self.board.get_task(tid).state == "done")   # the stage runs again
             finally:
                 r.shutdown()
@@ -757,6 +770,26 @@ class HeldTaskAreaTest(E2ECase):
     def test_held_reviewing_task_keeps_its_area(self):
         self.assertEqual(self._held_then_tick("reviewing"), "open")
 
+    def test_a_held_open_task_does_not_block_an_overlapping_task_in_flight(self):
+        # catches marking every held task busy: pick.select counts a busy open task as a running area holder,
+        # so B's review would wait as long as the human worktree of A exists (reviews/T15-3.md major 1)
+        self.scenario({"review": PASS})
+        a = self.add_task("A", area=["src"])
+        b = self.add_task("B", area=["src"])
+        git(self.repo_path, "branch", f"artel/{a}", INTEGRATION)   # e.g. kept by an R17 reset to open
+        git(self.repo_path, "branch", f"artel/{b}", INTEGRATION)
+        t = self.board.get_task(b)
+        self.board.update_task(b, expect_state="open", expect_version=t.version, state="reviewing", round=1)
+        git(self.repo_path, "worktree", "add", str(self.tmp / "human"), f"artel/{a}")
+        r = self.runner(max_agents=2)
+        r.start()
+        try:
+            r.tick()
+            self.assertEqual([j.task_id for j in r.jobs], [b])
+            self.assertEqual(self.board.get_task(a).state, "open")
+        finally:
+            r.shutdown()
+
 
 class RunnerReopenTest(E2ECase):
     """Reopen of Task 15 (reviews/T15-2.md, plan 'Reopened 2026-10-20')."""
@@ -849,6 +882,39 @@ class RunnerReopenTest(E2ECase):
             self.assertEqual(len(rows), 1)   # recorded once per text
             self.assertIn("collecting results", rows[0]["text"])
             r.tick()   # and the next tick works
+        finally:
+            r.shutdown()
+
+    def test_a_failure_while_charging_a_failed_job_does_not_end_the_runner(self):
+        # catches _collect calling _finish_failed unguarded: a second error would escape tick()
+        self.scenario({"write": WRITE, "review": PASS})
+        self.add_task("Add hello")
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            with mock.patch.object(Runner, "_finish", side_effect=RuntimeError("finish broke")), \
+                    mock.patch.object(Runner, "_finish_failed", side_effect=RuntimeError("charge broke")):
+                self.drive(r, lambda: not r.jobs and self.board.conn.execute(
+                    "SELECT 1 FROM entries WHERE kind = 'FAIL' AND text LIKE '%charge broke%'").fetchone())
+                r.tick()
+        finally:
+            r.shutdown()
+        rows = self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'").fetchall()
+        self.assertIn("finishing a job", rows[-1]["text"])
+
+    def test_an_error_while_integrating_does_not_end_the_runner(self):
+        # catches tick calling _integrate_verified unguarded, or returning before picking after its failure
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            with mock.patch.object(Runner, "_integrate_verified", side_effect=RuntimeError("integrate broke")):
+                r.tick()
+            rows = self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'").fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertIn("internal error in integrating", rows[0]["text"])
+            self.assertEqual([j.task_id for j in r.jobs], [tid])   # the same tick still picked work
         finally:
             r.shutdown()
 

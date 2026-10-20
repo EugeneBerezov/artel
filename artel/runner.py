@@ -378,7 +378,11 @@ class Runner:
         if "vet" not in stages.SUPPORTED_STAGES:   # they wait for Task 21; filtering after select would starve open tasks
             tasks = [t for t in tasks if t.state != "proposed"]
         busy = {j.task_id for j in self.jobs if j.task_id is not None}
-        busy |= self._held_elsewhere(tasks)   # PD-8: never a candidate, but still holds its area; no slot wasted
+        # PD-8: a held task is never a candidate, but an in-flight one still holds its area; no slot wasted.
+        # A held open task holds no area, and as busy it would count as a running holder in pick.select.
+        held = self._held_elsewhere(tasks)
+        tasks = [t for t in tasks if not (t.id in held and t.state == "open")]
+        busy |= {t.id for t in tasks if t.id in held}
         selected = pick.select(tasks, board.all_deps(), free_slots=len(free),
                                verify_busy=any(j.kind == "verify" for j in self.jobs), busy=busy)
         for task in selected:
