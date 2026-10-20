@@ -98,6 +98,7 @@ def make_repo(tmp, plan=FAKE_PLAN):
 def cli(repo, *args, env=None, expect=None):
     e = dict(os.environ, **GIT_ENV)
     e.pop("ARTEL_DEV_SESSION", None)
+    e.pop("ARTEL_TASK", None)
     e.update(env or {})
     r = subprocess.run([sys.executable, BOARD_PY, "--repo", str(repo), *args],
                        text=True, encoding="utf-8", capture_output=True, env=e)
@@ -920,6 +921,92 @@ class Ci(unittest.TestCase):
         with self.assertRaises(board.BoardError):
             board.cmd_ci(args, fetch=lambda u, t: {},
                          token_path=Path("/nonexistent/token"))
+
+
+class Phases(TmpCase):
+    """Revision 2026-10-20: plan phases; claim hands out the active phase only."""
+
+    def plan(self, active=None):
+        plan = FAKE_PLAN.replace("body three", "**Phase:** 2\n\nbody three")
+        if active is not None:
+            plan = plan.replace("# Tiny plan", "# Tiny plan\n\n**Active phase:** %d" % active)
+        return plan
+
+    def write_plan(self, text):
+        (self.repo / "docs" / "plan.md").write_text(text, encoding="utf-8")
+
+    def test_phase_parsed_default_one(self):
+        t = {x["id"]: x for x in board.parse_plan(self.plan())}
+        self.assertEqual(t[3]["phase"], 2)
+        self.assertEqual(t[2]["phase"], 1)  # mutation: default 2 / no default
+
+    def test_active_phase_default_one(self):
+        self.assertEqual(board.active_phase(self.plan()), 1)
+        self.assertEqual(board.active_phase(self.plan(active=2)), 2)
+
+    def test_phase_line_inside_fence_is_ignored(self):
+        plan = self.plan().replace("body two", "```\n**Phase:** 3\n```\nbody two")
+        t = {x["id"]: x for x in board.parse_plan(plan)}
+        self.assertEqual(t[2]["phase"], 1)
+
+    def test_claim_skips_later_phase_tasks(self):
+        self.write_plan(self.plan())
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "done", "1", expect=0)
+        r = cli(self.repo, "claim", "--session", "A", expect=0)
+        self.assertIn("id: 2", r.stdout)
+        r = cli(self.repo, "claim", "--session", "B")
+        # T3 (phase 2) is open and its deps are done, but phase 1 is active
+        self.assertEqual(r.returncode, 3)  # mutation: phase filter removed
+        self.assertIn("phase 2", r.stderr + r.stdout)
+        self.assertIn("T3", r.stderr + r.stdout)
+
+    def test_refresh_activates_next_phase_and_keeps_states(self):
+        self.write_plan(self.plan())
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "done", "1", expect=0)
+        self.write_plan(self.plan(active=2))
+        cli(self.repo, "init", "--from", "docs/plan.md", "--refresh", expect=0)
+        t = self.tasks()
+        self.assertEqual(t[1]["state"], "done")
+        self.assertEqual(t[3]["phase"], 2)  # mutation: phase not in PLAN_FIELDS
+        r = cli(self.repo, "claim", "--session", "B", expect=0)
+        self.assertIn("id: 2", r.stdout)
+        r = cli(self.repo, "claim", "--session", "C", expect=0)
+        self.assertIn("id: 3", r.stdout)  # mutation: max_phase not refreshed
+
+    def test_board_without_phase_fields_still_claims(self):
+        self.init()
+        st = self.store() / "board.json"
+        data = json.loads(st.read_text(encoding="utf-8"))
+        data.pop("max_phase", None)
+        for t in data["tasks"]:
+            t.pop("phase", None)
+        st.write_text(json.dumps(data), encoding="utf-8")
+        r = cli(self.repo, "claim", "--session", "A", expect=0)
+        self.assertIn("id: 1", r.stdout)
+
+    def test_status_shows_phase_and_active_phase(self):
+        self.write_plan(self.plan())
+        self.init()
+        out = cli(self.repo, "status", expect=0).stdout
+        self.assertIn("phase", out.splitlines()[0])
+        self.assertIn("active phase 1", out)
+
+
+class ArtelAgentGuard(TmpCase):
+    def test_refuses_inside_an_artel_agent(self):
+        self.init()
+        r = cli(self.repo, "status", env={"ARTEL_TASK": "7"})
+        self.assertEqual(r.returncode, 1)  # mutation: guard removed
+        self.assertIn("artel agent", r.stderr)
+        self.assertNotIn("First thing", r.stdout)
+
+    def test_empty_artel_task_is_not_an_agent(self):
+        self.init()
+        cli(self.repo, "status", env={"ARTEL_TASK": ""}, expect=0)
 
 
 if __name__ == "__main__":

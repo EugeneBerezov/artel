@@ -48,6 +48,9 @@ TASK_RE = re.compile(r"^### Task (\d+):\s*(.+?)\s*$")
 HEADING_RE = re.compile(r"^#{1,3} ")
 WAVE_ROW_RE = re.compile(r"^\|\s*W(\d+)\s*\|(.*)\|\s*$")
 DEPENDS_RE = re.compile(r"^\*\*Depends on:?\*\*:?\s*(.+)$", re.IGNORECASE)
+PHASE_RE = re.compile(r"^\*\*Phase:?\*\*:?\s*(\d+)", re.IGNORECASE)
+ACTIVE_PHASE_RE = re.compile(r"^\*\*Active phase:?\*\*:?\s*(\d+)",
+                             re.IGNORECASE)
 
 
 def _clean_title(raw):
@@ -116,14 +119,20 @@ def parse_plan(text):
         while end > no and lines[end - 1].strip() in ("", "---"):
             end -= 1
         explicit = None
+        phase = 1
         in_fence = False
         for line in lines[no:end]:
             if line.startswith("```"):
                 in_fence = not in_fence
-            m = None if in_fence else DEPENDS_RE.match(line)
+            if in_fence:
+                continue
+            m = DEPENDS_RE.match(line)
             if m:
                 explicit = sorted({int(x) for x in re.findall(r"\d+",
                                                               m.group(1))})
+            m = PHASE_RE.match(line)
+            if m:
+                phase = int(m.group(1))
         wave = waves[tid]
         if explicit is not None:
             deps = explicit
@@ -138,7 +147,7 @@ def parse_plan(text):
                              % (tid, missing))
         tasks.append({
             "id": tid, "title": _clean_title(raw), "wave": wave,
-            "deps": deps, "risky": "**RISKY" in raw or tid in bold,
+            "deps": deps, "phase": phase, "risky": "**RISKY" in raw or tid in bold,
             "controller": "controller task" in raw.lower(),
             "plan_lines": [no, end],
             "state": "open", "session": None, "claimed_at": None,
@@ -260,6 +269,23 @@ def check_session(s):
     return s
 
 
+def active_phase(text):
+    """The plan's `**Active phase:** N` (outside fences); 1 when absent."""
+    in_fence = False
+    for line in text.splitlines():
+        if line.startswith("```"):
+            in_fence = not in_fence
+            continue
+        m = None if in_fence else ACTIVE_PHASE_RE.match(line)
+        if m:
+            return int(m.group(1))
+    return 1
+
+
+def phase_of(t):
+    return t.get("phase", 1)
+
+
 # --------------------------------------------------------------------------
 # Commands
 # --------------------------------------------------------------------------
@@ -272,8 +298,9 @@ def cmd_init(args):
     except OSError as e:
         raise BoardError("cannot read plan: %s" % e)
     tasks = parse_plan(text)
+    active = active_phase(text)
     if args.refresh:
-        return _refresh(store, args.plan, tasks)
+        return _refresh(store, args.plan, tasks, active)
     with store.lock():
         if store.exists() and not args.force:
             raise BoardError("board already exists (use --force to replace "
@@ -292,7 +319,7 @@ def cmd_init(args):
                     shutil.move(str(store.dir / name), str(backup / name))
             print("previous state backed up to %s" % backup)
         store.save({"version": 1, "source": args.plan, "created": now_iso(),
-                    "tasks": tasks})
+                    "max_phase": active, "tasks": tasks})
     print("initialised %d tasks from %s" % (len(tasks), args.plan))
 
 
@@ -402,11 +429,12 @@ def cmd_claim(args):
         if args.review_only:
             print("no review pending for %s" % session, file=sys.stderr)
             return EXIT_NOTHING
+        active = board.get("max_phase", 1)
         cands = [t for t in tasks if t["state"] == "open"
-                 and not t["controller"]
+                 and not t["controller"] and phase_of(t) <= active
                  and all(dep_ok(by_id[d]) for d in t["deps"])]
         if not cands:
-            print(_nothing_claimable(tasks, by_id), file=sys.stderr)
+            print(_nothing_claimable(tasks, by_id, active), file=sys.stderr)
             return EXIT_NOTHING
         t = min(cands, key=lambda x: (x["wave"], x["id"]))
         t["state"], t["session"], t["claimed_at"] = "claimed", session, now_iso()
@@ -416,10 +444,11 @@ def cmd_claim(args):
     return 0
 
 
-PLAN_FIELDS = ("title", "wave", "deps", "risky", "controller", "plan_lines")
+PLAN_FIELDS = ("title", "wave", "deps", "phase", "risky", "controller",
+               "plan_lines")
 
 
-def _refresh(store, plan, parsed):
+def _refresh(store, plan, parsed, active=1):
     """Re-read the plan into an existing board, keeping every task's state.
 
     Titles, waves, deps, flags and line ranges follow the plan; new tasks
@@ -444,8 +473,10 @@ def _refresh(store, plan, parsed):
                 tasks.append(t)
                 added.append(t["id"])
         board["tasks"], board["source"] = tasks, plan
+        board["max_phase"] = active
         store.save(board)
-        text = "board refreshed from %s: %d tasks" % (plan, len(tasks))
+        text = "board refreshed from %s: %d tasks, active phase %d" % (
+            plan, len(tasks), active)
         if added:
             text += ", added %s" % " ".join("T%d" % i for i in added)
         if gone:
@@ -479,11 +510,12 @@ def cmd_reopen(args):
             "T%d %s" % (d["id"], d["state"]) for d in held), file=sys.stderr)
 
 
-def _nothing_claimable(tasks, by_id):
+def _nothing_claimable(tasks, by_id, active=1):
     open_ = [t for t in tasks if t["state"] == "open"]
+    later = [t["id"] for t in open_ if phase_of(t) > active]
     held = {}
     for t in open_:
-        if t["controller"]:
+        if t["controller"] or phase_of(t) > active:
             continue
         for d in t["deps"]:
             dep = by_id[d]
@@ -512,6 +544,11 @@ def _nothing_claimable(tasks, by_id):
                          "T%d by %s, reviewer %s" % (
                              t["id"], t.get("author", "-"),
                              t.get("reviewer") or "-") for t in pending))
+    if later:
+        parts.append("phase %d+ tasks wait until the plan's active phase "
+                     "(now %d) moves on: %s" % (
+                         active + 1, active,
+                         ", ".join("T%d" % i for i in later)))
     stuck = [t["id"] for t in tasks if t["state"] == "stuck"]
     if stuck:
         parts.append("stuck: %s" % ", ".join("T%d" % i for i in stuck))
@@ -635,7 +672,7 @@ def cmd_status(args):
     store = Store(args.repo)
     with store.lock():
         board = store.load()
-    rows = [("id", "wave", "title", "state", "session", "risky")]
+    rows = [("id", "wave", "phase", "title", "state", "session", "risky")]
     for t in board["tasks"]:
         title = t["title"]
         if len(title) > 44:
@@ -645,9 +682,9 @@ def cmd_status(args):
         state = t["state"]
         if state == "done" and t.get("review") == "pending":
             state = "review(%s)" % (t.get("reviewer") or "-")
-        rows.append(("T%d" % t["id"], "W%d" % t["wave"], title, state,
-                     t["session"] or "-", flags.strip() or "-"))
-    widths = [max(len(r[i]) for r in rows) for i in range(6)]
+        rows.append(("T%d" % t["id"], "W%d" % t["wave"], "P%d" % phase_of(t),
+                     title, state, t["session"] or "-", flags.strip() or "-"))
+    widths = [max(len(r[i]) for r in rows) for i in range(7)]
     for r in rows:
         print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
     counts = {}
@@ -657,10 +694,10 @@ def cmd_status(args):
             key = "review"
         counts[key] = counts.get(key, 0) + 1
     print()
-    print("%s (%d total)" % (", ".join(
+    print("%s (%d total), active phase %d" % (", ".join(
         "%s %d" % (s, counts.get(s, 0))
         for s in ("open", "claimed", "review", "done", "stuck")),
-        len(board["tasks"])))
+        len(board["tasks"]), board.get("max_phase", 1)))
 
 
 def main_worktree(repo):
@@ -980,6 +1017,10 @@ def main(argv=None):
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             stream.reconfigure(encoding="utf-8", errors="replace")
+    if os.environ.get("ARTEL_TASK"):
+        print("error: dev/board.py is the dev team's board; an artel agent "
+              "(ARTEL_TASK is set) must not use it", file=sys.stderr)
+        return EXIT_ERROR
     args = build_parser().parse_args(argv)
     for key, value in vars(args).items():
         if isinstance(value, str):
