@@ -17,8 +17,8 @@ standard library only. Apache-2.0. Everything in this repository is in English.
   provisional choice, mention it in the commit message.
 
 **Read only what your task needs:** the plan's Global Constraints, your task
-section (by its heading `### Task N:`), and the spec sections it cites. Never read the whole spec or plan.
-
+section (by its heading `### Task N:`), and the spec sections it cites.
+Never read the whole spec or plan.
 
 ## Who reads what
 
