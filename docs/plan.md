@@ -1992,8 +1992,10 @@ Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence
       # rank=2, resets_at=None, limit_type=None, utilization=None, windows={});
       # result = validate_result(stage, parser.structured) unless parser.failed();
       # new_commits (PD-35): write → `git rev-list --count artel/integration..HEAD` > 0; fix (review/verify)
-      # → HEAD != task.fix_base (fix_base None → compare with head_before); merge_committed = integration
-      # tip is an ancestor of HEAD and HEAD is a merge commit; slots.leave_slot always (finally);
+      # → HEAD != task.fix_base (fix_base None → compare with head_before); merge_committed = the commit
+      # start_conflict_merge merged (recorded in the plan) is an ancestor of HEAD and HEAD is a merge commit
+      # — not the current integration tip, which may move meanwhile (s1 SPEC-GAP, controller 2026-10-20);
+      # slots.leave_slot always (finally);
       # finish_run with usage, measurements and session id (PD-23)
   def classify(task: Task, stage: str, run: StageRun, board) -> str
       # "requeue" if run.stopped, or run.rate_limited and run.result is None (PD-40: a limit hit with a
