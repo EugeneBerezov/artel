@@ -21,8 +21,9 @@ PROTECTED_PATHS = [".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "art
                    "uv.lock", "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock"]
 PROBE_PROFILE = ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
                  "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config",
-                 "--permission-mode", "default", "--max-turns", "1", "--disallowedTools",
+                 "--permission-mode", "default", "--max-turns", "1", "--tools", "", "--disallowedTools",
                  "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task TodoWrite"]
+EDIT_TOOLS = "Bash,Edit,Write,Read,Glob,Grep"
 
 EXPECTED_DEFAULTS = {
     "base": "main", "max_agents": 2, "max_attempts": 2, "review_rounds": 2, "max_verify_fixes": 2,
@@ -52,15 +53,15 @@ EXPECTED_DEFAULTS = {
     "profiles.common": ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
                         "--json-schema", "{schema}", "--permission-prompts", "none", "--disable-slash-commands",
                         "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections",
-                        "--append-system-prompt-file", "{unattended_notice}"],
-    "profiles.writer": ["--permission-mode", "acceptEdits", "--allowedTools",
+                        "--append-system-prompt-file", "{unattended_notice}", "--setting-sources", "project,local"],
+    "profiles.writer": ["--permission-mode", "acceptEdits", "--tools", EDIT_TOOLS, "--allowedTools",
                         "Bash(artel note *) Bash(artel add *) Bash(artel heavy *) Bash(git add *) "
                         "Bash(git commit *) Bash(git status *) Bash(git diff *)", "{project_tools}"],
-    "profiles.reviewer": ["--permission-mode", "acceptEdits", "--allowedTools",
+    "profiles.reviewer": ["--permission-mode", "acceptEdits", "--tools", EDIT_TOOLS, "--allowedTools",
                           "Bash(artel note *) Bash(artel heavy *) Bash(git diff *) Bash(git log *) "
                           "Bash(git show *) Bash(git status *)", "{project_tools}", "{project_read_tools}",
                           "--disallowedTools", "Bash(git * --output*)"],
-    "profiles.attacker": ["--permission-mode", "default", "--disallowedTools",
+    "profiles.attacker": ["--permission-mode", "default", "--tools", "Bash,Read,Glob,Grep", "--disallowedTools",
                           "Edit Write NotebookEdit Bash(git * --output*)", "--allowedTools",
                           "Bash(artel note *) Bash(git diff *) Bash(git log *) Bash(git show *) "
                           "Bash(git status *)", "{project_read_tools}"],
@@ -120,7 +121,38 @@ class SchemaTest(unittest.TestCase):
         self.assertNotIn("{unattended_notice}", text)
         self.assertNotIn("{schema}", text)
         self.assertEqual(probe[probe.index("--max-turns") + 1], "1")
-        self.assertIn("--disallowedTools", probe)
+        # Task 44: two fences, an empty --tools list and the deny list (catches dropping either)
+        self.assertEqual(probe.count("--tools"), 1)
+        self.assertEqual(probe[probe.index("--tools") + 1], "")
+        denied = set(probe[probe.index("--disallowedTools") + 1].split())
+        self.assertLessEqual({"Bash", "Edit", "Write", "NotebookEdit", "Read", "Glob", "Grep"}, denied)
+
+    def test_attacker_tools_read_only(self):
+        """Mutation caught: an attacker --tools list with an edit tool, or the Bash(git * --output*) fence dropped."""
+        attacker = setting("profiles.attacker").default
+        self.assertEqual(set(attacker[attacker.index("--tools") + 1].split(",")), {"Bash", "Read", "Glob", "Grep"})
+        denied = attacker[attacker.index("--disallowedTools") + 1]
+        self.assertIn("Bash(git * --output*)", denied)
+        self.assertLessEqual({"Edit", "Write", "NotebookEdit"}, set(denied.split()))
+
+    def test_no_profile_allows_messaging_or_subagents(self):
+        """Mutation caught: a --tools list that lets an unattended agent message sessions, schedule work,
+        start sub-agents or read the web (live slice check (c))."""
+        forbidden = {"SendMessage", "ListAgents", "PushNotification", "RemoteTrigger", "CronCreate", "CronDelete",
+                     "CronList", "ScheduleWakeup", "Monitor", "Task", "Workflow", "WebFetch", "WebSearch",
+                     "NotebookEdit", "TodoWrite", "EnterWorktree", "ExitWorktree", "DesignSync"}
+        for key in ("profiles.common", "profiles.writer", "profiles.reviewer", "profiles.attacker",
+                    "profiles.probe"):
+            argv = setting(key).default
+            lists = [argv[i + 1] for i, token in enumerate(argv) if token == "--tools"]
+            if key != "profiles.common":
+                self.assertEqual(len(lists), 1, key)   # every stage profile names its tools
+            for value in lists:
+                self.assertFalse(forbidden & set(value.split(",")), key)
+
+    def test_common_has_setting_sources(self):
+        """Mutation caught: user-level settings (MCP servers, skills, hooks) loaded into an unattended agent."""
+        self.assertEqual(setting("profiles.common").default[-2:], ["--setting-sources", "project,local"])
 
     def test_profiles_deny_git_output(self):
         """Mutation caught: a profile that lets `git diff --output=FILE` write a file."""
@@ -208,7 +240,7 @@ class SchemaTest(unittest.TestCase):
         common = setting("profiles.common").default
         self.assertIn("{schema}", common)
         self.assertIn("{unattended_notice}", common)
-        self.assertNotIn("--setting-sources", common)
+        self.assertEqual(common.count("--setting-sources"), 1)
 
     def test_every_setting_has_meaning_and_explain(self):
         for s in S.SETTINGS:

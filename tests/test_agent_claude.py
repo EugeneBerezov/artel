@@ -6,9 +6,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from artel import agent_claude as A, config as C, config_schema as S, platform as P
+from artel import agent_claude as A, config as C, config_schema as S, platform as P, procs
 from artel.errors import ArtelError
-from tests.helpers import subprocess_env
+from artel.gitutil import Repo
+from tests.helpers import RepoTestCase, subprocess_env
 
 FIX = Path(__file__).parent / "fixtures" / "stream"
 FAKE_AGENT = Path(__file__).parent / "fake_agent.py"
@@ -324,6 +325,29 @@ class ValidateTest(unittest.TestCase):
             self.assertNotIn(key, result)
 
 
+class ProbeArgvTest(RepoTestCase):
+    def test_probe_argv_keeps_empty_tools_element(self):
+        """Mutation caught: the probe's `--tools ""` lost on the way (a comma-string form, or a filter that drops
+        empty items) — the agent would get every tool again (live slice check (c))."""
+        fake = Path(__file__).parent / "fake_agent.py"
+        probe = S.by_key("profiles.probe").default
+        (self.repo_path / "artel.toml").write_text(
+            f"agent_command = {S.toml_literal([sys.executable, str(fake)])}\n\n"
+            f"[profiles]\nprobe = {S.toml_literal(probe)}\n", encoding="utf-8", newline="\n")
+        cfg = C.load_config(Repo.discover(self.repo_path), env={})
+        self.assertEqual(cfg["profiles.probe"], probe)
+        argv = A.agent_argv(cfg) + [t.replace("{model}", "haiku") for t in cfg["profiles.probe"]]
+        fake_dir = self.tmp / "fake"
+        fake_dir.mkdir()
+        result = procs.run_tree(argv, cwd=self.tmp, env=subprocess_env(ARTEL_FAKE_DIR=str(fake_dir)),
+                                stdin_text="Reply with the single word OK.", timeout=60, kill_grace=1.0)
+        self.assertEqual(result.returncode, 0)
+        (call,) = [json.loads(line) for line in (fake_dir / "calls.jsonl").read_text(encoding="utf-8").splitlines()]
+        got = call["argv"]
+        self.assertEqual(got[got.index("--tools") + 1], "")
+        self.assertEqual(got[got.index("--tools") + 2], "--disallowedTools")
+
+
 class ArgvTest(unittest.TestCase):
     def build(self, profile="writer", model="sonnet", **overrides):
         cfg = runtime_cfg(agent_command=[sys.executable, "x.py"], **overrides)
@@ -350,6 +374,21 @@ class ArgvTest(unittest.TestCase):
         allowed = argv[argv.index("--allowedTools") + 1]
         self.assertNotIn("git commit", allowed)
         self.assertNotIn("git add", allowed)
+
+    def test_writer_and_reviewer_tools_allowlist(self):
+        """Mutation caught: a missing or widened --tools list (compared as a set: `Task` in `TaskOutput` is not it)."""
+        for profile in ("writer", "reviewer"):
+            with self.subTest(profile=profile):
+                argv = self.build(profile)
+                self.assertEqual(argv.count("--tools"), 1)
+                self.assertEqual(set(argv[argv.index("--tools") + 1].split(",")),
+                                 {"Bash", "Edit", "Write", "Read", "Glob", "Grep"})
+
+    def test_writer_argv_has_setting_sources_once(self):
+        """Mutation caught: the pair repeated in a stage profile (the probe adds only the pair of common, PD-55)."""
+        argv = self.build("writer")
+        self.assertEqual(argv.count("--setting-sources"), 1)
+        self.assertEqual(argv[argv.index("--setting-sources") + 1], "project,local")
 
     def test_unknown_profile(self):
         with self.assertRaises(ValueError):
