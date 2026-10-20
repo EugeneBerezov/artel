@@ -358,6 +358,11 @@ class BoardTest(unittest.TestCase):
         self.assertIsNotNone(self.board.get_request(r1).applied_at)
         self.assertIsNone(self.board.get_request(r1).error)
         self.assertEqual(self.board.get_request(r2).error, "bad state")
+        stamp = self.board.get_request(r1).applied_at
+        with self.assertRaises(B.ArtelError):
+            self.board.finish_request(r1, error="late")
+        self.assertEqual(self.board.get_request(r1).applied_at, stamp)
+        self.assertIsNone(self.board.get_request(r1).error)
         with self.assertRaises(ValueError):
             self.board.add_request("explode", None, {})
         with self.assertRaises(B.ArtelError):
@@ -372,15 +377,114 @@ class BoardTest(unittest.TestCase):
         self.assertTrue(self.board.update_task(
             tid, expect_state="reviewing", expect_version=t.version, state="blocked",
             then="awaiting_approval", rejected_by="vet", cause="ask", stuck_from="writing",
-            review_closure=True, fix_kind="conflict", asked_by="review", last_verify="conflict"))
+            review_closure=True, fix_kind="conflict", asked_by="review", last_verify="conflict",
+            fix_base="abc123", accepted=True, risky=True))
         t = self.board.get_task(tid)
         self.assertEqual((t.then, t.rejected_by, t.cause, t.stuck_from, t.fix_kind, t.asked_by, t.last_verify),
                          ("awaiting_approval", "vet", "ask", "writing", "conflict", "review", "conflict"))
         self.assertIs(t.review_closure, True)
+        self.assertEqual(t.fix_base, "abc123")
+        self.assertIs(t.accepted, True)
+        self.assertIs(t.risky, True)
+        fresh = self.board.get_task(self.new_task())
+        self.assertEqual((fresh.fix_base, fresh.accepted, fresh.risky), (None, False, False))
+
+    def test_then_column_is_quoted(self):
+        # catches: an unquoted `then` in the schema or in update_task's SQL (SQLite keyword)
+        tid = self.new_task()
+        t = self.board.get_task(tid)
+        self.assertTrue(self.board.update_task(tid, expect_state="open", expect_version=t.version, then="open"))
+        self.assertEqual(self.board.get_task(tid).then, "open")
+        self.assertIn('"then"', self.board.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'tasks'").fetchone()[0])
+
+    def test_meta_formats_roundtrip(self):
+        import json
+        limit = {"status": "allowed_warning", "rank": 1, "resets_at": 1792464000.0,
+                 "utilization": 0.9, "seen_at": 1792460000.5}
+        self.board.set_meta("limit:five_hour", json.dumps(limit))
+        self.assertEqual(json.loads(self.board.get_meta("limit:five_hour")), limit)
+        self.board.set_meta("pause_until", repr(1792464000.0))
+        self.assertEqual(self.board.get_meta("pause_until"), "1792464000.0")
+        self.assertEqual(float(self.board.get_meta("pause_until")), 1792464000.0)
+        base = {"pid": 5, "group": 5, "fingerprint": None, "slot": 2, "started_at": 1.5}
+        self.board.set_meta("base_running", json.dumps(base))
+        self.assertEqual(json.loads(self.board.get_meta("base_running")), base)
+
+    def test_updates_bump_updated_at(self):
+        # catches: dropping updated_at from update_task / set_running / clear_running
+        tid = self.new_task()
+        self.board.conn.execute("UPDATE tasks SET updated_at = 1.0")
+        t = self.board.get_task(tid)
+        self.board.update_task(tid, expect_state="open", expect_version=t.version, priority=1)
+        self.assertGreater(self.board.get_task(tid).updated_at, 1.0)
+        self.board.conn.execute("UPDATE tasks SET updated_at = 1.0")
+        self.board.set_running(tid, kind="agent", pid=1, group=1, fingerprint=None, slot=None)
+        self.assertGreater(self.board.get_task(tid).updated_at, 1.0)
+        self.board.conn.execute("UPDATE tasks SET updated_at = 1.0")
+        self.board.clear_running(tid)
+        self.assertGreater(self.board.get_task(tid).updated_at, 1.0)
+
+    def test_update_task_protected_columns_and_unknown_id(self):
+        tid = self.new_task()
+        t = self.board.get_task(tid)
+        for column in ("id", "created_at", "updated_at", "version"):
+            with self.assertRaises(ValueError, msg=column):
+                self.board.update_task(tid, expect_state="open", expect_version=t.version, **{column: 5})
+        self.assertFalse(self.board.update_task(999, expect_state="open", expect_version=0, priority=1))
+
+    def test_deps_are_sorted_deduplicated_and_all_deps_lists_every_task(self):
+        a, b, c = self.new_task(), self.new_task(), self.new_task()
+        d = self.new_task(after=[c, a, a, b])
+        self.assertEqual(self.board.deps(d), [a, b, c])
+        self.assertEqual(self.board.all_deps(), {a: [], b: [], c: [], d: [a, b, c]})
 
     def test_states_cover_the_spec(self):
-        self.assertEqual(len(B.STATES), 15)
-        self.assertEqual(len(set(B.STATES)), 15)
+        self.assertEqual(B.STATES, (
+            "proposed", "vetting", "awaiting_approval", "open", "attacking", "writing", "reviewing",
+            "fixing", "verifying", "verified", "blocked", "awaiting_accept", "done", "rejected", "stuck"))
+
+    def test_journal_mode_other_than_wal_or_delete_is_refused(self):
+        class MemoryMode(sqlite3.Connection):
+            def execute(self, sql, *args):
+                upper = sql.strip().upper()
+                if upper.startswith("PRAGMA JOURNAL_MODE=WAL"):
+                    raise sqlite3.OperationalError("no wal")
+                if upper.startswith("PRAGMA JOURNAL_MODE=DELETE"):
+                    return super().execute("PRAGMA journal_mode=MEMORY")
+                return super().execute(sql, *args)
+
+        with self.assertRaises(B.ArtelError):
+            B.open_board(Path(self._tmp.name) / "b5.db", factory=MemoryMode)
+
+    def test_concurrent_first_open_creates_one_schema(self):
+        # catches: dropping IF NOT EXISTS / INSERT OR IGNORE from schema creation
+        path = Path(self._tmp.name) / "race" / "board.db"
+        barrier = threading.Barrier(4)
+        results = []
+
+        def opener():
+            try:
+                barrier.wait(5)
+                b = B.open_board(path)
+                results.append(b.get_meta("schema_version"))
+                b.close()
+            except Exception as e:   # noqa: BLE001 - asserted below
+                results.append(e)
+
+        threads = [threading.Thread(target=opener) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, ["1"] * 4)
+
+    def test_reopen_does_not_take_the_write_lock(self):
+        # catches: _init_schema starting BEGIN IMMEDIATE on every open (read-only commands would hit BoardBusy)
+        with self.board.tx():
+            again = B.open_board(self.path, busy_timeout_ms=50)
+            self.assertEqual(again.get_meta("schema_version"), "1")
+            again.close()
 
 
 class FactoryTest(unittest.TestCase):

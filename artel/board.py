@@ -61,10 +61,13 @@ class Task:
     rejected_by: str | None         # "vet" | "human" | None
     stuck_from: str | None          # stage state the task got stuck in (PD-28)
     review_closure: bool            # next review uses the closure template (PD-29)
+    fix_base: str | None            # task-branch tip when the task last entered fixing (PD-35)
+    accepted: bool                  # human accepted the verified commit (PD-36)
+    risky: bool                     # vet found the task risky (PD-37)
     answered: bool
     last_verify: str | None         # "green" | "red" | "conflict" | "timeout" | None
     running: bool
-    running_kind: str | None        # "agent" | "setup" | "verify" | "base"
+    running_kind: str | None        # "agent" | "setup" | "verify" (the base job is not a task, PD-34)
     running_started_at: float | None
     running_pid: int | None
     running_group: int | None
@@ -121,7 +124,7 @@ class Request:
 
 
 _TASK_FIELDS = tuple(f.name for f in dataclasses.fields(Task))
-_TASK_BOOLS = frozenset({"attack", "strong", "review_closure", "answered", "running"})
+_TASK_BOOLS = frozenset({"attack", "strong", "review_closure", "accepted", "risky", "answered", "running"})
 _NOT_UPDATABLE = frozenset({"id", "version", "created_at", "updated_at"})
 _RUNNING_COLUMNS = ("running_kind", "running_started_at", "running_pid", "running_group",
                     "running_fingerprint", "running_slot")
@@ -138,6 +141,7 @@ _SCHEMA = (
     attempts INTEGER NOT NULL DEFAULT 0, round INTEGER NOT NULL DEFAULT 0,
     verify_fixes INTEGER NOT NULL DEFAULT 0, fix_kind TEXT, asked_by TEXT, cause TEXT,
     "then" TEXT, rejected_by TEXT, stuck_from TEXT, review_closure INTEGER NOT NULL DEFAULT 0,
+    fix_base TEXT, accepted INTEGER NOT NULL DEFAULT 0, risky INTEGER NOT NULL DEFAULT 0,
     answered INTEGER NOT NULL DEFAULT 0, last_verify TEXT,
     running INTEGER NOT NULL DEFAULT 0, running_kind TEXT, running_started_at REAL, running_pid INTEGER,
     running_group INTEGER, running_fingerprint TEXT, running_slot INTEGER,
@@ -215,7 +219,10 @@ def _choose_journal_mode(conn: sqlite3.Connection) -> str:
         if "locked" in str(e):
             raise BoardBusy(str(e)) from e
         raise
-    return str(row[0]).lower()
+    mode = str(row[0]).lower()
+    if mode != "delete":
+        raise ArtelError(f"cannot use board journal mode {mode!r}")
+    return mode
 
 
 class Board:
@@ -268,14 +275,29 @@ class Board:
             pass   # never mask the original exception
 
     def _init_schema(self) -> None:
+        try:   # read-only opens must not queue behind the runner's write transaction
+            row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                raise BoardBusy(str(e)) from e
+            if "no such table" not in str(e):
+                raise
+            row = None
+        if row is not None:
+            self._check_schema_version(row[0])
+            return
         with self.tx() as conn:
             for statement in _SCHEMA:
                 conn.execute(statement)
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
             found = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
-            if found != str(SCHEMA_VERSION):
-                raise ArtelError(f"board schema version {found} is not supported (this artel: {SCHEMA_VERSION})")
+            self._check_schema_version(found)
+
+    @staticmethod
+    def _check_schema_version(found: str) -> None:
+        if found != str(SCHEMA_VERSION):
+            raise ArtelError(f"board schema version {found} is not supported (this artel: {SCHEMA_VERSION})")
 
     # tasks ---------------------------------------------------------------
 
