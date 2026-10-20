@@ -79,7 +79,7 @@ def _verify_command(cfg, repo: Repo, path: Path, *, log_path: Path, env, on_star
     if result.stopped:
         return "stopped", "stopped", result.returncode
     if result.timed_out:
-        return "timeout", f"timed out after {cfg['verify_timeout']:g}s", result.returncode
+        return "timeout", f"timed out after {cfg['verify_timeout']:g}s (verify_timeout)", result.returncode
     if result.returncode == 0:
         return "green", "exit 0", 0
     return "red", f"exit {result.returncode}", result.returncode
@@ -104,7 +104,9 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
         if setup == "stopped":
             return VerifyResult("stopped", None, log_path, "stopped during setup")
         if setup in ("failed", "timeout"):
-            return VerifyResult("setup_failed", None, log_path, f"setup {setup}")
+            setup_logs = sum(1 for r in board.list_runs(task.id) if r.stage == "setup")
+            return VerifyResult("setup_failed", None, repo.logs_dir / str(task.id) / f"setup-{setup_logs}.log",
+                                f"setup {setup}")
         commit = slots._git(repo, "rev-parse", "HEAD", cwd=path).stdout.strip()
         if not cfg["commands.verify"]:
             return VerifyResult("green", commit, log_path, 'verify not configured (commands.verify="")')   # PD-14
@@ -133,6 +135,7 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
     task = board.get_task(task_id)
     limits = transitions.Limits.from_cfg(task, cfg)
     tip = repo.rev(task_branch(task_id))   # after the verify merge: the base of a verify fix (PD-35)
+    transitions.decide(task, _EVENT[result.kind], limits, tip=tip)   # refuse before writing anything
     if result.kind != "setup_failed":
         if not board.update_task(task_id, expect_state=task.state, expect_version=task.version,
                                  last_verify=result.kind):
@@ -179,6 +182,8 @@ def integrate_task(repo: Repo, board, cfg, task_id: int) -> str:
         raise transitions.TransitionError(f"transition not allowed: integrate from {task.state}")
     if slots.checked_out_elsewhere(repo, INTEGRATION) is not None:
         return "held"   # PD-13: never move a branch somebody has checked out
+    if slots.checked_out_elsewhere(repo, task_branch(task_id)) is not None:
+        return "held"   # somebody may be committing on it: only the verified commit may be integrated (§5 step 8)
     limits = transitions.Limits.from_cfg(task, cfg)
     tip = repo.rev(task_branch(task_id))
     old = repo.rev(INTEGRATION)
@@ -243,7 +248,9 @@ def base_update(repo: Repo, board, cfg, slot_n: int, *, on_start: OnStart | None
         if setup == "stopped":
             return BaseUpdate("stopped", old, None, None, "stopped during setup")
         if setup in ("failed", "timeout"):
-            return BaseUpdate("timeout" if setup == "timeout" else "red", old, None, None, f"setup {setup}")
+            setup_logs = sorted((repo.logs_dir / "base").glob("setup-*.log"), key=lambda p: p.stat().st_mtime)
+            return BaseUpdate("timeout" if setup == "timeout" else "red", old, None,
+                              setup_logs[-1] if setup_logs else None, f"setup {setup}")
         new = slots._git(repo, "rev-parse", "HEAD", cwd=path).stdout.strip()
         if not cfg["commands.verify"]:
             return BaseUpdate("merged", old, new, None, 'verify not configured (commands.verify="")')
@@ -263,7 +270,8 @@ def finish_base_update(repo: Repo, board, cfg, bu: BaseUpdate) -> str:
             return "held"
         if repo.git("update-ref", _INTEGRATION_REF, bu.new, bu.old, check=False).returncode != 0:
             return "retry"
-        board.set_meta("last_base", repo.rev(cfg["base"]) or bu.new)
+        merged_base = bu.new if bu.kind == "fast_forward" else repo.rev(f"{bu.new}^2")   # the base tip that was merged
+        board.set_meta("last_base", merged_base or bu.new)
         return "applied"
     if bu.kind in ("conflict", "red", "timeout"):
         detail = journal.truncate_utf8(f"{bu.kind}: {bu.detail}", journal.TEXT_LIMIT)

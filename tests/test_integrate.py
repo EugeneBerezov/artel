@@ -1,14 +1,13 @@
 import json
 import os
 import sys
-import tempfile
 import threading
 import time
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from artel import board as B, config as C, integrate, journal, slots, transitions as T
+from artel import board as B, config as C, integrate, platform as P, slots, transitions as T
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 from tests.helpers import RepoTestCase, git, py_cmd
@@ -184,6 +183,67 @@ class VerifyTest(IntegrateCase):
         self.assertEqual((tr.rid, task.state, task.last_verify), ("R33", "fixing", "timeout"))
         (run,) = self.board.list_runs(tid)
         self.assertTrue(run.timed_out)
+        self.assertIn("verify_timeout", self.entries("VERDICT")[0]["text"])   # §10: the setting that caused it
+        self.assertEqual(len(self.entries("FAIL")), 1)                           # a timeout leaves a FAIL with the log
+        self.assertIn("verify-1.log", self.entries("FAIL")[0]["text"])
+
+    def test_verify_timeout_terminates_the_process_tree(self):
+        pidfile = self.tmp / "verify.pid"
+        code = (f"import os, time\nopen({json.dumps(str(pidfile))}, 'w', encoding='utf-8').write(str(os.getpid()))\n"
+                "time.sleep(30)")
+        self.configure(**{"commands.verify": py_cmd(code), "verify_timeout": "1s", "kill_grace": "1s"})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.assertEqual(self.verify(tid).kind, "timeout")
+        self.assertFalse(P.pid_alive(int(pidfile.read_text(encoding="utf-8"))))
+
+    def test_verify_env_reaches_setup_and_verify(self):
+        """Mutation caught: env=None for the setup or the verify command."""
+        probe = "import os, sys; sys.exit(0 if os.environ.get('ARTEL_PROBE') == '1' else 5)"
+        self.configure(**{"commands.setup": py_cmd(probe), "commands.verify": py_cmd(probe)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        env = dict(os.environ, ARTEL_PROBE="1")
+        self.assertEqual(self.verify(tid, env=env).kind, "green")
+        self.configure(**{"commands.setup": "", "commands.verify": py_cmd(probe)})
+        self.assertEqual(self.verify(tid).kind, "red")                       # without env the probe fails
+        self.assertEqual(self.verify(tid, env=env).kind, "green")
+
+    def test_verify_records_setup_and_verify_processes(self):
+        """Mutation caught: dropping on_start or reporting the wrong kind (reconcile could not find the tree)."""
+        self.configure(**{"commands.setup": py_cmd(OK_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        seen = []
+        self.verify(tid, on_start=lambda kind, pid, group, fp: seen.append((kind, pid, group, fp)))
+        self.assertEqual([k for k, *_ in seen], ["setup", "verify"])
+        for _, pid, group, fp in seen:
+            self.assertIsInstance(pid, int)
+            self.assertEqual(group, pid)
+            self.assertTrue(fp)
+
+    def test_verify_logs_are_numbered_per_task(self):
+        """Mutation caught: a constant log number (the second verify would overwrite the first)."""
+        tid = self.task_with_commit("verifying", "a.txt")
+        first, second = self.verify(tid), self.verify(tid)
+        self.assertEqual((first.log_path.name, second.log_path.name), ("verify-1.log", "verify-2.log"))
+        self.assertEqual([r.n for r in self.board.list_runs(tid) if r.stage == "verify"], [1, 2])
+
+    def test_setup_failure_points_at_the_setup_log(self):
+        self.configure(**{"commands.setup": py_cmd("print('no network'); import sys; sys.exit(3)")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.assertEqual(result.log_path.name, "setup-1.log")
+        self.assertIn("no network", result.log_path.read_text(encoding="utf-8"))
+        self.finish(tid, result)
+        self.assertIn("setup-1.log", self.entries("VERDICT")[0]["basis"])
+
+    def test_finish_verify_on_a_task_in_the_wrong_state_writes_nothing(self):
+        """Mutation caught: last_verify written before the transition is checked."""
+        tid = self.verified_task_with_commit("a.txt")
+        before = self.board.get_task(tid)
+        with self.assertRaises(T.TransitionError):
+            self.finish(tid, integrate.VerifyResult("green", "abc", self.tmp / "x.log", "exit 0"))
+        after = self.board.get_task(tid)
+        self.assertEqual((after.version, after.last_verify), (before.version, before.last_verify))
+        self.assertEqual(self.entries(), [])
 
     def test_verify_stopped_requeues_without_a_transition(self):
         stop = threading.Event()
@@ -309,8 +369,21 @@ class IntegrateTaskTest(IntegrateCase):
 
     def test_integrate_refuses_a_task_that_is_not_verified(self):
         tid = self.task_with_commit("verifying", "a.txt")
+        before = git(self.repo_path, "rev-parse", INTEGRATION)
         with self.assertRaises(T.TransitionError):
             integrate.integrate_task(self.repo, self.board, self.cfg, tid)
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)   # the state is checked first
+
+    def test_task_branch_checked_out_elsewhere_is_held(self):
+        """Only the verified commit may be integrated: somebody committing on the branch holds it back."""
+        tid = self.verified_task_with_commit("a.txt")
+        other = self.tmp / "human"
+        git(self.repo_path, "worktree", "add", "-q", str(other), task_branch(tid))
+        self.commit_file("human.txt", "unverified\n", "human edit", cwd=other)
+        before = git(self.repo_path, "rev-parse", INTEGRATION)
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "held")
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
+        self.assertEqual(self.board.get_task(tid).state, "verified")
 
     def test_accept_then_integration_moved_reverifies_then_done(self):
         """PD-36: merge=ask; the accept survives a re-verify; no second awaiting_accept."""
@@ -379,6 +452,67 @@ class BaseTest(IntegrateCase):
         self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "paused")
         self.assertTrue(self.board.get_meta("pause_detail").startswith("red:"))
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
+
+    def test_base_update_held_when_integration_is_checked_out(self):
+        """Mutation caught: dropping the PD-13 check from finish_base_update."""
+        new = self.commit_on_base("b.txt")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        held = self.temp_worktree(INTEGRATION)
+        before = git(self.repo_path, "rev-parse", INTEGRATION)
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "held")
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
+        self.assertTrue(held.is_dir())
+        self.assertNotEqual(before, new)
+
+    def test_base_update_old_value_guard(self):
+        """Mutation caught: update-ref without the old-value guard (a task integrated meanwhile would be lost)."""
+        self.commit_on_base("b.txt")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(bu.kind, "fast_forward")
+        moved = self.commit_on_integration("race.txt")
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "retry")
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), moved)
+
+    def test_base_setup_failure_pauses_with_its_log(self):
+        self.configure(**{"commands.setup": py_cmd("print('setup broke'); import sys; sys.exit(4)")})
+        self.commit_on_integration("task.txt")
+        self.commit_on_base("b.txt")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual((bu.kind, bu.detail), ("red", "setup failed"))
+        self.assertEqual(bu.log_path, self.repo.logs_dir / "base" / "setup-1.log")
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "paused")
+        (fail,) = self.entries("FAIL")
+        self.assertIn("setup-1.log", fail["basis"])
+        self.slot_clean()
+
+    def test_base_with_empty_verify_merges(self):
+        self.configure(**{"commands.verify": ""})
+        self.commit_on_integration("task.txt")
+        self.commit_on_base("b.txt")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(bu.kind, "merged")
+        self.assertIn("verify not configured", bu.detail)
+
+    def test_base_update_stopped_is_a_noop(self):
+        stop = threading.Event()
+        self.configure(**{"commands.verify": py_cmd("import time; time.sleep(30)"), "kill_grace": "1s"})
+        self.commit_on_integration("task.txt")
+        self.commit_on_base("b.txt")
+        before = git(self.repo_path, "rev-parse", INTEGRATION)
+        threading.Timer(1.0, stop.set).start()
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1, stop_event=stop)
+        self.assertEqual(bu.kind, "stopped")
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "noop")
+        self.assertIsNone(self.board.get_meta("pause_reason"))
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
+
+    def test_last_base_is_the_merged_tip_not_the_current_one(self):
+        self.commit_on_integration("task.txt")
+        merged_tip = self.commit_on_base("b.txt")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.commit_on_base("later.txt")   # the base moved on while the job ran
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "applied")
+        self.assertEqual(self.board.get_meta("last_base"), merged_tip)
 
     def test_base_verify_logs_under_base_without_run_row(self):
         """PD-34: the base job belongs to no task."""
