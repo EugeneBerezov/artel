@@ -47,7 +47,8 @@ class Repo:
         except (FileNotFoundError, NotADirectoryError) as exc:   # the start directory does not exist
             raise ArtelError(f"not inside a git repository ({exc})") from exc
         if common.returncode != 0:
-            raise ArtelError("not inside a git repository")
+            detail = common.stderr.strip().splitlines()
+            raise ArtelError("not inside a git repository" + (f" (git: {detail[-1]})" if detail else ""))
         common_dir = Path(common.stdout.strip())
         listing = _run(["worktree", "list", "--porcelain"], start)
         if listing.returncode != 0:
