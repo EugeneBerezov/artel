@@ -104,7 +104,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 | W1 | 1 Skeleton + CLI |
 | W2 | 2 CI + lint + pyz · **3 Platform** → 28 T2 follow-up · 4 Board · 5 Config |
 | W3 | 6 Journal + pick · **7 Transitions** · 8 Procs · **9 Agent adapter** |
-| W4 | **10 Slots** · 11 Templates + agent commands · 12 Prompts |
+| W4 | **10 Slots** · 11 Templates + agent commands · 12 Prompts · 29 T7 test hardening |
 | W5 | **13 Stages** · **14 Verify + integrate** |
 | W6 | **15 Runner core + happy-path e2e (vertical slice)** → 16 Live slice check (controller) |
 | W7 | 17 Notifier · 18 Requests · 19 Status/show/logs · 20 Stats |
@@ -1238,7 +1238,8 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
       @staticmethod
       def for_task(task: Task, *, max_attempts: int, review_rounds: int, max_verify_fixes: int,
                    merge: str, autoapprove: str) -> "Limits"
-          # review_rounds = (task.review_rounds or review_rounds) + task.extra_review_rounds
+          # review_rounds = (review_rounds if task.review_rounds is None else task.review_rounds) + task.extra_review_rounds
+          #   (`is None`, not `or`: `artel add --review 0` means zero review rounds — controller 2026-10-20)
           # max_verify_fixes = max_verify_fixes + task.extra_verify_fixes; merge = task.merge or merge
       @staticmethod
       def from_cfg(task: Task, cfg: Mapping[str, object]) -> "Limits"
@@ -2782,6 +2783,32 @@ Content requirements per section (§11): (1) three sentences + "when not to use 
 - [ ] **Step 5: Commit** — `T28: CI child encoding env, lint gaps, pyz smoke, T1 test gaps`
 
 **Acceptance:** every rule and test listed above exists and fails on its seeded mutation; the lint is green on `artel/`, `tests/` and `tools/`; `--staging .` cannot delete files; CI green on all six jobs once pushed (link in the report), with the child-encoding test actually running (not skipped) there.
+
+---
+
+### Task 29: T7 test hardening — exact row effects, causes, small engine fixes
+
+**Spec:** §3.1 (transition table), §10 (VERDICT names the setting that caused it).
+
+**Context for the writer:** Global Constraints + Task 7's section + `<git-common-dir>/artel-dev/reviews/T7-1.md` (controller opus review of the merged T7: table identical to the plan; tests only assert listed keys).
+
+**Files:**
+- Modify: `tests/test_transitions.py`, `artel/transitions.py` (only the fixes below)
+
+**Interfaces:** none new; Task 7's pinned interfaces unchanged except the `review_rounds` rule (Task 7 section, `is None`).
+
+- [ ] **Step 1: Tests first.**
+  - Every row test asserts the **exact** `updates` dict and the **exact** `effects` tuple of the decision (not a subset) — catches adding `reset_branch` to R14a (would delete the writer's branch on `ready`) or a stray `answered=1`.
+  - Every row with a `cause` asserts it (R04b/c/d, R13, R17, R20, R31a, R33, R34b, ...) — catches dropping a cause (VERDICT without its setting, §10).
+  - R20 covers every source state (add `attacking`, `fixing`).
+  - `Limits.for_task` with `task.review_rounds == 0` gives 0 (+ extras) — catches `or`.
+  - R31a with `merge=ask` and `accepted=1`: cause text names the acceptance (`"merge=ask, accepted"`).
+  - `create(..., add_agent=True)` without `created_by` raises `TransitionError` (not a raw `TypeError`).
+- [ ] **Step 2: Fix** `Limits.for_task` (`is None`), the R31a cause text, and the `create` argument check.
+- [ ] **Step 3:** whole suite; mutation spot-check: add `reset_branch` to R14a and drop R17's cause — both must fail.
+- [ ] **Step 4: Commit** — `T29: exact transition effects in tests, review_rounds 0, R31a cause`
+
+**Acceptance:** the listed mutations fail the suite; CI green on all six jobs.
 
 ---
 
