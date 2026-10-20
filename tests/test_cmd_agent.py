@@ -287,6 +287,32 @@ class CmdAgentTest(RepoTestCase):
         self.assertEqual(res.returncode, 0, res.stderr)
         self.assertEqual(json.loads(out.read_text(encoding="utf-8")), ["/agent/pp", "yes"])
 
+    def test_ensure_shim_resolves_root(self):
+        """Mutation caught: dropping .resolve() (a symlinked checkout path baked into the shim)."""
+        link = self.tmp / "link"
+        P.link_dir(link, REPO_ROOT)   # a symlink (a junction on Windows)
+        with mock.patch.object(CA.platform, "write_shim") as ws, \
+                mock.patch.object(artel, "__file__", str(link / "artel" / "__init__.py")):
+            CA.ensure_shim(self.repo)
+        self.assertEqual(ws.call_args.args[2], str(REPO_ROOT.resolve()))
+
+    def test_ensure_shim_zipapp_by_file_not_suffix(self):
+        """Mutation caught: deciding zipapp by the .pyz suffix (a directory named x.pyz is a source root)."""
+        root = self.tmp / "x.pyz"
+        (root / "artel").mkdir(parents=True)
+        with mock.patch.object(CA.platform, "write_shim") as ws, \
+                mock.patch.object(artel, "__file__", str(root / "artel" / "__init__.py")):
+            CA.ensure_shim(self.repo)
+        self.assertFalse(ws.call_args.kwargs["zipapp"])
+
+    def test_add_refusal_before_repo_discovery(self):
+        """Mutation caught: the refusal after Repo.discover (a "not a git repository" error instead)."""
+        os.environ["ARTEL_CHILD"] = "1"
+        os.chdir(self.tmp)   # outside any repository
+        code, out, err = self.run_cmd(CA.run_add, "add", "x")
+        self.assertEqual(code, 2)
+        self.assertIn("is a human command; refused inside a process started by artel", err)
+
     def test_ensure_shim_detects_source_root_and_zipapp(self):
         """Mutation caught: a .pyz run baked as a source root (or the reverse)."""
         with mock.patch.object(CA.platform, "write_shim") as ws:
