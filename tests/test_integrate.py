@@ -312,9 +312,9 @@ class VerifyTest(IntegrateCase):
         with mock.patch.dict(os.environ):   # restored afterwards; keep PATH/SystemRoot (Windows needs them)
             for name in [k for k in os.environ if k.startswith(("GIT_AUTHOR", "GIT_COMMITTER"))]:
                 del os.environ[name]
-            os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="2",
-                              GIT_CONFIG_KEY_0="user.useConfigOnly", GIT_CONFIG_VALUE_0="true",
-                              GIT_CONFIG_KEY_1="user.name", GIT_CONFIG_VALUE_1="")
+            # no empty env values: Windows treats them as "unset", which breaks GIT_CONFIG_VALUE_n
+            os.environ.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_COUNT="1",
+                              GIT_CONFIG_KEY_0="user.useConfigOnly", GIT_CONFIG_VALUE_0="true")
             self.assertEqual(slots.merge_identity_args(Repo.discover(self.repo_path))[:2], ["-c", "user.name=artel"])
             result = self.verify(tid)
         self.assertEqual(result.kind, "green")
