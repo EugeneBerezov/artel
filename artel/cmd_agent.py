@@ -1,6 +1,7 @@
 """Agent-side commands bound to ARTEL_TASK: `artel add`, `artel note`, `artel heavy` (spec §6, §8)."""
 import fnmatch
 import os
+import re
 import subprocess
 import sys
 from collections.abc import Mapping, Sequence
@@ -24,10 +25,34 @@ def _task_from_env() -> int | None:
         raise ArtelError(f"ARTEL_TASK is not a task id: {value!r}") from None
 
 
+def clean_area(raw: str) -> str:
+    """One repository-relative path with `/` separators, lexically resolved; "" is the whole repository.
+    Different spellings of one path must compare equal in pick.areas_overlap (src\\a vs src/a on Windows)."""
+    if not raw.strip():
+        raise UsageError("--area must not be empty (omit it for the whole repository)")
+    text = raw.strip().replace("\\", "/")
+    if text.startswith("/") or re.match(r"^[A-Za-z]:", text):
+        raise UsageError(f"--area {raw!r}: must be relative to the repository, not an absolute path")
+    parts: list[str] = []
+    for part in text.split("/"):
+        if part in ("", "."):
+            continue
+        if part == "..":
+            if not parts:
+                raise UsageError(f"--area {raw!r}: escapes the repository")
+            parts.pop()
+        else:
+            parts.append(part)
+    return "/".join(parts)
+
+
 def run_add(args) -> int:
     repo = Repo.discover(Path.cwd())
+    if not args.title.strip():
+        raise UsageError("a task needs a title")
     if args.review is not None and args.review < 1:
         raise UsageError("--review must be at least 1")
+    areas = [clean_area(a) for a in args.area]
     board = open_board(repo.board_path)
     try:
         for after_id in args.after:
@@ -38,7 +63,7 @@ def run_add(args) -> int:
         parent = _task_from_env()
         event, created_by = ("add_agent", f"agent:{parent}") if parent is not None else ("add_human", "human")
         task_id = transitions.create(
-            board, event, title=args.title, created_by=created_by, body=args.body or "", area=args.area,
+            board, event, title=args.title, created_by=created_by, body=args.body or "", area=areas,
             priority=args.priority, attack=args.attack, strong=args.strong, review_rounds=args.review,
             merge=args.merge, after=args.after)
         print(f"#{task_id} {board.get_task(task_id).state}")

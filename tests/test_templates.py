@@ -175,3 +175,30 @@ class PackagingTest(unittest.TestCase):
             path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
             T.notice_path(repo, cfg)
             self.assertNotIn(b"\r", path.read_bytes())
+
+
+class TemplateRobustnessTest(RepoTestCase):
+    def setUp(self):
+        super().setUp()
+        self.repo = Repo.discover(self.repo_path)
+        self.cfg = C.load_config(self.repo, env={})
+        self.dir = self.repo_path / ".artel" / "templates"
+        self.dir.mkdir(parents=True)
+
+    def test_non_utf8_template_is_a_named_error(self):
+        """Mutation caught: a raw UnicodeDecodeError traceback for a template saved in another encoding."""
+        (self.dir / "write.md").write_bytes("привет".encode("cp1251"))
+        from artel.errors import ArtelError
+        with self.assertRaises(ArtelError) as cm:
+            T.load_template(self.repo, self.cfg, "write.md")
+        self.assertIn("write.md", str(cm.exception))
+        with self.assertRaises(ArtelError):
+            T.export(self.repo, self.cfg)
+
+    def test_export_skips_a_directory_named_like_a_template(self):
+        """Mutation caught: crashing the whole export on one odd entry."""
+        (self.dir / "fix.md").mkdir()
+        result = dict(T.export(self.repo, self.cfg))
+        self.assertEqual(result["fix.md"], "kept (not a file)")
+        self.assertEqual(result["write.md"], "written")
+        self.assertEqual(T.load_template(self.repo, self.cfg, "fix.md"), T.builtin_text("fix.md"))
