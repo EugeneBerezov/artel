@@ -3424,6 +3424,8 @@ def agent_env(repo, *, task_id, stage, round, base_env) -> dict[str, str]
 
 **Revision round 2 (attack round 2: spec-closure M2, m5, m6; plan-closure N1, N2, N11):** the interface block below is the round-2 form — `probe_times` holds `[ts, kind]` pairs and `due` derives k and the anchor from them; `due` probes only `PROBED_KINDS`; `ProbeResult` carries the probe's usage windows, and a `quota` pause ends only when every window is below its threshold; a probe that reports a limit while another kind is probed adds a `limit` pause; `StreamParser` gains `assistant_seen` for `is_unavailable` (Task 37 reads it too); probes run with `Runner.child_env()`.
 
+
+**Also (T44 SPEC-GAP 2026-10-20):** the `artel/agent_claude.py` module docstring still says `--setting-sources` is absent from the defaults; correct it to "in `profiles.common` since Task 44" (no test).
 **Files:**
 - Create: `artel/probe.py`, `tests/test_probe.py`, `tests/test_runner_limits.py`
 - Modify: `artel/runner.py` (`on_rate_limit`, the limit/quota/agent_unavailable part of `update_pauses`, the probe job), `artel/pauses.py` (probe bookkeeping: `probe_times`, `record_probe`), `tests/test_pauses.py`
