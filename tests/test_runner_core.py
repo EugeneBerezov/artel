@@ -1,3 +1,5 @@
+import json
+import os
 import subprocess
 import sys
 import threading
@@ -158,7 +160,7 @@ class RunnerCoreTest(E2ECase):
         self.scenario({"write": WRITE, "review": PASS})
         first = self.add_task("first")
         second = self.add_task("second", area=["other"])
-        r = self.runner(max_agents=1)
+        r = self.runner(max_agents=2)
         r.start()
         try:
             self.drive(r, lambda: self.board.get_meta("pause_reason") == "setup_failed")
@@ -184,13 +186,13 @@ class RunnerCoreTest(E2ECase):
     def test_proposed_task_picked_into_vetting_when_vet_supported(self):
         proposed = transitions_create(self.board, "add_agent", title="agent idea", created_by="agent:1")
         r = self.runner(max_agents=1)
-        r.start()
-        try:
-            with mock.patch.object(stages, "SUPPORTED_STAGES", {"attack", "write", "review", "fix", "vet"}):
+        with mock.patch.object(stages, "SUPPORTED_STAGES", {"attack", "write", "review", "fix", "vet"}):
+            r.start()
+            try:
                 r.tick()
                 self.assertEqual(self.board.get_task(proposed).state, "vetting")   # R03
-        finally:
-            r.shutdown()
+            finally:
+                r.shutdown()
 
     def test_base_moved_merged_before_next_pick(self):
         self.scenario({"write": WRITE, "review": PASS})
@@ -232,9 +234,9 @@ class RunnerCoreTest(E2ECase):
         self.assertIn("paused", kinds(self))
 
     def test_task_dispatched_once_until_running(self):
+        # catches busy=set(): the same task would be dispatched again on the next tick, before `running` is set
         self.scenario({"write": WRITE, "review": PASS})
         tid = self.add_task("Add hello")
-        r = self.runner(max_agents=2)
         real = Runner._on_start
 
         def slow(self_, board, job):
@@ -245,7 +247,15 @@ class RunnerCoreTest(E2ECase):
                 inner(*args)
             return delayed
 
-        with mock.patch.object(Runner, "_on_start", slow):
+        spawned = []
+        real_spawn = Runner._spawn
+
+        def counting(self_, kind, task_id, slot, work):
+            spawned.append((kind, self.board.get_task(task_id).state))
+            return real_spawn(self_, kind, task_id, slot, work)
+
+        with mock.patch.object(Runner, "_on_start", slow), mock.patch.object(Runner, "_spawn", counting):
+            r = self.runner(max_agents=2)
             r.start()
             try:
                 for _ in range(12):
@@ -254,6 +264,8 @@ class RunnerCoreTest(E2ECase):
                 self.drive(r, lambda: self.board.get_task(tid).state == "done", timeout=60)
             finally:
                 r.shutdown()
+        # one dispatch of the write stage although `running` was not set yet (later stages are separate jobs)
+        self.assertEqual([state for kind, state in spawned].count("writing"), 1)
         self.assertEqual([c["stage"] for c in self.calls()].count("write"), 1)
 
     def test_branch_checked_out_elsewhere_skipped(self):
@@ -344,6 +356,222 @@ class RunnerCoreTest(E2ECase):
         self.assertEqual(e.to_json(), '{"kind": "done", "task_id": 3, "title": "t", "state": "done"}')
         self.assertEqual(events.EVENT_KINDS[-1], "error")
         events.null_notify(e)
+
+
+class RunnerHardeningTest(E2ECase):
+    """Review round 1 of Task 15."""
+
+    def make_runner(self, **kw):
+        r = self.runner(**kw)
+        r.start()
+        return r
+
+    def test_a_task_held_by_a_human_does_not_stop_other_work(self):
+        # PD-8: the held task is skipped, its slot is not wasted
+        self.scenario({"write": WRITE, "review": PASS})
+        held = self.add_task("held", area=["a"])
+        other = self.add_task("other", area=["b"])
+        git(self.repo_path, "branch", f"artel/{held}", INTEGRATION)
+        git(self.repo_path, "worktree", "add", str(self.tmp / "human"), f"artel/{held}")
+        r = self.make_runner(max_agents=1)
+        try:
+            self.drive(r, lambda: self.board.get_task(other).state == "done", timeout=60)
+            self.assertEqual(self.board.get_task(held).state, "open")
+        finally:
+            r.shutdown()
+
+    def test_base_update_waits_while_integration_is_checked_out(self):
+        # PD-13: no base job is started every tick, and the board keeps working
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        self.commit_file("base-news.txt", "news\n", "base moved on")
+        git(self.repo_path, "worktree", "add", str(self.tmp / "human-int"), INTEGRATION)
+        spawned = []
+        real = Runner._spawn
+
+        def counting(self_, kind, task_id, slot, work):
+            spawned.append(kind)
+            return real(self_, kind, task_id, slot, work)
+
+        with mock.patch.object(Runner, "_spawn", counting):
+            r = self.make_runner(max_agents=1)
+            try:
+                self.drive(r, lambda: self.board.get_task(tid).state == "verified", timeout=60)
+                for _ in range(10):
+                    r.tick()
+                    r.wait(0.05)
+                self.assertNotIn("base", spawned)
+                self.assertEqual(self.board.get_task(tid).state, "verified")   # integrate_task: held (PD-13)
+                git(self.repo_path, "worktree", "remove", "--force", str(self.tmp / "human-int"))
+                self.drive(r, lambda: self.board.get_task(tid).state == "done", timeout=60)
+            finally:
+                r.shutdown()
+        self.assertIn("base", spawned)
+
+    def test_nothing_new_is_picked_while_the_base_job_runs(self):
+        # catches: _base_moved returning False once the base job was started, and ignoring a running verify
+        self.write_toml({"commands.verify": py_cmd("import time; time.sleep(2)")})
+        self.scenario({"write": WRITE, "review": PASS})
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("int-only.txt", "i\n", "integration has its own commit")
+        git(self.repo_path, "checkout", "-q", "main")
+        self.commit_file("base-news.txt", "news\n", "base moved on")   # diverged: a merge + verify is needed
+        tid = self.add_task("Add hello")
+        r = self.make_runner(max_agents=2)
+        try:
+            r.tick()
+            self.assertEqual([j.kind for j in r.jobs], ["base"])
+            self.wait_until(lambda: self.board.get_meta("base_running"))
+            info = json.loads(self.board.get_meta("base_running"))
+            self.assertEqual(set(info), {"pid", "group", "fingerprint", "slot", "started_at"})   # PD-34
+            self.assertTrue(platform.pid_alive(info["pid"]))
+            for _ in range(4):
+                r.tick()
+                self.assertEqual([j.kind for j in r.jobs], ["base"])   # a free slot, but nothing new is picked
+                self.assertEqual(self.board.get_task(tid).state, "open")
+                r.wait(0.1)
+            self.drive(r, lambda: self.board.get_task(tid).state == "done", timeout=90)
+            self.assertIsNone(self.board.get_meta("base_running"))
+        finally:
+            r.shutdown()
+
+    def test_base_conflict_pauses_with_an_event_and_no_task_is_charged(self):
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("shared.txt", "integration\n", "integration edit")
+        git(self.repo_path, "checkout", "-q", "main")
+        self.commit_file("shared.txt", "main\n", "main edit")
+        tid = self.add_task("Add hello")
+        r = self.make_runner(max_agents=1)
+        try:
+            self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+        finally:
+            r.shutdown()
+        self.assertIn("paused", kinds(self))
+        self.assertIn("conflict", self.board.get_meta("pause_detail"))
+        self.assertEqual(self.board.get_task(tid).attempts, 0)
+
+    def test_a_failure_while_finishing_a_job_is_charged_as_an_internal_error(self):
+        # catches: only writing a FAIL entry (the stage would run, and spend quota, forever)
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        with mock.patch.object(stages, "finish_stage", side_effect=RuntimeError("cannot apply")):
+            r = self.make_runner(max_agents=1)
+            try:
+                self.drive(r, lambda: self.board.get_task(tid).state == "stuck", timeout=60)
+            finally:
+                r.shutdown()
+        task = self.board.get_task(tid)
+        self.assertEqual((task.attempts, task.running), (2, False))   # max_attempts 2
+        self.assertEqual([c["stage"] for c in self.calls()].count("write"), 2)
+        self.assertIn("error", kinds(self))
+        self.assertIn("stuck", kinds(self))
+
+    def test_a_failing_integrate_is_recorded_once_and_not_retried_every_tick(self):
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        r = self.make_runner(max_agents=1)
+        try:
+            with mock.patch.object(integrate, "integrate_task", side_effect=RuntimeError("branch vanished")) as m:
+                self.drive(r, lambda: self.board.get_task(tid).state == "verified")
+                for _ in range(8):
+                    r.tick()
+                    r.wait(0.05)
+                self.assertEqual(m.call_count, 1)
+            fails = [e for e in journal.task_entries(self.board, tid) if e.kind == "FAIL"]
+            self.assertEqual(len(fails), 1)
+            self.clock.advance(61)   # the backoff is clock-based
+            self.drive(r, lambda: self.board.get_task(tid).state == "done")
+        finally:
+            r.shutdown()
+
+    def test_an_error_inside_a_tick_step_does_not_end_the_runner(self):
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        r = self.make_runner(max_agents=1)
+        try:
+            with mock.patch.object(pick_module(), "select", side_effect=RuntimeError("select broke")):
+                for _ in range(4):
+                    r.tick()
+            fails = [e for e in self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'")]
+            self.assertEqual(len(fails), 1)   # recorded once per distinct text
+            self.assertIn("select broke", fails[0]["text"])
+            self.drive(r, lambda: self.board.get_task(tid).state == "done")
+        finally:
+            r.shutdown()
+
+    def test_slot_busy_in_a_worker_is_skipped_without_a_counter(self):
+        tid = self.add_task("Add hello")
+        calls = []
+        real = stages.plan_stage
+
+        def busy_once(*a, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise slots.SlotBusy(self.tmp / "elsewhere", "artel/1")
+            return real(*a, **kw)
+
+        self.scenario({"write": WRITE, "review": PASS})
+        with mock.patch.object(stages, "plan_stage", busy_once):
+            r = self.make_runner(max_agents=1)
+            try:
+                self.drive(r, lambda: self.board.get_task(tid).state == "done")
+            finally:
+                r.shutdown()
+        self.assertGreaterEqual(len(calls), 2)                     # the busy job, then the real one
+        task = self.board.get_task(tid)
+        self.assertEqual(task.attempts, 0)                         # PD-8: skipped, no counter
+        self.assertEqual([e for e in journal.task_entries(self.board, tid) if e.kind == "FAIL"], [])
+        self.assertEqual(kinds(self), ["done"])                    # no error event
+
+    def test_answered_flag_is_cleared_when_the_stage_starts(self):
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        task = self.board.get_task(tid)
+        self.board.update_task(tid, expect_state="open", expect_version=task.version, state="writing", answered=True)
+        r = self.make_runner(max_agents=1)
+        try:
+            r.tick()
+            self.assertFalse(self.board.get_task(tid).answered)
+        finally:
+            r.shutdown()
+
+    def test_no_new_jobs_after_a_soft_stop(self):
+        tid = self.add_task("Add hello")
+        r = self.make_runner(max_agents=1)
+        try:
+            r.request_stop(now=False)
+            for _ in range(3):
+                r.tick()
+            self.assertEqual(r.jobs, [])
+            self.assertEqual(self.board.get_task(tid).state, "open")
+        finally:
+            r.shutdown()
+
+    def test_start_prepares_the_shim_and_clears_runner_pid_on_shutdown(self):
+        r = self.make_runner()
+        self.assertTrue((self.repo.artel_dir / "bin").is_dir())
+        self.assertEqual(self.board.get_meta("runner_pid"), str(os.getpid()))
+        r.shutdown()
+        self.assertIsNone(self.board.get_meta("runner_pid"))
+
+    def test_verify_and_setup_processes_are_dead_after_shutdown(self):
+        # the harness records every pid a job started, not only the agents'
+        self.write_toml({"commands.verify": py_cmd("import time; time.sleep(30)")})
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        r = self.make_runner(max_agents=1)
+        self.drive(r, lambda: any(j.kind == "verify" for j in r.jobs) and self.board.get_task(tid).running)
+        self.wait_until(lambda: len(self.started_pids) >= 3)
+        pids = set(self.started_pids)
+        r.shutdown()
+        self.wait_until(lambda: not any(platform.pid_alive(p) for p in pids), timeout=15)
+        task = self.board.get_task(tid)
+        self.assertEqual((task.state, task.attempts, task.running), ("verifying", 0, False))   # requeued, no counter
+
+
+def pick_module():
+    from artel import pick
+    return pick
 
 
 def transitions_create(board, event, **kw):

@@ -36,6 +36,7 @@ class E2ECase(RepoTestCase):
         self.clock = FakeClock()
         self.events = []
         self.runners = []
+        self.started_pids = set()
         self.settings = {}
         self.write_toml({})
         self.board = B.open_board(self.repo.board_path)
@@ -44,14 +45,16 @@ class E2ECase(RepoTestCase):
         self.env = subprocess_env(ARTEL_FAKE_DIR=str(self.fake_dir))
 
     def tearDown(self):
+        failures = []
         for runner in self.runners:
             try:
                 runner.shutdown()
-            except Exception:   # noqa: BLE001 - tearDown must still check the processes
-                pass
+            except Exception as exc:   # noqa: BLE001 - the processes are still checked below
+                failures.append(repr(exc))
         pids = self.recorded_pids()
         self.board.close()
         super().tearDown()
+        self.assertEqual(failures, [], "a runner failed to shut down")
         deadline = time.monotonic() + 10
         alive = list(pids)
         while alive and time.monotonic() < deadline:
@@ -82,6 +85,17 @@ class E2ECase(RepoTestCase):
         cfg = C.load_config(self.repo, env={})
         self.cfg = cfg
         runner = Runner(self.repo, cfg, env=self.env, clock=self.clock, notify=self.events.append)
+        original = runner._on_start
+
+        def recording(board, job):   # every process a job starts (agent, setup, verify, base) must be dead at the end
+            inner = original(board, job)
+
+            def on_start(kind, pid, group, fingerprint):
+                self.started_pids.add(pid)
+                inner(kind, pid, group, fingerprint)
+            return on_start
+
+        runner._on_start = recording
         self.runners.append(runner)
         return runner
 
@@ -131,7 +145,7 @@ class E2ECase(RepoTestCase):
             runner.wait(0.1)
 
     def recorded_pids(self) -> list[int]:
-        pids = {c["pid"] for c in self.calls()}
+        pids = {c["pid"] for c in self.calls()} | self.started_pids
         for task in self.board.list_tasks():
             if task.running_pid:
                 pids.add(task.running_pid)
