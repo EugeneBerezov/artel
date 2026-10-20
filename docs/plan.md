@@ -94,6 +94,7 @@ Added after controller attack #1 — all **(controller, 2026-10-20, owner to con
 - **PD-42 Unknown closure ids.** `closed` ids that are not open review findings of the task are dropped before recording with a runner `FAIL` entry `closed #<id> ignored: not an open finding of #<task>`; they never fail the stage or cost an attempt.
 - **PD-43 Conflict fix skips setup.** A `fix` with `fix_kind=conflict` does not run setup (the merge may leave markers in `setup_inputs`, e.g. a lockfile, and setup would pause the board forever); the following verify rechecks `setup_inputs` (§5 step 7).
 - **PD-44 String `agent_command`.** A string `argv` setting is one executable name or path and is never split (shlex would eat Windows backslashes); arguments need the list form.
+- **PD-45 Integrate exactly the verified commit.** *(controller, 2026-10-20, owner to confirm; from s2's SPEC-GAP in T14)* `finish_verify` on green stores the verified commit in meta `verified:<task_id>` (full sha). `integrate_task` fast-forwards `artel/integration` only to that sha and only if `rev(artel/<id>)` still equals it; a different tip (anything committed after verify) → `ff_impossible` → reverify (R37). The key is deleted on `done`, on reset/delete of the branch, and whenever the task leaves `verified`/`awaiting_accept`. Spec §5 step 8.
 
 ## Waves, slice, shared files
 
@@ -828,6 +829,7 @@ Each test added in the rework names, in its docstring, the mutation it catches.
   | `limit:<rateLimitType>` | T22 | JSON `{"status": str, "rank": int, "resets_at": float \| null, "utilization": float \| null, "seen_at": float}` |
   | `last_base` | T14 | full sha of the base tip last merged |
   | `heavy_lock_stale` | T22 | the check's output, one line, ≤ 400 bytes; absent when not stale |
+  | `verified:<task_id>` | T14 | full sha of the commit verify passed on (PD-45); absent otherwise |
   | `base_running` | T15 | JSON `{"pid": int, "group": int, "fingerprint": str \| null, "slot": int, "started_at": float}` while a base job runs (PD-34) |
 
 - [ ] **Step 1: Write the failing tests**
@@ -2085,7 +2087,8 @@ Full test list: `test_severities_match_journal` (`agent_claude.SEVERITIES == jou
       # merge as applicable; FAIL entry with log path for red
   def integrate_task(repo, board, cfg, task_id: int) -> str
       # for a "verified" task: if artel/integration is checked out in any worktree → "held" (PD-13);
-      # tip = rev(artel/<id>); old = rev(artel/integration);
+      # tip = rev(artel/<id>); old = rev(artel/integration); verified = meta verified:<id> (PD-45);
+      # tip != verified (or no key) → ff_impossible → "reverify";
       # is_ancestor(old, tip) → `git update-ref refs/heads/artel/integration <tip> <old>` → ff_ok
       #   (DONE entry: "integrated <tip12> usage: write 1.2k/3.4k, review …" truncated to 400 B) → "done";
       #   update-ref failure (old moved concurrently) → "retry" (no transition);
