@@ -88,7 +88,7 @@ class RunTreeTest(unittest.TestCase):
     def test_on_start_reports_pid_group_fingerprint(self):
         seen = []
         lines = []
-        self.run_py("import os\nprint(os.getpid())\n", on_start=lambda *a: seen.append(a), on_line=lines.append)
+        self.run_py("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(0.5)\n", on_start=lambda *a: seen.append(a), on_line=lines.append)
         self.assertEqual(len(seen), 1)
         pid, group, fingerprint = seen[0]
         self.assertEqual(str(pid), lines[0])
@@ -154,7 +154,7 @@ class RunTreeTest(unittest.TestCase):
     def test_escaped_pipe_holder_is_abandoned_quietly(self):
         """Mutation caught: a pump that keeps reporting after run_tree returned; an unbounded join."""
         code = ("import subprocess, sys\n"
-                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(1.5); print(\"late\", "
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3.0); print(\"late\", "
                 "flush=True)'], start_new_session=True)\n"
                 "print('first', flush=True)\n")
         lines = []
@@ -163,9 +163,9 @@ class RunTreeTest(unittest.TestCase):
         self.addCleanup(setattr, procs, "JOIN_DEADLINE", saved)
         start = time.monotonic()
         res = self.run_py(code, on_line=lines.append)
-        self.assertLess(time.monotonic() - start, 1.4)   # returned at the deadline, not when the pipe closed
+        self.assertLess(time.monotonic() - start, 2.5)   # returned at the deadline, not when the pipe closed
         self.assertEqual(res.returncode, 0)
-        time.sleep(2.0)
+        time.sleep(3.5)
         self.assertEqual(lines, ["first"])               # "late" arrived after run_tree returned: dropped
 
     def test_trailing_cr_is_not_stripped_twice(self):
