@@ -43,7 +43,7 @@ given in the first message (`You are s1`). Loop:
    section, the cited spec sections and `git diff main...HEAD`; it must not
    edit. Fix blocker/major findings; second round is a closure check only.
    Still open after round 2 → SPEC-GAP note and ask the owner.
-6. Commit on `dev/T<id>`. **Right before integrating**: `tail` again and re-read
+6. Commit on `dev/T<id>`: stage explicit paths (never `git add -A`), check `git diff --cached --stat`, and squash only with `git reset --soft $(git merge-base main HEAD)` — `reset --soft main` onto a newer `main` silently reverts other merges (`integrate` refuses a branch that changes `docs/spec.md` or `docs/plan.md`). **Right before integrating**: `tail` again and re-read
    `reviews/T<id>-*.md` — the controller may have added findings or a plan
    change (PLAN entry) while you worked; close them first. Run the suite with
    `PYTHONWARNDEFAULTENCODING=1 PYTHONWARNINGS=error::EncodingWarning` (CI sets

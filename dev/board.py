@@ -756,6 +756,10 @@ def _terminate(signum, frame):
     raise SystemExit(128 + signum)
 
 
+# Only the controller changes these, by pushing to main directly (docs/dev-process.md).
+CONTROLLER_DOCS = ("docs/spec.md", "docs/plan.md")
+
+
 def cmd_integrate(args):
     session = check_session(args.session)
     store = Store(args.repo)
@@ -787,6 +791,15 @@ def cmd_integrate(args):
         problem = _sync_problem(main)
         if problem:
             raise BoardError(problem)
+        rc, out = git(main, "diff", "--name-only", "HEAD..." + args.branch)
+        touched = sorted(set(out.split()) & set(CONTROLLER_DOCS))
+        if touched:
+            raise BoardError(
+                "%s changes %s: implementers never edit them (a stale copy from "
+                "'git reset --soft main' + 'git add -A' reverts the controller's "
+                "edits). Drop the change: git checkout $(git merge-base main HEAD) "
+                "-- %s, commit, integrate again; a real gap is a SPEC-GAP note"
+                % (args.branch, ", ".join(touched), " ".join(touched)))
         rc, head = git(main, "rev-parse", "HEAD")
         head = head.strip()
 

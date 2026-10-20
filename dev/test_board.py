@@ -567,6 +567,18 @@ class Integrate(TmpCase):
         self.assertIn("DONE T1", (self.store() / "journal.md").read_text())
         self.assertEqual((t["author"], t["review"]), ("A", "pending"))
 
+    def test_branch_touching_plan_is_refused(self):
+        # catches: a squash onto a newer main carrying a stale docs/plan.md (T17, 1e084ca)
+        self.start()
+        (self.repo / "docs").mkdir(exist_ok=True)
+        self.branch_with("dev/T1", "docs/plan.md", "stale\n")
+        head = git(self.repo, "rev-parse", "HEAD")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("docs/plan.md", r.stdout + r.stderr)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.tasks()[1]["state"], "claimed")
+
     def test_conflict_rolls_back(self):
         self.start()
         self.branch_with("dev/T1", "base.txt", "branch side\n")
