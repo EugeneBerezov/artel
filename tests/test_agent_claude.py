@@ -136,7 +136,35 @@ class ParserTest(unittest.TestCase):
         p = A.StreamParser()
         self.assertIsNone(p.feed("[" * 100000))
         huge = "9" * 400
-        self.assertIsNone(p.feed('{"type": "rate_limit_event", "rate_limit_info": {"status": "x", "resetsAt": %s}}' % huge))
+        event = p.feed('{"type": "rate_limit_event", "rate_limit_info": {"status": "x", "resetsAt": %s}}' % huge)
+        self.assertIsNone(event.resets_at)   # an unusable optional field is dropped, the event stays
+        self.assertEqual(p.max_rank, 1)
+
+    def test_rejection_survives_an_overflowing_reset_time(self):
+        """Mutation caught: updating max_rank after parsing optional fields (a rejection would be lost)."""
+        for resets in ("9" * 400, "1e400"):
+            p = A.StreamParser()
+            event = p.feed('{"type": "rate_limit_event", "rate_limit_info": {"status": "rejected", '
+                           '"resetsAt": %s}}' % resets)
+            self.assertEqual(p.max_rank, 2, resets)
+            self.assertIsNone(event.resets_at, resets)   # never inf: the runner would pause forever
+
+    def test_last_call_is_the_latest_line_and_first_context_is_exposed(self):
+        """Mutation caught: last_call taken by first insertion (m1, m2, m1 -> m2); no first-call context."""
+        p = A.StreamParser()
+        for mid, tokens in (("m1", 10), ("m2", 20), ("m1", 30)):
+            p.feed(A.sample_assistant_line("x", {"input_tokens": tokens}, message_id=mid))
+        self.assertEqual(p.usage.last_call, {"input_tokens": 30})
+        self.assertEqual(p.usage.first_context_tokens(), 30)   # m1's latest usage replaced its earlier one
+        self.assertEqual(p.usage.context_tokens(), 30)
+        self.assertIsNone(A.Usage().first_context_tokens())
+
+    def test_usage_to_dict_holds_the_token_counters(self):
+        """Mutation caught: to_dict returning {} or the wrong fields."""
+        u = A.Usage()
+        u.input_tokens, u.output_tokens = 3, 4
+        self.assertEqual(u.to_dict(), {name: getattr(u, name) for name in A.TOKEN_FIELDS})
+        self.assertEqual(u.to_dict()["input_tokens"], 3)
 
     def test_error_flag_fails_even_with_structured_output(self):
         p = A.StreamParser()
@@ -448,6 +476,19 @@ class ArgvTest(unittest.TestCase):
             (Path(tmp) / "node.exe").write_bytes(b"")
             for text in (newer, older):
                 self.assertEqual(A.unwrap_cmd_shim(text, shim), [str(Path(tmp, "node.exe")), cli])
+
+    def test_unwrap_npm_shim_rejects_anything_beyond_the_templates(self):
+        """Mutation caught: a loose recognizer (any batch with `node` and a %~dp0 .js line)."""
+        shim = Path("C:/w/claude.cmd")
+        cases = {
+            "another program": '@echo off\r\nrem uses node\r\n"C:\\Program Files\\Claude\\claude.exe" "%~dp0\\hook.js" %*\r\n',
+            "env line dropped": '@echo off\r\nset "ANTHROPIC_BASE_URL=http://x"\r\nnode "%~dp0\\node_modules\\a\\cli.js" %*\r\n',
+            "extra command": '@echo off\r\nnode "%~dp0\\node_modules\\a\\cli.js" %*\r\necho done\r\n',
+            "trailing args": '@echo off\r\nnode "%~dp0\\node_modules\\a\\cli.js" %* --evil\r\n',
+            "two targets": '@echo off\r\nnode "%~dp0\\a.js" %*\r\nnode "%~dp0\\b.js" %*\r\n',
+        }
+        for name, text in cases.items():
+            self.assertIsNone(A.unwrap_cmd_shim(text, shim), name)
 
     def test_unwrap_write_wrapper_text(self):
         argv = ["C:\\Python 3\\python.exe", "C:\\r\\tests\\fake_agent.py", "100%done"]

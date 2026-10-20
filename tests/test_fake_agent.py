@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from artel import agent_claude as A
+from artel import agent_claude as A, platform as P
 from tests.helpers import RepoTestCase, git, subprocess_env
 
 FAKE_AGENT = Path(__file__).parent / "fake_agent.py"
@@ -144,12 +144,38 @@ class FakeAgentTest(RepoTestCase):
         self.assertTrue(self.parse(res.stdout)[0].failed())
         self.assertEqual((self.repo_path / "a.txt").read_text(encoding="utf-8"), "x")
 
-    def test_fake_note_runs_artel_note(self):
-        # the PATH shim is not built here: the fake falls back to `python -m artel`, which must fail cleanly
-        # outside an initialised repository, proving the action really invokes artel
+    def test_fake_note_fails_loudly_without_the_shim(self):
+        """Mutation caught: a silent `python -m artel` fallback (a runner that never installs the shim would pass)."""
         self.scenario({"*": [{"note": ["FACT", "hi", "basis"]}]})
-        res = self.run_fake()
-        self.assertNotEqual(res.returncode, 0)
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as empty:
+            res = self.run_fake(extra_env={"PATH": empty})
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("no `artel` shim on PATH", res.stderr)
+
+    def test_fake_note_runs_the_path_shim_with_the_note_arguments(self):
+        """Mutation caught: replacing the action with a no-op / not calling the shim found on PATH."""
+        self.scenario({"*": [{"note": ["FACT", "hi there", "the basis"]},
+                             {"result": {"outcome": "ready", "summary": "x"}}]})
+        record = self.tmp / "shim-argv.json"
+        script = self.tmp / "record.py"
+        script.write_text("import json, sys\nopen(sys.argv[1], 'w', encoding='utf-8').write(json.dumps(sys.argv[2:]))\n",
+                          encoding="utf-8", newline="\n")
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        P.write_wrapper(bin_dir / "artel", [sys.executable, str(script), str(record)])
+        res = self.run_fake(extra_env={"PATH": str(bin_dir) + os.pathsep + os.environ["PATH"]})
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(record.read_text(encoding="utf-8")),
+                         ["note", "FACT", "hi there", "--basis", "the basis"])
+
+    def test_fake_usage_sums_every_key_across_assistant_actions(self):
+        """Mutation caught: the final usage keeping only the keys of the latest action (Q6)."""
+        self.scenario({"*": [{"assistant": {"input_tokens": 4, "cache_read_input_tokens": 100}},
+                             {"assistant": {"input_tokens": 6}},
+                             {"result": {"outcome": "ready", "summary": "x"}}]})
+        parser, _ = self.parse(self.run_fake().stdout)
+        self.assertEqual(parser.usage.input_tokens, 10)
+        self.assertEqual(parser.usage.cache_read_input_tokens, 100)
 
     def test_fake_records_pid(self):
         self.scenario({"*": [{"result": {"outcome": "ready", "summary": "x"}}]})

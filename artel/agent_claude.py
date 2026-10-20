@@ -18,6 +18,7 @@ docs/spike-2026-10-19.md (Claude Code 2.1.304, model haiku, Linux):
 - PD-40 `api_error_status == 429` on an error result as the limit-hit shape is an ASSUMPTION (unobserved).
 """
 import json
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -104,14 +105,23 @@ class Usage:                        # PD-23
     last_call: dict | None = None   # latest assistant.message.usage
     final: bool = False             # True when taken from the result record (a SUM over calls, Q6)
 
+    @staticmethod
+    def _context(call: dict | None) -> int | None:
+        if call is None:
+            return None
+        return (_int(call.get("input_tokens")) + _int(call.get("cache_creation_input_tokens"))
+                + _int(call.get("cache_read_input_tokens")))
+
     def context_tokens(self) -> int | None:
         """Context size for rotation (§4): input + cache tokens of the last call; None if no call was seen."""
-        if self.last_call is None:
-            return None
-        return (_int(self.last_call.get("input_tokens")) + _int(self.last_call.get("cache_creation_input_tokens"))
-                + _int(self.last_call.get("cache_read_input_tokens")))
+        return self._context(self.last_call)
+
+    def first_context_tokens(self) -> int | None:
+        """The same measure for the first API call of the run (stored next to the last one, PD-23)."""
+        return self._context(self.first_call)
 
     def to_dict(self) -> dict:
+        """The token counters only; cost, turns and duration are separate board columns (PD-23)."""
         return {name: getattr(self, name) for name in TOKEN_FIELDS}
 
 
@@ -172,14 +182,22 @@ class StreamParser:
         windows = dict(windows) if isinstance(windows, dict) else {}
         window = windows.get(limit_type) if isinstance(limit_type, str) else None
         utilization = window.get("utilization") if isinstance(window, dict) else None
+        rank = status_rank(status)
+        self.max_rank = max(self.max_rank, rank)   # first: a malformed optional field must not hide a rejection
         resets = info.get("resetsAt")
+        try:
+            resets_at = (float(resets) if isinstance(resets, (int, float)) and not isinstance(resets, bool)
+                         else None)
+        except OverflowError:
+            resets_at = None
+        if resets_at is not None and not math.isfinite(resets_at):
+            resets_at = None
         event = RateLimit(
-            status=status, rank=status_rank(status),
-            resets_at=float(resets) if isinstance(resets, (int, float)) and not isinstance(resets, bool) else None,
+            status=status, rank=rank,
+            resets_at=resets_at,
             limit_type=limit_type if isinstance(limit_type, str) else None,
             utilization=float(utilization) if isinstance(utilization, (int, float)) else None,
             windows=windows)
-        self.max_rank = max(self.max_rank, event.rank)
         return event
 
     def _assistant(self, obj: dict) -> None:
@@ -194,7 +212,7 @@ class StreamParser:
             key = f"#line{self._lines_without_id}"
         self._calls[key] = usage   # the last usage seen for an id replaces the earlier one (PD-23)
         calls = list(self._calls.values())
-        self.usage.first_call, self.usage.last_call = calls[0], calls[-1]
+        self.usage.first_call, self.usage.last_call = calls[0], self._calls[key]   # last = latest line seen
         if not self.usage.final:
             for name in TOKEN_FIELDS:
                 setattr(self.usage, name, sum(_int(c.get(name)) for c in calls))
@@ -303,16 +321,44 @@ def schema_json() -> str:
 
 # Windows batch launchers (PD-41) ---------------------------------------------------------------------
 
-_NPM_TARGET = re.compile(r'"%(?:~dp0|dp0%)\\?([^"%\r\n]+?\.js)"\s+%\*', re.IGNORECASE)
+# The two npm cmd-shim templates, line by line. Anything else in the file (env tweaks, another program,
+# extra commands) makes it an unrecognized batch file: unwrapping would silently drop it (PD-41).
+_NPM_BOILERPLATE = frozenset(line.lower() for line in (
+    "@echo off", "goto start", ":find_dp0", "set dp0=%~dp0", "exit /b", ":start", "setlocal", "call :find_dp0",
+    'if exist "%dp0%\\node.exe" (', 'set "_prog=%dp0%\\node.exe"', ") else (", 'set "_prog=node"',
+    "set pathext=%pathext:;.js;=;%", ")",
+    '@if exist "%~dp0\\node.exe" (', "@setlocal", "@set pathext=%pathext:;.js;=;%"))
+_JS = r'"%(?:~dp0|dp0%)\\?(?P<js>[^"%\r\n]+?\.js)"\s+%\*'
+_NPM_COMMANDS = tuple(re.compile(p, re.IGNORECASE) for p in (
+    r'^endlocal & goto #_undefined_# 2>nul \|\| title %comspec% & "%_prog%"\s+' + _JS + "$",
+    r'^"%~dp0\\node\.exe"\s+' + _JS + "$",
+    r"^node\s+" + _JS + "$"))
 _WRAPPER_LINE = re.compile(r'^((?:"[^"\r\n]*"\s+)+)%\*\s*$')
 _SENTINEL = "\0artel-command\0"
 
 
+def _npm_targets(text: str) -> str | None:
+    """The cli.js path when every line of `text` belongs to a known npm cmd-shim template, else None."""
+    found = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.lower() in _NPM_BOILERPLATE:
+            continue
+        for pattern in _NPM_COMMANDS:
+            m = pattern.match(line)
+            if m:
+                found.add(m.group("js"))
+                break
+        else:
+            return None
+    return found.pop() if len(found) == 1 else None
+
+
 def unwrap_cmd_shim(text: str, shim_path: Path) -> list[str] | None:
     shim_path = Path(shim_path)
-    npm = _NPM_TARGET.search(text)
-    if npm and re.search(r"\bnode(?:\.exe)?\b", text, re.IGNORECASE):
-        parts = [p for p in re.split(r"[\\/]+", npm.group(1)) if p]
+    targets = _npm_targets(text)
+    if targets:
+        parts = [p for p in re.split(r"[\\/]+", targets) if p]
         node = shim_path.parent / "node.exe"
         return [str(node) if node.is_file() else "node", str(shim_path.parent.joinpath(*parts))]
     return _unwrap_artel_wrapper(text)
