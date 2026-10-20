@@ -278,6 +278,8 @@ class Board:
         try:   # read-only opens must not queue behind the runner's write transaction
             row = self.conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
         except sqlite3.OperationalError as e:
+            if "locked" in str(e):
+                raise BoardBusy(str(e)) from e
             if "no such table" not in str(e):
                 raise
             row = None

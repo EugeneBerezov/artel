@@ -457,6 +457,28 @@ class BoardTest(unittest.TestCase):
         with self.assertRaises(B.ArtelError):
             B.open_board(Path(self._tmp.name) / "b5.db", factory=MemoryMode)
 
+    def test_concurrent_first_open_creates_one_schema(self):
+        # catches: dropping IF NOT EXISTS / INSERT OR IGNORE from schema creation
+        path = Path(self._tmp.name) / "race" / "board.db"
+        barrier = threading.Barrier(4)
+        results = []
+
+        def opener():
+            try:
+                barrier.wait(5)
+                b = B.open_board(path)
+                results.append(b.get_meta("schema_version"))
+                b.close()
+            except Exception as e:   # noqa: BLE001 - asserted below
+                results.append(e)
+
+        threads = [threading.Thread(target=opener) for _ in range(4)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertEqual(results, ["1"] * 4)
+
     def test_reopen_does_not_take_the_write_lock(self):
         # catches: _init_schema starting BEGIN IMMEDIATE on every open (read-only commands would hit BoardBusy)
         with self.board.tx():
