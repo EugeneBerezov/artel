@@ -19,8 +19,13 @@ class Worktree:
 
 
 def _run(args: list[str], cwd: Path, input: str | None = None, env: dict | None = None):
-    return subprocess.run(["git", *args], cwd=cwd, capture_output=True, input=input,
-                          encoding="utf-8", errors="replace", env=env)
+    try:
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, input=input,
+                              encoding="utf-8", errors="replace", env=env)
+    except FileNotFoundError as exc:
+        if Path(cwd).is_dir():   # the directory exists, so the executable is what is missing
+            raise ArtelError("git not found on PATH") from exc
+        raise
 
 
 class Repo:
@@ -39,7 +44,7 @@ class Repo:
         start = Path(start)
         try:
             common = _run(["rev-parse", "--path-format=absolute", "--git-common-dir"], start)
-        except (FileNotFoundError, NotADirectoryError) as exc:
+        except (FileNotFoundError, NotADirectoryError) as exc:   # the start directory does not exist
             raise ArtelError(f"not inside a git repository ({exc})") from exc
         if common.returncode != 0:
             raise ArtelError("not inside a git repository")

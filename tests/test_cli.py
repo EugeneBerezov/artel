@@ -1,11 +1,15 @@
 import contextlib
 import io
+import subprocess
 import sys
+import tempfile
 import types
 import unittest
+from pathlib import Path
 
 from artel import cli
 from artel.errors import UsageError
+from tests.helpers import REPO_ROOT, subprocess_env
 
 
 class ParserTest(unittest.TestCase):
@@ -54,15 +58,45 @@ class ParserTest(unittest.TestCase):
         a = self.parse("templates", "export", "--force")
         self.assertEqual((a.templates_cmd, a.force), ("export", True))
 
-    def test_simple_commands(self):
+    def test_run_n(self):
         self.assertEqual(self.parse("run", "-n", "2").n, 2)
+        self.assertIsNone(self.parse("run").n)
+
+    def test_stop_now(self):
         self.assertTrue(self.parse("stop", "--now").now)
+        self.assertFalse(self.parse("stop").now)
+
+    def test_resume_force(self):
         self.assertTrue(self.parse("resume", "--force").force)
+        self.assertFalse(self.parse("resume").force)
+
+    def test_init_yes(self):
         self.assertTrue(self.parse("init", "--yes").yes)
+        self.assertFalse(self.parse("init").yes)
+
+    def test_init_force(self):
+        args = self.parse("init", "--force")
+        self.assertTrue(args.force)
+        self.assertFalse(args.yes)
+
+    def test_stats_json(self):
         self.assertTrue(self.parse("stats", "--json").json)
+        self.assertFalse(self.parse("stats").json)
+
+    def test_status_json(self):
+        self.assertTrue(self.parse("status", "--json").json)
+        self.assertFalse(self.parse("status").json)
+
+    def test_notify_test(self):
         self.assertEqual(self.parse("notify", "test").notify_cmd, "test")
+
+    def test_reject_and_answer(self):
         self.assertEqual(self.parse("reject", "4", "--reason", "r").reason, "r")
         self.assertEqual(self.parse("answer", "4", "yes").id, 4)
+
+    def test_ids_are_int(self):
+        for command in ("show", "logs", "approve", "accept"):
+            self.assertEqual(self.fails(command, "x"), 2, command)
 
     def test_unknown_command_is_usage_error(self):
         self.assertEqual(self.fails("frobnicate"), 2)
@@ -103,6 +137,29 @@ class DispatchTest(unittest.TestCase):
         with contextlib.redirect_stderr(err):
             self.assertEqual(cli.main(["status"]), 2)
         self.assertEqual(err.getvalue().strip(), "artel: x")
+
+    def test_broken_handler_import_is_not_hidden(self):
+        """Mutation caught: _resolve swallowing every ModuleNotFoundError (a bug inside a handler -> 'not available')."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            Path(tmp, "artel_t28_broken.py").write_text("import artel_t28_definitely_missing\n",
+                                                        encoding="utf-8", newline="\n")
+            sys.path.insert(0, tmp)
+            self.addCleanup(sys.path.remove, tmp)
+            self.addCleanup(sys.modules.pop, "artel_t28_broken", None)
+            cli.COMMANDS["status"] = "artel_t28_broken:run"
+            with self.assertRaises(ModuleNotFoundError) as cm:
+                cli.main(["status"])
+        self.assertEqual(cm.exception.name, "artel_t28_definitely_missing")
+
+    def test_output_survives_legacy_console_encoding(self):
+        """Mutation caught: removing the stdout/stderr reconfigure loop in cli.main."""
+        # argparse echoes the bad command to stderr; without the reconfigure, cp1252 stderr cannot show it
+        out = subprocess.run([sys.executable, "-m", "artel", "привет-✓"], cwd=REPO_ROOT,
+                             env=subprocess_env(PYTHONIOENCODING="cp1252"), capture_output=True)
+        stderr = out.stderr.decode("utf-8", errors="replace")
+        self.assertNotIn("UnicodeEncodeError", stderr)
+        self.assertEqual(out.returncode, 2)
+        self.assertIn("привет-✓", stderr)
 
     def test_every_command_has_parser(self):
         sub = next(a for a in cli.build_parser()._actions if a.choices and "init" in a.choices)
