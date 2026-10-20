@@ -193,6 +193,9 @@ class TreeTest(unittest.TestCase):
         """Mutation caught: signalling a gone tree / returning True."""
         proc = self.spawn("pass")
         proc.wait(timeout=10)
+        deadline = time.monotonic() + 10   # Windows: the job's ActiveProcesses lags the exit by a moment
+        while P.tree_alive(proc.pid, P.group_of(proc)) and time.monotonic() < deadline:
+            time.sleep(0.05)
         self.assertFalse(P.terminate_tree(proc.pid, P.group_of(proc), grace=0.5))
 
     def test_job_object_kills_orphaned_grandchild(self):
