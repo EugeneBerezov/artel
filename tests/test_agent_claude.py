@@ -406,6 +406,20 @@ class ArgvTest(unittest.TestCase):
         ok = self.build("writer", **{"profiles.writer": ["--permission-mode=acceptEdits"], "profiles.common": ["-p"]})
         self.assertIn("--permission-mode=acceptEdits", ok)
 
+    def test_model_value_cannot_satisfy_the_permission_mode_check(self):
+        with self.assertRaises(ArtelError):
+            self.build("writer", model="--permission-mode=acceptEdits",
+                       **{"profiles.writer": ["--allowedTools", "x"], "profiles.common": ["-p", "--model", "{model}"]})
+
+    def test_bypass_inside_an_unwrapped_wrapper_is_refused(self):
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            wrapper = Path(tmp) / "agent.cmd"
+            wrapper.write_text(P._cmd_script('"C:\\p\\python.exe" "--permission-mode" "bypassPermissions" %*'),
+                               encoding="utf-8", newline="")
+            with mock.patch.object(P, "which", lambda name: name), self.assertRaises(ArtelError):
+                A.build_argv(runtime_cfg(agent_command=[str(wrapper)]), profile="writer", model="m",
+                             notice_path=Path("n"))
+
     def test_model_name_cannot_inject_a_placeholder(self):
         argv = self.build("writer", model="{schema}")
         self.assertEqual(argv[argv.index("--model") + 1], "{schema}")

@@ -93,16 +93,15 @@ class FakeAgentTest(RepoTestCase):
         self.scenario({"*": [{"sleep": 0.1}, {"result": {"outcome": "pass", "summary": "x"}}]})
         procs = []
         env = subprocess_env(ARTEL_FAKE_DIR=str(self.fake_dir), ARTEL_STAGE="review")
-        for task in ("1", "2", "3", "4", "5", "6"):
+        for task in ("1", "1", "1", "1", "1", "1"):   # the same key: the counter read-modify-write must not lose updates
             e = dict(env, ARTEL_TASK=task)
             procs.append(subprocess.Popen([sys.executable, str(FAKE_AGENT)], stdin=subprocess.PIPE,
                                           stdout=subprocess.PIPE, cwd=str(self.repo_path), env=e))
         for proc in procs:
             proc.communicate(b"p")
             self.assertEqual(proc.returncode, 0)
-        self.assertEqual(sorted(c["task"] for c in self.calls()), ["1", "2", "3", "4", "5", "6"])
-        self.assertEqual(json.loads((self.fake_dir / "counts.json").read_text(encoding="utf-8")),
-                         {f"{t}:review": 1 for t in "123456"})
+        self.assertEqual(len(self.calls()), 6)
+        self.assertEqual(json.loads((self.fake_dir / "counts.json").read_text(encoding="utf-8")), {"1:review": 6})
 
     def test_fake_sleep_really_sleeps(self):
         import time
