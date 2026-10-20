@@ -114,7 +114,8 @@ TABLE = (
     Row("R16", ("fixing",), "ready", "reviewing", when=("fix_kind=conflict",),
         sets=("fix_kind=none", "review_closure=1")),
     Row("R17", ("writing", "fixing"), "stage_failed", "open",
-        sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0"),
+        sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0",
+              "review_closure=0"),   # the reset branch gets a fresh first review, never a closure
         effects=("reset_branch",), stuck_on_cap=True, cause="max_attempts"),
     Row("R18", STAGE_STATES, "ask", "blocked", sets=("asked_by=stage", "cause=ask")),
     Row("R19", JOB_STATES, "setup_failed", "=", effects=("pause_setup_failed",)),
