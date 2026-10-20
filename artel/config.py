@@ -104,9 +104,11 @@ def _normalize(setting: Setting, raw: object) -> object:
         raise UsageError(f"{key}: expected true or false, got {raw!r}")
     if kind in ("duration", "size"):
         try:
-            (parse_duration if kind == "duration" else parse_size)(raw)
+            parsed = (parse_duration if kind == "duration" else parse_size)(raw)
         except UsageError as e:
             raise UsageError(f"{key}: {e}") from None
+        if kind == "duration" and parsed <= 0 and key != "kill_grace":   # 0 = busy loop / instant timeout
+            raise UsageError(f"{key}: must be greater than zero, got {raw!r}")
         return raw.strip() if isinstance(raw, str) else raw
     if kind == "str_list":
         return _list_from(raw, key)
@@ -123,8 +125,14 @@ def _normalize(setting: Setting, raw: object) -> object:
     if kind in ("command", "argv"):
         if isinstance(raw, str):
             text = raw.strip()
-            if text.startswith("["):
-                raw = _str_items(_toml_array(text, key), key)
+            items = None
+            if text.startswith("["):   # only a TOML array literal is a list; `[ -d x ] && make` stays a string
+                try:
+                    items = _str_items(_toml_array(text, key), key)
+                except UsageError:
+                    items = None
+            if items is not None:
+                raw = items
             else:
                 if kind == "argv" and not text:
                     raise UsageError(f"{key}: must not be empty")
@@ -326,11 +334,13 @@ def _edit(text: str, key: str, literal: str) -> str:
                 full = current + "." + full
             end_line, end_col = _value_end(lines, i, km.end())
             skip_to = end_line
+            if current == table:
+                section_last = end_line
             if full == key:
                 tail = lines[end_line][end_col:]
                 lines[i:end_line + 1] = [lines[i][:km.end()] + literal + tail]
                 return "".join(lines)
-        if current == table and line.strip() and not line.lstrip().startswith("#"):
+        elif current == table and line.strip() and not line.lstrip().startswith("#"):
             section_last = i
     new_line = f"{name} = {literal}{eol}"
     if table == "":
@@ -380,5 +390,11 @@ def set_value(path: Path, key: str, raw: str) -> None:
         raise UsageError(f"cannot set {key}: {path.name} would not parse ({e}); file left unchanged") from None
     if parsed.get(key) != value:
         raise UsageError(f"cannot set {key}: {path.name} would not read back the new value; file left unchanged")
-    with open(path, "w", encoding="utf-8", newline="") as f:
+    tmp = path.with_name(path.name + ".tmp")   # same directory: os.replace is atomic
+    with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(bom + updated)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)   # never leave artel.toml.tmp dirtying the tree
+        raise

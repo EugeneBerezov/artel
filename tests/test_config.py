@@ -161,6 +161,14 @@ class ParseTest(unittest.TestCase):
                 C.coerce(setting("max_agents"), bad)   # minimum is 1
         self.assertEqual(C.coerce(setting("rotation.writer_max_context"), "0"), 0)
 
+    def test_zero_duration_refused_except_kill_grace(self):
+        # catches: poll_interval = 0 (busy loop) / stage_timeout = 0 (kills every stage)
+        for key in ("poll_interval", "stage_timeout"):
+            for bad in ("0s", 0, "0"):
+                with self.assertRaises(UsageError, msg=f"{key} {bad!r}"):
+                    C.coerce(setting(key), bad)
+        self.assertEqual(C.coerce(setting("kill_grace"), "0s"), 0.0)
+
     def test_coerce_lists_from_string(self):
         s = setting("slot_keep")
         self.assertEqual(C.coerce(s, "a, b ,c"), ["a", "b", "c"])
@@ -411,6 +419,48 @@ class SetTest(RepoTestCase):
         self.assertEqual(cfg["profiles.common"], ["-p", "--model", "{model}"])
         self.assertEqual(cfg["notify.on"], ["done"])
         self.assertEqual(cfg["max_agents"], 2)
+
+
+class SetRework(RepoTestCase):
+    def setUp(self):
+        super().setUp()
+        self.path = self.repo_path / "artel.toml"
+
+    def write(self, text):
+        self.path.write_bytes(text.encode("utf-8"))
+
+    def read(self):
+        return self.path.read_bytes().decode("utf-8")
+
+    def test_append_after_multiline_value(self):
+        # catches: section_last pointing at the FIRST line of a multi-line value (insert inside the array)
+        self.write('[profiles]\ncommon = [\n  "-p",\n]\n')
+        C.set_value(self.path, "profiles.writer", '["a"]')
+        self.assertEqual(self.read(), '[profiles]\ncommon = [\n  "-p",\n]\nwriter = ["a"]\n')
+        self.write('[profiles]\ncommon = [\n  "-p",\n]\n\n[notify]\non = ["done"]\n')
+        C.set_value(self.path, "profiles.reviewer", '["b"]')
+        self.assertIn('  "-p",\n]\nreviewer = ["b"]\n\n[notify]', self.read())
+
+    def test_set_leaves_no_temp_file_and_keeps_original_on_error(self):
+        # catches: writing in place / leaving artel.toml.tmp behind
+        self.write("max_agents = 2\n")
+        C.set_value(self.path, "max_agents", "4")
+        self.assertEqual(sorted(p.name for p in self.repo_path.iterdir() if "artel.toml" in p.name),
+                         ["artel.toml"])
+        with self.assertRaises(UsageError):
+            C.set_value(self.path, "max_agents", "zero")
+        self.assertEqual(self.read(), "max_agents = 4\n")
+
+    def test_command_text_starting_with_bracket_stays_a_string(self):
+        # catches: any "[..." string being parsed as a TOML array
+        C.set_value(self.path, "commands.verify", "[ -d x ] && make")
+        self.assertEqual(C.load_config(Repo.discover(self.repo_path), env={})["commands.verify"],
+                         "[ -d x ] && make")
+
+    def test_bom_file_loads(self):
+        # catches: dropping .decode("utf-8-sig") in load_config
+        self.path.write_bytes(b"\xef\xbb\xbfmax_agents = 5\n")
+        self.assertEqual(C.load_config(Repo.discover(self.repo_path), env={})["max_agents"], 5)
 
 
 class CommandTest(RepoTestCase):
