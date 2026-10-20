@@ -65,6 +65,8 @@ def tail_bytes(text: str, limit: int) -> str:
         newline = chunk.find(b"\n")
         if newline != -1:
             chunk = chunk[newline + 1:]
+    if not chunk.strip(b"\n"):   # the last line alone is longer than the limit: keep its tail, not nothing
+        chunk = raw[-limit:]
     return chunk.decode("utf-8", errors="ignore")   # drops a partial leading code point, never splits one
 
 
@@ -90,17 +92,20 @@ def _entries(entries: Sequence[Entry], source: str) -> str:
 
 
 def render(template_text: str, inputs: PromptInputs, *, budget: int) -> str:
+    """`inputs.history` is oldest first ($answer is the last ANSWER in it). Text an agent wrote (the body and
+    the title of an agent-created task, entries, findings, open-task titles, conflicting paths) is fenced."""
     task = inputs.task
+    agent_made = task.created_by.startswith("agent:")
     answers = [e for e in inputs.history if e.kind == "ANSWER"]
     values = {
         "task_id": str(task.id),
-        "title": task.title,
+        "title": fence(task.title, f"task {task.id} title") if agent_made else task.title,   # SPEC-GAP: plan fences body only
         "area": ", ".join(task.area) if task.area else "(whole repository)",
         "stage": inputs.stage,
         "round": str(task.round),
         "branch": f"artel/{task.id}",
         "diff_range": inputs.diff_range,
-        "body": fence(task.body, f"task {task.id} body") if task.created_by.startswith("agent:") else task.body,
+        "body": fence(task.body, f"task {task.id} body") if agent_made else task.body,
         "task_history": _entries(inputs.history, "task history"),
         "findings": _entries(inputs.findings, "findings"),
         "closure_list": (fence("\n".join(f"#{e.id} [{e.severity}] {e.text}" for e in inputs.closure_list),
@@ -108,7 +113,8 @@ def render(template_text: str, inputs: PromptInputs, *, budget: int) -> str:
         "verify_log": (fence(tail_bytes(inputs.verify_log, budget), "verify log")
                        if inputs.verify_log else "(none)"),
         "context": _entries(inputs.context, "journal"),
-        "conflict_paths": "\n".join(inputs.conflict_paths) if inputs.conflict_paths else "(none)",
+        "conflict_paths": (fence("\n".join(inputs.conflict_paths), "conflicting paths")
+                           if inputs.conflict_paths else "(none)"),
         "open_tasks": (fence("\n".join(f"#{i} [{state}] {title}" for i, state, title in inputs.open_tasks),
                              "open tasks") if inputs.open_tasks else "(none)"),
         "risk_signals": ", ".join(inputs.risk_signals) if inputs.risk_signals else "(none)",
