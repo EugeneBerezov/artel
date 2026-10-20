@@ -74,7 +74,8 @@ States: `proposed`, `vetting`, `awaiting_approval`, `open`, `attacking`, `writin
 a separate `running` flag (agent or command pid) says it is in progress.
 Requeue (`stop --now`, reconcile after a crash, usage limit `rejected`,
 `agent_unavailable` — §5 step 6) only clears `running`: the state stays, the
-branch is kept and the stage runs again later, with no counter. Every transition not in the table is an error and is not taken.
+branch is kept and the stage — or the verify job, for a task in `verifying` —
+runs again later, with no counter. Every transition not in the table is an error and is not taken.
 
 | From | Event | To | Counters / effects |
 |---|---|---|---|
@@ -98,9 +99,12 @@ branch is kept and the stage runs again later, with no counter. Every transition
 | attacking, reviewing | `fail`, invalid result, timeout | same state | `attempts += 1`; `stuck` if `attempts ≥ max_attempts` |
 | writing, fixing (`fix_kind=review`) | `ready` with new commits | reviewing | `round += 1` |
 | fixing (`fix_kind=verify`) | `ready` with new commits | reviewing | verify-fix check of the fix only (§4); no round added |
-| fixing (`fix_kind=conflict`) | `ready` with the merge committed | reviewing | closure check of the resolution; no round added |
-| fixing (`fix_kind=verify`) | `ready` without new commits | blocked (`asked_by=verify`, `cause=ask`) | branch and `attempts` kept; ASK `fixer made no change: <summary>`; slot freed |
-| writing, fixing | `ready` without new commits (not a verify fix), `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `round = 0`, `verify_fixes = 0`; `stuck` if `attempts ≥ max_attempts` |
+| fixing (`fix_kind=conflict`) | `ready` with the merge committed | reviewing | resolution check of the merge (§4); no round added |
+| fixing (`fix_kind=verify`) | `ready` without new commits since `fix_base` | blocked (`asked_by=verify`, `cause=ask`) | branch and `attempts` kept; ASK `fixer made no change: <summary>`; slot freed |
+| writing | `ready` without new commits, `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `round = 0`, `verify_fixes = 0`; `stuck` if `attempts ≥ max_attempts` |
+| fixing | a review fix's `ready` without new commits, a conflict fix's `ready` without the merge committed, `fail`, invalid result, timeout — and `attempts + 1 < max_attempts` | same state | `attempts += 1`; branch kept: the next fixer starts from its tip, and commits since `fix_base` count as its work |
+| fixing | same, `attempts + 1 ≥ max_attempts`, `resets < max_branch_resets` | open | `resets += 1`, `attempts = 0`; branch reset; `round = 0`, `verify_fixes = 0`; open review findings superseded |
+| fixing | same, `attempts + 1 ≥ max_attempts`, `resets ≥ max_branch_resets` | stuck | branch kept; VERDICT names `max_branch_resets` |
 | any stage | `ask` | blocked (`asked_by=<stage>`, `cause=ask`) | branch kept, slot freed |
 | any stage | `setup` fails before the agent starts | same state | no counter; `running` cleared; board paused (`setup_failed`), notify — an environment fault never costs committed work |
 | any agent stage | `agent_unavailable` (§5 step 6) | same state | requeue: no counter, branch kept; board paused (`agent_unavailable`), notify |
@@ -114,39 +118,66 @@ branch is kept and the stage runs again later, with no counter. Every transition
 | blocked (`asked_by=review`, `cause=ask`) | `answer` | reviewing | answer appended; no round added |
 | blocked (`asked_by=review`, `cause=cap`) | `answer` | fixing (`fix_kind=review`) | `review_rounds += 1` for this task; answer appended |
 | blocked (`asked_by=vet`) | `answer` | vetting | answer appended |
-| blocked (`asked_by=verify`) | `answer` | fixing (`fix_kind=verify`) | `max_verify_fixes += 1` for this task |
-| blocked, stuck (task has a branch) | `rework --note` | fixing (`fix_kind=review`) | `review_rounds += 1`; `stuck` also resets `attempts` and `stage_runs` |
-| stuck (no branch; stuck in `vetting`, `attacking` or `writing` — no code exists) | `rework --note` | the stuck stage | `attempts = 0`, `stage_runs = 0`; note appended |
-| verifying | verify green **on its first run**, and `merge=auto` with no protected path changed — or the task was `accept`ed | verified | |
-| verifying | verify green only on a rerun (`flaky` — always, even if the task was `accept`ed) | awaiting_accept | slot freed; the branch keeps the verified commit; FAIL entry with the red log path; the VERDICT says `flaky` |
-| verifying | verify green on its first run, `merge=ask` or a protected path changed (§4), not `accept`ed | awaiting_accept | slot freed; the branch keeps the verified commit; the VERDICT names the reason |
-| verifying | verify red (not a timeout), reruns left in this verify job (`verify_reruns`) | same state | the whole verify runs again on the same merged tree (§5 step 7) |
+| blocked (`asked_by=verify`, `cause=cap`) | `answer` | fixing (`fix_kind=verify`) | `max_verify_fixes += 1` for this task; answer appended |
+| blocked (`asked_by=verify`, `cause=ask`) | `answer` | fixing (`fix_kind=verify`) | answer appended; the cap is unchanged (it was not reached) |
+| blocked (`asked_by=verify`, `cause=ask`) | `accept` | verifying | the human judges the red not to be this change's fault: verify runs again on the branch as it is. It overrides only the red — `accepted` is **not** set, so a green verify still meets every gate (protected paths, test guard, empty verify, `merge=ask`, `flaky`); red → the verify-red rows below |
+| blocked, stuck (task has a branch) | `rework --note` | fixing (`fix_kind=review`) | `review_rounds += 1`; `stuck` also resets `attempts`, `resets` and `stage_runs` |
+| stuck (no branch; stuck in `vetting`, `attacking` or `writing` — no code exists) | `rework --note` | the stuck stage | `attempts = 0`, `resets = 0`, `stage_runs = 0`; note appended |
+| verifying | verify green **on its first run** (on every run, for a task with an earlier red job — §5 step 7), and `merge=auto` with no guard forcing `merge=ask` (protected path, test guard — §4; empty verify — below) — or the task was `accept`ed from `awaiting_accept` | verified | |
+| verifying | verify green only on a rerun, or — for a task with an earlier red job — green on some runs and red on others (`flaky` — always, even if the task was `accept`ed) | awaiting_accept | slot freed; the branch keeps the verified commit; FAIL entry with the red log path; the VERDICT says `flaky` |
+| verifying | verify green on its first run, `merge=ask` or a guard forces it (§4 protected paths, test guard; empty verify), not `accept`ed | awaiting_accept | slot freed; the branch keeps the verified commit; the VERDICT names the reason and the setting |
+| verifying | verify red (not a timeout), reruns left in this verify job (`verify_reruns`) — for a `red_seen` task also after a green run | same state | the whole verify runs again on the same merged tree (§5 step 7) |
 | verifying | merge conflict, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=conflict`) | `verify_fixes += 1`; the runner leaves the merge in progress (`merge --no-commit`) for the agent to resolve and commit |
-| verifying | verify red after its reruns, or `verify_timeout`, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1` |
-| verifying | same, cap reached | blocked (`asked_by=verify`) | |
+| verifying | verify red after its reruns, and `artel/integration` alone is red too (§5 step 7) — checked before the cap | same state | no counter, no fixer; `running` cleared; board paused (`base_conflict`), notify |
+| verifying | verify red after its reruns (`artel/integration` alone green), or `verify_timeout` (no base check: a timeout says nothing about the base), `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1` |
+| verifying | merge conflict, verify red after its reruns (base green) or `verify_timeout` — `verify_fixes ≥ max_verify_fixes` | blocked (`asked_by=verify`, `cause=cap`) | ASK names the cap and the last log |
 | awaiting_accept | `accept` | verified | `flaky` cleared |
 | verified | integration fast-forward succeeds | done | branch deleted, slot freed |
 | verified | fast-forward impossible (integration moved, e.g. while awaiting accept) | verifying | no counter: re-merge and re-verify |
 
 Defaults: `max_attempts = 2`, `review_rounds = 2`, `max_verify_fixes = 2`,
-`verify_reruns = 1`, `max_stage_runs = 12`.
+`verify_reruns = 1`, `max_stage_runs = 12`, `max_branch_resets = 1`.
+
+**New commits.** A writer's new commits are commits on the task branch that
+are not in `artel/integration`; a fixer's are commits since `fix_base`, the
+branch tip recorded when the task entered `fixing` (every row into `fixing`
+records it, the conflict row included). A task that goes `blocked` from
+`fixing` keeps its `fix_kind`, and `answer` returns to the same fix.
 
 **Counters.** `attempts` counts consecutive failed runs of the stage the task
-is in: `fail`, invalid result, timeout, internal error, and `ready` without
-new commits outside a verify fix. Every other row that leaves a stage state
-on a classified outcome other than `ask` sets `attempts = 0`. `ask`, a verify
+is in: `fail`, invalid result, timeout, internal error, a writer's or a
+review fixer's `ready` without new commits, and a conflict fixer's `ready`
+without the merge committed. Every other row that leaves a stage state on a
+classified outcome other than `ask` sets `attempts = 0`. `ask`, a verify
 fix's `ready` without new commits (the fixer says the red is not the
 change's fault; a human decides), a setup failure, a
 requeue (including `agent_unavailable`) and human commands other than
 `rework` from `stuck` leave it unchanged. So `max_attempts` bounds
 consecutive failures of one stage.
+A failed fix is retried on the same branch: finished work is never thrown
+away for one bad fixer run. Only when a fix stage has used up
+`max_attempts` is the branch reset and the task rewritten from `open`, at
+most `max_branch_resets` times in the task's life (`resets`; only `rework`
+from `stuck` sets it back to 0); the next time the task is `stuck`. A
+writer's failure resets the writer's own partial branch and does not count
+toward `resets`.
 `stage_runs` counts finished agent runs of the task over its life: a run
 counts when its agent started and it was not requeued; verify, setup and
 limit probes are not agent runs. Every row triggered by a human command that
 moves the task (`answer`, `rework`, `approve`, `accept`) sets
 `stage_runs = 0`, so a task a human just moved always gets at least one run;
-the cap bounds unattended loops such as write → verify red → fix → reset,
-which the attempts reset would otherwise allow.
+the cap bounds unattended loops such as write → review → fix → … that
+`attempts` alone, reset by every success, would not stop.
+`accepted` is set only by `accept` from `awaiting_accept`, where the human
+saw the reasons; it overrides `merge=ask` and the guards for **that code**.
+Every row that lets the branch change (into `fixing`, a branch reset,
+`rework`) clears it, so it survives only a re-verify of the same commit after
+the integration moved (`verified` → `verifying`) — which keeps the accept →
+fast-forward impossible → re-verify path from asking again. `red_seen` is set
+when a verify job of the task ends red (after its reruns) and never cleared:
+such a task's later jobs run all `1 + verify_reruns` runs, and anything but
+all green is `flaky` or red — a fix that merely re-rolls a racy test cannot
+merge on one lucky run.
 `flaky` describes one verify job: a green rerun sets it; it is cleared when
 the task's next verify starts and by `accept`. It records only what was
 observed — red, then green on the same tree — and does not say the test is
@@ -162,6 +193,15 @@ blocking findings go straight to the human. Reviews cannot be disabled;
 they append a request to a `requests` table, and the runner applies it on its
 next tick through the table above. Without a running runner, requests wait;
 `artel status` lists them.
+Every process the runner starts (agents, `setup`, `verify`, probes, and what
+they run) carries `ARTEL_CHILD=1` in its environment. Human commands, `artel
+run` and a human `artel add` refuse to run under it (only the variable
+decides: the slots are also where the project's own tests run, so a
+working-directory rule would refuse legitimate test calls): an agent, a test or a
+setup script cannot answer, accept, approve, resume or add work in the
+human's name by mistake. This guards against confused agents, not against
+hostile code, which runs as the same OS user and could write the board
+directly (§11 says so).
 
 **Pauses.** The board holds a **set** of active pauses, each with its kind,
 detail and end condition, stored in the board (a restart keeps them). While
@@ -176,19 +216,22 @@ removes another kind. Kinds:
 | Kind | Cause | Ends |
 |---|---|---|
 | `manual` | `artel pause` | `resume` |
-| `base_conflict` | base merge conflicts or its verify is red (§5) | `resume` after the human fixed `artel/integration` |
+| `base_conflict` | base merge conflicts or its verify is red (§5); or `artel/integration` alone is red before a verify fix (§5 step 7) | `resume` after the human fixed `artel/integration` or the environment; `resume` forgets every cached base-check result (not the recorded test ids, §4), so the base is verified again before the board can pause on it again |
+| `integration_moved` | `artel/integration` is not at the commit the runner last left it (§5 step 8) | `resume` (the runner then records the current tip) |
 | `failures` | the failure breaker (§5 step 6) | `resume` (resets the breaker count) |
 | `limit` | usage limit reported by the agent CLI (§5 step 5) | by itself at the reset time; without one, when a probe passes (§5 step 5); after `limit_probes` failed probes, `resume` |
 | `agent_unavailable` | an `agent_unavailable` run (§5 step 6) | by itself when a probe passes (same schedule as `limit`); after `limit_probes` failed probes, `resume` |
-| `quota` | a usage window's utilization reached its `quota_stop_*`, or `night_budget_seven_day` is spent (§5 step 5) | by itself at that window's reset time (budget: 24 h after the baseline sample); a window with no future reset time is probed as for `limit`; after `limit_probes` failed probes, `resume` |
+| `quota` | a usage window's utilization reached its `quota_stop_*`, or `night_budget_seven_day` is spent (§5 step 5) | by itself at that window's reset time (budget: 24 h after the baseline sample); a window with no future reset time is probed as for `limit`, but a probe ends a `quota` pause only when its own usage event shows every window below its `quota_stop_*`; after `limit_probes` failed probes, `resume` |
 | `disk` | free disk below `min_free_disk` | by itself when space is back |
 | `setup_failed` | `setup` failed before an agent started | by itself when `setup_inputs` change or the retry after `setup_retry` succeeds |
 
-Plain `resume` removes exactly the kinds whose Ends column names `resume`
-(`limit`, `agent_unavailable` and a probed `quota` only after their probes
-are spent); on any
-other active kind it says `pause <kind> ends by itself; use resume --force`.
-`resume --force` empties the set. Every pause notifies (`paused`, with kind,
+Plain `resume` removes `manual`, `base_conflict`, `failures` and
+`integration_moved`, and a `limit`, `agent_unavailable` or `quota` pause
+only once its probes are spent; on any other active pause (a `quota` with a
+known reset time included) it says `pause <kind> ends by itself; use resume
+--force`. `resume --force` empties the set. Removing `failures` sets both
+the failure breaker count and the `agent_unavailable` streak (§5 step 6) to
+0. Every pause notifies (`paused`, with kind,
 cause and reset time when known) and names the setting or event that caused
 it; every end notifies (`resumed`).
 
@@ -198,13 +241,19 @@ free slot detached at the integration tip, with the read-only profile.
 **Leaving a slot.** After every stage the runner aborts any merge in progress
 and runs `git reset --hard` + `git clean -ffdx` (keeping `slot_keep`) before
 `git switch --detach`. These commands refuse to run on any path that is not
-a registered slot under `slots_dir`.
+a registered slot under `slots_dir`. After a successful `setup` the runner
+records the untracked and ignored top-level paths that setup created; when
+leaving the slot would delete one of them (it is not covered by
+`slot_keep`), the slot's setup hash is cleared, so the next stage runs
+`setup` again instead of running without its environment.
 
 **Recorded processes** carry their start time; reconcile terminates a
 recorded pid only if its start time still matches (pid reuse).
 
 **Empty `verify`** is allowed but shown as a warning in `artel status`, and
-`artel init` asks for it.
+`artel init` asks for it. It counts as green, but nothing was executed, so
+it forces `merge=ask`: a task then merges only after `artel accept` (VERDICT
+`verify not configured (commands.verify="")`).
 
 **Base moved with a conflict.** If merging the base into `artel/integration`
 (§5) conflicts, the runner pauses the board (`paused: base_conflict`) and
@@ -246,33 +295,105 @@ invalid result is `fail`.
 |---|---|---|---|
 | `attack` | task has `--attack` | strong | Attacks the task statement before code: ambiguity, contradictions, risks. |
 | `write` | always | `write` | Implements, commits on the branch, runs checks for what it touched. |
-| `review` round 1 | after `write` | `review`, or strong if escalated | Fresh full attack on the diff `integration...artel/<id>`, the task and the journal. Read-only. |
-| `review` round ≥ 2 | after a `fix` | same rule | **Closure check:** for each open finding, closed or not (with basis); new findings only at `blocker` severity. No new topics. |
-| `review` after a verify fix | after a `fix` for a red verify | same rule | **Verify-fix check** of the fix only (`fix_base..artel/<id>`) with the verify log: weakening, skipping or deleting a test or check, editing verify or CI configuration, or special-casing the test environment is a `blocker`; other new findings are `minor`; open findings are listed for closure as in any closure round. |
+| `review` round 1 | after `write` | `review`, or strong if escalated | Fresh full attack on the diff `integration...artel/<id>`, the task and the journal. May run the project's checks and write probe tests (below); never commits. |
+| `review` round ≥ 2 | after a review `fix` | `review` | **Closure check** of the fix only (`fix_base..artel/<id>`): for each open finding, closed or not (with basis); new findings only at `blocker` severity. No new topics. Probes allowed. |
+| `review` after a verify fix | after a `fix` for a red verify | `review` | **Verify-fix check** of the fix only (`fix_base..artel/<id>`) with the verify log: weakening, skipping or deleting a test or check, editing verify or CI configuration, or special-casing the test environment is a `blocker`; other new findings are `minor`; open findings are listed for closure as in any closure round. |
+| `review` after a conflict fix | after a `fix` that resolved a merge conflict | `review` | **Resolution check** of the merge only (`git show --remerge-diff` of each merge in `fix_base..artel/<id>`): a resolution that drops a change that came from `artel/integration` (work of an already merged task) is a `blocker`; other new findings are `minor`. |
 | `fix` | open blocker/major findings, or verify red / conflict | `write` | Fresh writer with the task and the open findings or the verify log; commits fixes. |
 
 **Model escalation.** The review model is the cheap one by default
-(`sonnet`); a review runs on the strong model (`opus`) when the task has
-`--strong` or `--attack`, the diff changes a protected path, or the diff
-exceeds `strong_diff_lines` (default 300). The attack stage always uses the
-strong model.
+(`sonnet`); a **round-1** review runs on the strong model (`opus`) when the
+task has `--strong` or `--attack`, the diff changes a protected path or
+trips the test guard, or the diff exceeds `strong_diff_lines` (default
+300). Closure, verify-fix and resolution checks look only at a fix and
+always run on `models.review`. The attack stage always uses the strong
+model.
+
+**Reviewer probes.** A reviewer (every `review` row above) works in the
+task's slot with the `reviewer` profile (§6): it may read anything, run the
+project's check commands (`project_tools`, through `artel heavy` when
+heavy) and write probe tests or scratch files to show a defect; a finding
+backed by a failing probe states the command and its output in `basis`. It
+never commits, and writes probes as new files (editing the code under
+review would make its verdict describe code that does not exist). Without
+`project_tools` it can write probes but not run them. `vet` and `attack`
+keep the read-only `attacker` profile.
+
+**Repository check (every agent stage).** A probe, a test or any command an
+agent runs acts on the shared `.git`, which the slot clean-up does not
+touch. Before and after every agent stage — writers too — the runner takes
+a snapshot: every ref under `refs/heads/artel/`, `refs/stash` and
+`refs/replace/`, the shared `config`, `info/` and `hooks/` (contents), the
+slot's `config.worktree`, the worktree list, and `git status` of every slot
+that had no job during the stage. Refs of tasks that had a job of their own
+during the stage are left out (their agents move them), and so is
+`artel/integration` (the runner checks it itself, §5 step 8), and so is every ref the runner
+itself moved or deleted during the stage (integrating, rejecting,
+accepting, resetting or deleting another task's branch) and every slot it
+added; the runner keeps that record. For a vet,
+attack or review stage the task's own branch and the slot's `HEAD` must
+also be unchanged; a writer or fixer may only add commits to its own
+branch. On any other change the runner restores what it can (refs set back
+or deleted, the files rewritten from the snapshot, an idle slot cleaned),
+writes a runner `FAIL` entry naming what changed, counts the run as a
+failed stage and notifies (`error`). Then the slot is left as after every
+stage (§3.1 "Leaving a slot"), so every probe file is gone.
 
 **Protected paths.** A task whose diff `artel/integration...artel/<id>`
 (renames on both sides, deletions included) changes a path matching
 `protected_paths` — agent and CI configuration such as `.claude/`,
-`CLAUDE.md`, `.github/`, `artel.toml`, the templates directory — gets every
-review on the strong model and never merges on its own: a green verify goes
-to `awaiting_accept` (§3.1) with a VERDICT naming the paths. A setting entry
+`CLAUDE.md`, `.github/`, `artel.toml`, the templates directory, dependency
+lockfiles — gets its round-1 review on the strong model and never merges on
+its own: a green verify goes to `awaiting_accept` (§3.1) with a VERDICT
+naming the paths. A setting entry
 without an inner `/` matches that name anywhere in the tree; an entry with
 one is a root-anchored path prefix; matching ignores case. In addition, every
 argument of a list-form `setup`/`verify` command that names a **regular
 file** (a blob, not a directory) at the `artel/integration` tip is protected
 as a root-anchored exact path (e.g. `scripts/verify.sh`; `-s tests` names a
-directory and protects nothing). String-form commands are not parsed. An
-empty `protected_paths` disables the setting entries; command-derived
-entries stay.
+directory and protects nothing), and so is every `setup_inputs` entry (a
+change there reruns `setup`, e.g. package install scripts, on the runner's
+machine). String-form commands are not parsed. An
+empty `protected_paths` disables the setting entries; derived entries stay.
+
 Known limitation in v0.1: while the task is reviewed and verified, its
 branch's own `.claude/settings.json` (hooks included) is active in the slot.
+
+**Test guard.** Verify is the only check that runs code, and the writer can
+change what it runs. Without spending tokens the runner looks at the task's
+diff `artel/integration...artel/<id>` for paths matching `test_paths`
+(entries as in `protected_paths`, plus `*`/`?` patterns matched against the
+file name; directories allowed). It asks the human (`merge=ask`, like a
+protected path) only on **hard signals**:
+- a matching file is deleted or renamed;
+- a test that passed on the last green verify of the current
+  `artel/integration` tip is missing from the task's verify, or did not
+  pass there (skipped included). Tests are compared as **sets of test
+  ids**, read from the verify log with `verify_test_id_regex` (one group:
+  the id of a passed test; defaults for `unittest -v` and `pytest -rA`).
+  The verify command must print ids (`-v`); totals are not enough, because
+  `Ran N tests` counts skipped tests and new tests hide removed ones. No
+  recorded ids for the tip (a fresh board, a tip a human repaired) → no id
+  check, and the task's VERDICT says `test-id check off: no ids recorded
+  for <sha>` (`artel status` too, once it exists). The ids are kept per
+  sha and only for green verifies: a later red result for the same sha, or
+  `resume` forgetting the base-check cache, never removes them;
+- a matching file whose diff removes more lines containing an assertion
+  marker (`test_assert_markers`: `assert`, `expect(` by default) than it
+  adds; comment lines (starting with `#`, `//`, `/*` or `*`) count on
+  neither side, so commenting an assertion out is a removal;
+- an added line in a matching file that matches one of `test_markers`
+  (regexes): an unconditional skip, `.only(`, an added `xfail` or expected
+  failure, `os._exit` — conditional skips (`skipIf`, platform checks) and
+  `sys.exit` are ordinary test code and are not markers.
+Any other changed or deleted line in a matching file, and any change to a
+matching file that is not itself a test file (`conftest.py`,
+`__init__.py`, test configuration), only sends the round-1 review to the
+strong model; it does not ask. A hard signal's VERDICT lists the paths,
+missing test ids (at most three, then `+N more`) and the settings.
+`accept` from `awaiting_accept` is honoured, as for protected paths. Empty
+`test_paths` disables the diff checks; empty `verify_test_id_regex`
+disables the id check.
 
 **Session rotation (writers only).** By default every stage is a fresh
 process. The user can let a writer session continue instead, with
@@ -297,13 +418,36 @@ recorded with its reason (`artel show`: "fix resumed writer session: same
 slot, context 41k < 60k").
 
 **Measuring before choosing.** artel records, per stage, the context size of
-the first and last API call, turns, duration and usage. `artel stats` prints
-medians and 90th percentiles per stage kind and model, and what a continued
-session would have cost versus a fresh one on the recorded tasks. Thresholds
-(`writer_max_context`, `strong_diff_lines`, `stage_timeout`) are chosen from
-these numbers; `artel init` shows the current defaults and asks for the key
-policies (agents, review model, rotation, auto-approval) instead of setting
-them silently.
+the first and last API call, turns, duration and usage, and the number of
+workers (`max_agents` in effect) when the stage started; per verify run,
+how long it waited for the verify lane and `heavy_lock` before it started;
+and why slots sat idle (`no_task`: nothing claimable, `area`: a claimable
+task waits on an overlapping area, `deps`: open tasks wait on dependencies,
+`paused:<kind>`), stored as spans written only when the reason changes.
+`artel stats` prints medians and 90th percentiles per stage kind and model,
+runs grouped by workers, idle time by reason, verify queue wait, and what a
+continued session would have cost versus a fresh one on the recorded tasks.
+Thresholds (`writer_max_context`, `strong_diff_lines`, `stage_timeout`) are
+chosen from these numbers; `artel init` shows the current defaults and asks
+for the key policies (agents, review model, rotation, auto-approval) instead
+of setting them silently.
+
+**Finding fates.** Every review finding is a journal entry with an id. When
+a task leaves the board (`done`, `rejected`), the runner records the fate of
+each of its review findings — `closed` (in which round), `open` (still open
+at the end: minors), `superseded` (branch reset) or `human` (listed in an
+ASK at the review cap) — and the severity the reviewer gave before any
+closure-round downgrade. When a review reports a blocker or major, the
+runner also verifies the reviewed commit itself (a **shadow verify**, no
+tokens; `shadow_verify`): green means verify alone would have merged the
+defect the review caught, red that verify would have caught it too. A
+shadow verify never delays real work: it starts only when the verify lane
+is idle, no task is due for verify and a slot would otherwise sit idle; it
+runs under `heavy_lock` like any verify; a task verify or base check that
+becomes due stops it, and a stopped or dropped shadow is recorded as `not
+measured`. It is a `runs` row (stage `verify-shadow`) and never changes any
+task's state. `artel stats` reports fates and shadow results, so the value
+of the review stage is measured, not assumed.
 
 **Vetting proposed tasks.** Every `proposed` task (added by an agent; in
 v0.2 also by the planner) first gets a `vet` stage: a fresh agent (`review`
@@ -342,8 +486,9 @@ Loop:
 3. **Slot.** Check `git worktree list --porcelain` that the branch is not
    checked out elsewhere; `git switch -C artel/<id> artel/integration` (new
    or reset) or `git switch artel/<id>` (resume); `git clean -ffdx` keeping
-   `slot_keep` paths (default `node_modules`); run `setup` under `heavy_lock`
-   if the hash of `setup_inputs` differs from the slot's last setup.
+   `slot_keep` paths (default `node_modules`, `.venv`, `venv`); run `setup`
+   under `heavy_lock` if the hash of `setup_inputs` differs from the slot's
+   last setup, or that hash was cleared (§3.1 "Leaving a slot").
 4. **Agent.** Start the stage command (§6) in the slot in its own process
    group, prompt on stdin, `--output-format stream-json` to
    `<git-common-dir>/artel/logs/<id>/<stage>-<n>.jsonl`, wall-clock
@@ -371,12 +516,18 @@ Loop:
      schema, no slot, no task); the k-th probe of a pause runs k ×
      `limit_retry` after the previous one (the first after the pause began:
      gaps 30/60/90/120 min by default; a machine waking late runs one probe,
-     not a burst); a probe
-     that reports a reset time sets the end, a probe without a limit ends the
-     pause, at most `limit_probes` probes in any rolling 24 h; then notify and
-     wait for `resume`. Probes never count toward `attempts`, `stage_runs`
-     or the failure breaker. A window without a future `resetsAt` ends by
-     the same probe rule.
+     not a burst). A probe runs for one pause and its outcome applies to that
+     pause: a reported limit with a reset time sets that pause's end (and a
+     `limit` pause is added or extended with it when the probed pause is
+     another kind); a limit without a reset time or an `agent_unavailable`
+     result is a failed probe; a probe without either ends the pause —
+     except a `quota` pause, which ends only when the probe's own usage event
+     shows every window below its `quota_stop_*` (a window still at or above
+     it with a future `resetsAt` sets the end instead; otherwise the probe
+     failed). At most `limit_probes` probes in any rolling 24 h, counted
+     across all kinds; then notify and wait for `resume`. Probes never count
+     toward `attempts`, `stage_runs` or the failure breaker. A window without
+     a future `resetsAt` ends by the same probe rule.
    Store usage from the final `result` record; if the agent was killed, keep
    what the stream already reported.
 6. **Outcome** from the structured result → transition (§3.1). After every
@@ -389,8 +540,15 @@ Loop:
    A permanent fault can look the same (a bad `models.*` value, an agent
    command that rejects its arguments) while probes pass: when
    `max_consecutive_failures` `agent_unavailable` runs in a row that started
-   after a passing probe end with the same signature (exit code + first
-   stderr line), pause `failures` instead, naming the signature.
+   after a passing probe end with the same signature, pause `failures`
+   instead, naming the signature. The signature is the exit code and the
+   first non-empty stderr line with every digit replaced by `#` (pids and
+   times differ between equal faults), at most 200 characters. "In a row":
+   any other classified agent outcome, of any task, resets the streak, and
+   so does `resume` of `failures`; requeues, setup failures and verify jobs
+   neither count nor reset. The two-task rule of the failure breaker does
+   not apply here: one task is enough, because the fault is the agent's,
+   not the task's.
    **Failure breaker:** a failure is any agent-stage outcome that increments
    `attempts` (§3.1 Counters). `max_consecutive_failures` failures in a row,
    from at least two distinct tasks, → pause `failures` and notify. Any
@@ -403,12 +561,34 @@ Loop:
    into the task branch, recheck `setup_inputs`, run `verify` under
    `heavy_lock` with `verify_timeout`. A red verify (non-zero exit, not a
    timeout) runs again, up to `verify_reruns` times within this verify job, on
-   the same merged tree under `heavy_lock`, without `setup`. Green on a rerun
+   the same merged tree under `heavy_lock`, without `setup`; for a task with
+   `red_seen` (§3.1) every one of the `1 + verify_reruns` runs is made and
+   all must be green. Green on a rerun
    → the task is `flaky`: it never merges on its own (`awaiting_accept`, even
    after an earlier `accept`), and a runner `FAIL` entry `flaky verify:
    <command>, red log <path>` is written — never a `FACT`, which later agents
-   would read as established. Each verify run is a `runs` row (stage
-   `verify`, outcome `green|red|timeout|stopped`, duration). `setup` and `verify` run in their own
+   would read as established; the entry also names up to three failed tests
+   read from the red log (`FAIL:` / `ERROR:` / `FAILED` lines). A verify
+   still red after its reruns is checked against its base before a fixer is
+   paid for: verify runs on the current `artel/integration` tip alone
+   (detached, in the same slot), with the same `verify_reruns` (green on any
+   run → base green, and a runner `FAIL` entry `flaky base`). The outcome is
+   cached per tip sha with its time; a green base-moved verify or an
+   integration also records it. A cached green is ignored when it is older
+   than `base_cache_ttl` (6 h) or when a second task has gone red on the
+   same tip since it was recorded — the overnight cause of a red base is
+   usually the environment, not a commit, and two red tasks on one tip are
+   the cheap signal. Base red → no fix and no counter: the task stays
+   `verifying` and the board pauses `base_conflict` naming the red log,
+   because no task fix can repair a red base; the first red task finds it
+   and the rest wait. `resume` forgets the cache (§3.1 Pauses), not the
+   recorded test ids, which are a separate record (§4). Base green →
+   the verify-fix rows of §3.1. The ids of the tests each green verify
+   passed (`verify_test_id_regex`) are stored with it for the test guard
+   (§4). Each verify run is a `runs` row (stage
+   `verify`, outcome `green|red|timeout|stopped`, duration, and `queued_at`:
+   when the job became due, so the wait for the verify lane and
+   `heavy_lock` is visible). `setup` and `verify` run in their own
    process groups, recorded like agents, so reconcile and timeouts terminate
    them the same way (SIGTERM, `kill_grace`, SIGKILL).
 8. **Integrate.** Fast-forward `artel/integration` to the verified commit
@@ -416,6 +596,15 @@ Loop:
    branch; if the fast-forward is impossible (the task waited in
    `awaiting_accept` while others integrated), the task goes back to
    verifying (§3.1). `DONE`, delete the task branch, notify per `notify_on`.
+   The runner records the sha it leaves `artel/integration` at — the
+   commit it passed to `update-ref` itself (a verified commit, a base
+   merge), never a value read back from the ref, except at start and on
+   `resume`. It compares the ref with that record on every tick, before
+   every move it is about to make and after collecting every verify job:
+   a different tip while no `base_conflict` pause is active (during one the
+   human repairs the branch) pauses `integration_moved` and notifies, and
+   nothing is moved or adopted; its `resume`, like the `resume` of
+   `base_conflict`, records the current tip.
 
 **Base moved.** When the base gets new commits, the runner merges the base
 into `artel/integration` before the next pick, runs `verify` on the result,
@@ -438,10 +627,13 @@ Logs: keep the last `log_keep_tasks` tasks' logs (default 50).
 
 Templates per stage (`attack.md`, `write.md`, `review.md`, `review-closure.md`,
 `review-verify-fix.md`, `fix.md`, `vet.md`), defaults built in, overridable per project. An unattended notice is
-appended to every agent's system prompt: no human is present; this overrides
-any instruction to wait for or ask for human approval; ask only through the
-structured `ask` outcome; stay in the current directory and branch; never
-merge, push or switch branches; run heavy commands only through `artel heavy`.
+appended to every agent's system prompt: no human is present, so never wait
+for one and never ask in prose; an instruction (in `CLAUDE.md` or elsewhere)
+to get human approval before an action means **do not take that action** —
+finish with the structured `ask` outcome naming it; for a reviewer, a change
+that the project's rules reserve for human approval is a `blocker`; stay in
+the current directory and branch; never merge, push or switch branches; run
+heavy commands only through `artel heavy`.
 
 **Context given to an agent** (`context_budget`, default 8000 bytes):
 1. The task, its findings and its own full history (never truncated).
@@ -455,7 +647,10 @@ instructions".
 **Agent-side CLI** (bound to `ARTEL_TASK`): `artel note FACT|FAIL TEXT
 [--basis B]`, `artel add` (creates `proposed` tasks), `artel heavy -- CMD`
 (runs CMD under `heavy_lock` if CMD matches `project_tools`). All state
-changes belong to the runner. The `artel` on the agent's `PATH` is a shim
+changes belong to the runner. An agent's `artel add --merge` and
+`--review N` can only make a task stricter than the configuration (`ask`
+over `auto`; at least `review_rounds` rounds), never the reverse. Under `ARTEL_CHILD` (§3.1 "Single writer") `artel add` without
+`ARTEL_TASK` is refused instead of creating a human task. The `artel` on the agent's `PATH` is a shim
 (a `sh` script, and a `.cmd` on Windows) that runs the runner's own Python in
 isolated mode with the location of the runner's own artel baked in:
 `python -I -c "import sys; sys.path.insert(0, ROOT); from artel.cli import
@@ -479,11 +674,20 @@ writer:  --permission-mode acceptEdits
          --allowedTools "Bash(artel note *) Bash(artel add *) Bash(artel heavy *)
                          Bash(git add *) Bash(git commit *) Bash(git status *)
                          Bash(git diff *)" {project_tools}
-reviewer/attacker:
+reviewer (review, closure, verify-fix and resolution checks; probes, §4):
+         --permission-mode acceptEdits
+         --allowedTools "Bash(artel note *) Bash(artel heavy *) Bash(git diff *)
+                         Bash(git log *) Bash(git show *) Bash(git status *)"
+                         {project_tools} {project_read_tools}
+         --disallowedTools "Bash(git * --output*)"
+         (no `git add` / `git commit`: anything not allowed is denied; the
+          runner checks the repository after the run, §4)
+attacker (vet, attack; read-only):
          --permission-mode default
-         --disallowedTools "Edit Write NotebookEdit"
+         --disallowedTools "Edit Write NotebookEdit Bash(git * --output*)"
          --allowedTools "Bash(artel note *) Bash(git diff *) Bash(git log *)
                          Bash(git show *) Bash(git status *)" {project_read_tools}
+         (`git log/diff/show --output=<file>` writes a file: denied)
 probe:   claude -p --model {model} --output-format stream-json --verbose
          --permission-prompts none --disable-slash-commands
          --strict-mcp-config --permission-mode default --max-turns 1
@@ -494,8 +698,16 @@ probe:   claude -p --model {model} --output-format stream-json --verbose
 ```
 
 Every profile passes `--permission-mode` explicitly: `-p` inherits the
-user's `defaultMode` from `~/.claude/settings.json`, and in `auto` mode a
-reviewer could write files through shell redirection (spike Q4).
+user's `defaultMode` from `~/.claude/settings.json`, and in `auto` mode an
+attacker could write files through shell redirection (spike Q4). The
+reviewer may write (probes) but not commit. Spike Q4 measured only
+`default`: under `acceptEdits` Claude Code may also auto-approve file
+commands (`rm`, `mv`, `sed -i`) inside the working directory. The live slice
+check (§15) records, as pass criteria, what a reviewer can do under
+`acceptEdits` in a slot (commit denied; `rm`/`mv`/`sed -i` on a tracked file
+and on a `slot_keep` file; a write outside the slot) and that `git log
+--output=` is denied for vet and attack; the repository check (§4) catches
+what reaches the shared `.git`.
 With `--permission-prompts none` anything not allowed is denied, so the
 project lists its check commands. artel never defaults to
 `bypassPermissions`. Allowing a command that runs project scripts
@@ -509,7 +721,8 @@ settings.
 ## 7. Notifications
 
 Events: `blocked`, `stuck`, `awaiting_accept` (reason: `merge=ask`,
-`flaky` or protected paths), `paused` (kind, cause, reset time when known —
+`flaky`, protected paths, the test guard (deleted test file, missing or
+skipped tests, fewer assertions, a weakening marker) or an empty verify), `paused` (kind, cause, reset time when known —
 §3.1), `resumed`, `done`, `runner_stopped`, `error` (an internal runner error
 in a job: task id, title, stage, "see artel show <id>" — never the
 traceback). `[notify] on` selects them (default: all except `done`, which is
@@ -545,9 +758,14 @@ artel show ID                       history: stages, verdicts, findings (open/cl
 artel logs ID [--stage S]           agent stream logs
 artel answer ID TEXT                answer the task's ASK; resumes the asking stage
 artel approve ID | artel reject ID [--reason R]
-artel accept ID                     merge a task waiting in awaiting_accept
+artel accept ID                     merge a task waiting in awaiting_accept, or re-verify
+                                    a task blocked because its verify fixer changed nothing
+                                    (accept and approve first print what the decision rests
+                                    on: the reason VERDICT, the diff stat, guard hits, the
+                                    red log path and failed tests of a flaky verify)
 artel rework ID --note TEXT         one more fix + closure round with your note
 artel run [-n N] | artel stop [--now] | artel pause | artel resume [--force]
+artel workers N                     (phase 2) change the running runner's worker count
 artel notify test
 artel config [explain KEY | set KEY VALUE]   effective settings and their sources
 artel templates export              copy built-in prompts into the project
@@ -570,6 +788,7 @@ max_verify_fixes = 2
 verify_reruns = 1                 # a red task verify runs again before it counts; a green rerun = flaky → ask
 max_stage_runs = 12               # finished agent runs per task since a human last moved it → stuck
 max_consecutive_failures = 3      # failed agent stages in a row, ≥ 2 tasks → pause until resume
+max_branch_resets = 1             # a fix stage out of attempts may reset the branch this often per task; then stuck
 merge = "auto"                    # or "ask"
 stage_timeout = "90m"
 setup_timeout = "20m"
@@ -586,13 +805,27 @@ setup_retry = "15m"               # setup_failed: retry setup after this
 poll_interval = "5s"              # how often the runner looks for work
 min_free_disk = "3G"
 slots_dir = ".artel/slots"        # relative to the main worktree
-slot_keep = ["node_modules"]
+slot_keep = ["node_modules", ".venv", "venv"]   # setup output that survives leaving a slot
 log_keep_tasks = 50
 propose_minors = false
 autoapprove = "none"              # "none" | "non_risky" | "all" — for proposed tasks, after vetting
 protected_paths = [".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "artel.toml", ".artel/",
                    ".github/", ".gitlab-ci.yml", ".githooks/", ".husky/", ".pre-commit-config.yaml",
-                   ".gitattributes"]   # + templates dir + files in list-form setup/verify (§4)
+                   ".gitattributes", "package-lock.json", "npm-shrinkwrap.json", "yarn.lock",
+                   "pnpm-lock.yaml", "poetry.lock", "uv.lock", "Pipfile.lock", "Cargo.lock", "go.sum",
+                   "Gemfile.lock", "composer.lock"]
+                                  # + templates dir + setup_inputs + files in list-form setup/verify (§4)
+test_paths = ["tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
+              "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*"]
+test_markers = ['^\s*@(unittest\.)?skip\(', '^\s*@pytest\.mark\.skip\b(?!if)', '\b(it|test|describe)\.skip\(',
+                '\bx(it|describe|test)\(', '\.only\(', 'pytest\.mark\.xfail', '\bxfail\(', '@(unittest\.)?expectedFailure',
+                'os\._exit\(']
+                                  # regexes on added lines of test_paths files → ask (§4); not conditional skips
+test_assert_markers = ["assert", "expect("]   # a test file losing more of these lines than it gains → ask
+verify_test_id_regex = ['^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$', '^PASSED (\S+)']
+                                  # ids of passed tests (unittest -v, pytest -rA); verify must print them
+base_cache_ttl = "6h"             # a cached green base verify older than this is verified again
+shadow_verify = true              # verify the reviewed commit when a review finds a blocker/major (no tokens)
 risk_signals = ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"]
 
 [rotation]                        # writers only; reviewers are always fresh
@@ -626,7 +859,10 @@ command = ""
 ```
 
 `heavy_lock` is never nested by artel; verify commands must not take the same
-lock themselves. Time waiting for the lock counts toward `stage_timeout`.
+lock themselves. Time an agent's `artel heavy` waits while the runner's own
+verify, base or shadow job holds the lock does not count toward
+`stage_timeout`: the runner adds the time its own verify-lane jobs held
+`heavy_lock` during the stage to that stage's deadline.
 
 ## 10. Defaults are visible and steerable
 
@@ -677,9 +913,20 @@ minutes. Sections:
    the strong model works, how limits, quota thresholds and the nightly
    budget pause the runner.
 7. Safety: permissions model, the risk of allowing commands that run project
-   scripts, protected paths and their known limitation, the night circuit
+   scripts, protected paths and their known limitation, the test guard and
+   what it does not see (test configuration inside `package.json` or
+   `pyproject.toml` unless listed in `test_paths`; weakening done purely by
+   additions — an import-time monkeypatch in a new test file, a `load_tests`
+   or `conftest.py` hook that filters tests — is left to the reviewer, and
+   the verify command must print test ids for the id check), the night circuit
    breakers (§3.1 Pauses), `CLAUDE.md` rules that require human approval and how the
-   unattended notice handles them, what the Telegram notifier sends.
+   unattended notice handles them, what the Telegram notifier sends. The
+   **trust model**, stated plainly: agents, `setup` and `verify` run as the
+   same OS user as the runner; tool profiles, `ARTEL_CHILD` refusals, the
+   repository check and the integration-tip check stop mistakes of a confused
+   agent, not hostile code, which can do anything that user can (write the
+   board, move refs, read credentials). Run artel as a user without
+   credentials you would not hand to the agent.
 8. Troubleshooting: stuck tasks, stale heavy lock, disk guard, a second
    runner, reading logs.
 
@@ -730,6 +977,14 @@ fake agent. A release is published only when the matrix is green.
   probes, the flaky rerun and `max_stage_runs`.
 - The agent shim runs the runner's artel even with `PYTHONPATH=":"` and an
   `artel/` package in the slot.
+- The test guard asks on a deleted test file, a missing or skipped test id,
+  fewer assertion lines and a marker, and only escalates the review for
+  other test edits; a pure test addition is free; any agent stage that moves
+  a foreign ref or edits the shared `.git` fails and is restored, and a
+  reviewer that commits fails its stage;
+  human commands refuse under `ARTEL_CHILD`; a red base pauses before any
+  verify fix; a failed fix retries on the same branch and resets it at most
+  `max_branch_resets` times.
 - Runner lock: a second runner exits; reconcile after SIGKILL terminates
   orphans.
 - Telegram notifier against a local fake HTTP endpoint (URL configurable for
@@ -757,11 +1012,14 @@ Delivered in two phases (revision 2026-10-20, `docs/revision-2026-10-20.md`):
   (attempts, verify-fix check, protected paths), human requests (`answer`,
   `approve`, `reject`, `accept`, `rework`, `pause`, `resume`, `stop`), limits,
   disk guard, pauses and circuit breakers, stop and signals, reconcile, the
-  notifier, the isolated agent shim, and a live check with one real task.
+  notifier, the isolated agent shim, the test guard, reviewer probes, the
+  base check before a verify fix, finding fates with shadow verifies, the
+  worker / idle / verify-wait records (§4 "Measuring"), and a live check
+  with one real task.
   Phase 1 is the **dogfood milestone**, not a release.
 - **Phase 2 — built with artel itself:** vetting of proposed tasks, writer
   session rotation and its live check, `artel stats`, `artel status` /
-  `show` / `logs`, `artel init`, the README.
+  `show` / `logs`, `artel init`, `artel workers`, the README.
 The v0.1 release is both phases.
 
 ## 15. Live checks before code (spike)
