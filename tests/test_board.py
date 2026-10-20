@@ -200,6 +200,20 @@ class BoardTest(unittest.TestCase):
             B.open_board(Path(self._tmp.name) / "b3.db", factory=Tracking)
         self.assertEqual(closed, [True])
 
+    def test_locked_during_delete_fallback_is_board_busy(self):
+        # catches: the DELETE fallback letting a raw sqlite3.OperationalError escape
+        class WalFailsDeleteLocked(sqlite3.Connection):
+            def execute(self, sql, *args):
+                upper = sql.strip().upper()
+                if upper.startswith("PRAGMA JOURNAL_MODE=WAL"):
+                    raise sqlite3.OperationalError("WAL not supported on this filesystem")
+                if upper.startswith("PRAGMA JOURNAL_MODE=DELETE"):
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args)
+
+        with self.assertRaises(B.BoardBusy):
+            B.open_board(Path(self._tmp.name) / "b4.db", factory=WalFailsDeleteLocked)
+
     def test_reopen_rejects_other_schema_version(self):
         self.board.set_meta("schema_version", "2")
         with self.assertRaises(B.ArtelError):
