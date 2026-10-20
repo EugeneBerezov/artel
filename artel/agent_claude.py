@@ -139,7 +139,7 @@ class StreamParser:
     def feed(self, line: str) -> RateLimit | None:
         try:
             obj = json.loads(line)
-        except (ValueError, TypeError):
+        except (ValueError, TypeError, RecursionError):
             return None
         if not isinstance(obj, dict):
             return None
@@ -153,7 +153,7 @@ class StreamParser:
                 self._result(obj)
             elif kind == SYSTEM_TYPE and obj.get("subtype") == "init":
                 self._session(obj)
-        except (AttributeError, TypeError, ValueError):
+        except (AttributeError, TypeError, ValueError, OverflowError):
             return None   # a malformed record of a known type is ignored like an unknown one
         return None
 
@@ -226,10 +226,10 @@ def _closed_id(item) -> int | None:
     if isinstance(item, bool):
         return None
     if isinstance(item, int):
-        return item
+        return item if item > 0 else None
     if isinstance(item, str):
-        m = re.fullmatch(r"\s*#?\s*(\d+)\s*", item)
-        if m:
+        m = re.fullmatch(r"\s*#?\s*([0-9]+)\s*", item)   # ASCII digits only
+        if m and int(m.group(1)) > 0:
             return int(m.group(1))
     return None
 
@@ -243,9 +243,9 @@ def validate_result(stage: str, obj: object) -> tuple[dict | None, str | None]:
     outcome = obj.get("outcome")
     if outcome not in outcomes:
         return None, f"outcome {outcome!r} is not allowed for stage {stage} (allowed: {', '.join(outcomes)})"
-    summary = obj.get("summary", "")
+    summary = obj.get("summary")
     if not isinstance(summary, str):
-        return None, "summary must be a string"
+        return None, "summary is required and must be a string"
     question = obj.get("question", "")
     if not isinstance(question, str):
         return None, "question must be a string"
@@ -288,8 +288,8 @@ def validate_result(stage: str, obj: object) -> tuple[dict | None, str | None]:
         duplicate = obj.get("duplicate_of")
         if not isinstance(risky, bool):
             return None, "risky must be a boolean"
-        if not isinstance(signals, list) or not all(isinstance(s, str) for s in signals):
-            return None, "risk_signals must be a list of strings"
+        if not isinstance(signals, list) or not all(isinstance(s, str) and s.strip() for s in signals):
+            return None, "risk_signals must be a list of non-empty strings"
         if duplicate is not None and (isinstance(duplicate, bool) or not isinstance(duplicate, int)):
             return None, "duplicate_of must be an integer or null"
         result.update(risky=risky or bool(signals), risk_signals=list(signals), duplicate_of=duplicate)   # PD-27
@@ -304,7 +304,8 @@ def schema_json() -> str:
 # Windows batch launchers (PD-41) ---------------------------------------------------------------------
 
 _NPM_TARGET = re.compile(r'"%(?:~dp0|dp0%)\\?([^"%\r\n]+?\.js)"\s+%\*', re.IGNORECASE)
-_WRAPPER_LINE = re.compile(r'^\s*((?:"[^"\r\n]*"\s+)+)%\*\s*$', re.MULTILINE)
+_WRAPPER_LINE = re.compile(r'^((?:"[^"\r\n]*"\s+)+)%\*\s*$')
+_SENTINEL = "\0artel-command\0"
 
 
 def unwrap_cmd_shim(text: str, shim_path: Path) -> list[str] | None:
@@ -314,12 +315,28 @@ def unwrap_cmd_shim(text: str, shim_path: Path) -> list[str] | None:
         parts = [p for p in re.split(r"[\\/]+", npm.group(1)) if p]
         node = shim_path.parent / "node.exe"
         return [str(node) if node.is_file() else "node", str(shim_path.parent.joinpath(*parts))]
-    if "%~dp0" not in text and "%dp0%" not in text:
-        for m in _WRAPPER_LINE.finditer(text):
-            tokens = re.findall(r'"([^"\r\n]*)"', m.group(1))
-            if tokens:
-                return [t.replace("%%", "%") for t in tokens]
-    return None
+    return _unwrap_artel_wrapper(text)
+
+
+def _unwrap_artel_wrapper(text: str) -> list[str] | None:
+    """Only the exact script platform.write_wrapper writes: boilerplate lines plus one command line."""
+    template = platform._cmd_script(_SENTINEL).splitlines()
+    lines = text.splitlines()
+    if len(lines) != len(template):
+        return None
+    command = None
+    for line, expected in zip(lines, template):
+        if expected == _SENTINEL:
+            command = line
+        elif line != expected:
+            return None   # a PATH tweak, a cd or anything else would be silently dropped
+    m = _WRAPPER_LINE.match(command or "")
+    if m is None:
+        return None
+    tokens = re.findall(r'"([^"\r\n]*)"', m.group(1))
+    if not tokens or any("%" in t.replace("%%", "") for t in tokens):
+        return None   # a lone % is an environment expansion write_wrapper never emits
+    return [t.replace("%%", "%") for t in tokens]
 
 
 def agent_argv(cfg) -> list[str]:
@@ -331,6 +348,9 @@ def agent_argv(cfg) -> list[str]:
         if unwrapped is None:
             raise ArtelError(f"agent_command {path} is a batch file artel cannot unwrap; "
                              "set agent_command to a list [node, cli.js] or to claude.exe")
+        if unwrapped[0].lower().endswith((".cmd", ".bat")):   # the inline schema must never reach cmd.exe
+            raise ArtelError(f"agent_command {path} wraps another batch file ({unwrapped[0]}); "
+                             "set agent_command to a list [node, cli.js] or to claude.exe")
         argv = unwrapped + argv[1:]
     return argv
 
@@ -338,23 +358,34 @@ def agent_argv(cfg) -> list[str]:
 _PLACEHOLDER = re.compile(r"\{(model|schema|unattended_notice)\}")
 
 
+def _has_permission_mode(tokens: list[str]) -> bool:
+    for i, token in enumerate(tokens):
+        if token.startswith("--permission-mode="):
+            return len(token) > len("--permission-mode=")
+        if token == "--permission-mode":
+            return i + 1 < len(tokens) and bool(tokens[i + 1]) and not tokens[i + 1].startswith("-")
+    return False
+
+
 def build_argv(cfg, *, profile: str, model: str, notice_path: Path) -> list[str]:
     if profile not in ("writer", "reviewer"):
         raise ValueError(f"unknown profile: {profile!r}")
+    template = [*cfg["profiles.common"], *cfg[f"profiles.{profile}"]]
+    if not _has_permission_mode(template):   # checked before substitution: a model name cannot satisfy it
+        raise ArtelError(f"profiles.common + profiles.{profile} must pass --permission-mode explicitly")
     values = {"model": model, "schema": schema_json(), "unattended_notice": str(notice_path)}
     expanded: list[str] = []
-    for token in [*cfg["profiles.common"], *cfg[f"profiles.{profile}"]]:
+    for token in template:
         if token == "{project_tools}":
             expanded.extend(cfg["commands.project_tools"])
         elif token == "{project_read_tools}":
             expanded.extend(cfg["commands.project_read_tools"])
         else:
             expanded.append(_PLACEHOLDER.sub(lambda m: values[m.group(1)], token))
-    if any("bypassPermissions" in t or t == "--dangerously-skip-permissions" for t in expanded):
-        raise ArtelError("artel never runs an agent with bypassPermissions")
-    if "--permission-mode" not in expanded:
-        raise ArtelError(f"profiles.common + profiles.{profile} must pass --permission-mode explicitly")
-    return agent_argv(cfg) + expanded
+    argv = agent_argv(cfg) + expanded
+    if any("bypassPermissions" in t or t.startswith("--dangerously-skip-permissions") for t in argv):
+        raise ArtelError("artel never runs an agent with bypassPermissions")   # agent_command arguments too
+    return argv
 
 
 # Sample lines in the shapes recorded by the spike (used by the fake agent and the tests) ---------------

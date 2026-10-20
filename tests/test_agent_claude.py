@@ -132,6 +132,31 @@ class ParserTest(unittest.TestCase):
         self.assertTrue(p.limit_hit())   # rank 2 even with a valid result
         self.assertFalse(p.failed())
 
+    def test_deep_nesting_and_huge_numbers_never_raise(self):
+        p = A.StreamParser()
+        self.assertIsNone(p.feed("[" * 100000))
+        huge = "9" * 400
+        self.assertIsNone(p.feed('{"type": "rate_limit_event", "rate_limit_info": {"status": "x", "resetsAt": %s}}' % huge))
+
+    def test_error_flag_fails_even_with_structured_output(self):
+        p = A.StreamParser()
+        p.feed(json.dumps({"type": "result", "is_error": True, "structured_output": {"outcome": "pass", "summary": "x"}}))
+        self.assertTrue(p.failed())
+
+    def test_session_id_from_init_and_from_result_separately(self):
+        init_only = A.StreamParser()
+        init_only.feed(A.sample_init_line("from-init"))
+        self.assertEqual(init_only.session_id, "from-init")
+        result_only = A.StreamParser()
+        result_only.feed(json.dumps({"type": "result", "session_id": "from-result", "is_error": False}))
+        self.assertEqual(result_only.session_id, "from-result")
+
+    def test_late_assistant_line_does_not_overwrite_final_usage(self):
+        p = A.StreamParser()
+        p.feed(A.sample_result_line({"outcome": "pass", "summary": "x"}, {"input_tokens": 100, "output_tokens": 9}))
+        p.feed(A.sample_assistant_line("late", {"input_tokens": 1, "output_tokens": 1}))
+        self.assertEqual((p.usage.input_tokens, p.usage.final), (100, True))
+
     def test_bad_json_and_unknown_type_ignored(self):
         p = A.StreamParser()
         for line in ("", "not json", "[1, 2]", "null", '{"type": "brand_new"}', '{"type": "assistant"}',
@@ -232,7 +257,7 @@ class ValidateTest(unittest.TestCase):
                                                       "closed": ["#12", 13, "14", " # 15 "]})
         self.assertIsNone(reason)
         self.assertEqual(result["closed"], [12, 13, 14, 15])
-        for bad in (["x"], [True], [1.5], ["#"], "12", [None]):
+        for bad in (["x"], [True], [1.5], ["#"], "12", [None], [0], [-3], ["\u0661\u0662"], ["#0"]):
             self.assertIsNotNone(A.validate_result("review", {"outcome": "pass", "summary": "x", "closed": bad})[1], bad)
 
     def test_non_dict_invalid(self):
@@ -240,6 +265,7 @@ class ValidateTest(unittest.TestCase):
             self.assertEqual(A.validate_result("write", bad)[0], None)
         self.assertIsNotNone(A.validate_result("nonsense", {"outcome": "ready"})[1])
         self.assertIsNotNone(A.validate_result("write", {"outcome": "ready", "summary": 5})[1])
+        self.assertIsNotNone(A.validate_result("write", {"outcome": "ready"})[1])   # summary is required
 
     def test_vet_fields_validated(self):
         ok, reason = A.validate_result("vet", {"outcome": "pass", "summary": "fine", "risky": True,
@@ -250,7 +276,8 @@ class ValidateTest(unittest.TestCase):
         self.assertTrue(signals_only["risky"])   # PD-27: any returned signal makes the task risky
         plain, _ = A.validate_result("vet", {"outcome": "pass", "summary": "x"})
         self.assertEqual((plain["risky"], plain["risk_signals"], plain["duplicate_of"]), (False, [], None))
-        for bad in ({"risky": "yes"}, {"risk_signals": "deletes data"}, {"risk_signals": [1]},
+        for bad in ({"risky": "yes"}, {"risky": 1}, {"risk_signals": "deletes data"}, {"risk_signals": [1]},
+                    {"risk_signals": [""]}, {"risk_signals": ["  "]},
                     {"duplicate_of": "4"}, {"duplicate_of": True}, {"duplicate_of": 1.5}):
             self.assertIsNotNone(A.validate_result("vet", {"outcome": "pass", "summary": "x", **bad})[1], bad)
         null_dup, _ = A.validate_result("vet", {"outcome": "pass", "summary": "x", "duplicate_of": None})
@@ -359,6 +386,30 @@ class ArgvTest(unittest.TestCase):
         with self.assertRaises(ArtelError):   # also when it arrives through profiles.common
             self.build("reviewer", **{"profiles.common": ["-p", "--permission-mode", "bypassPermissions"]})
 
+    def test_bypass_in_agent_command_arguments_refused(self):
+        # catches: checking only the profile tokens and not the agent_command arguments
+        for command in ([sys.executable, "--dangerously-skip-permissions"],
+                        [sys.executable, "--permission-mode", "bypassPermissions"],
+                        [sys.executable, "--permission-mode=bypassPermissions"]):
+            with self.assertRaises(ArtelError, msg=command):
+                A.build_argv(runtime_cfg(agent_command=command), profile="writer", model="m", notice_path=Path("n"))
+
+    def test_permission_mode_must_come_from_the_profile(self):
+        # catches: a model name or tool item equal to --permission-mode satisfying the check
+        with self.assertRaises(ArtelError):
+            self.build("writer", model="--permission-mode", **{"profiles.writer": ["--allowedTools", "x"],
+                                                              "profiles.common": ["-p", "--model", "{model}"]})
+        with self.assertRaises(ArtelError):
+            self.build("writer", **{"profiles.writer": ["--permission-mode"], "profiles.common": ["-p"]})   # no value
+        with self.assertRaises(ArtelError):
+            self.build("writer", **{"profiles.writer": ["--permission-mode="], "profiles.common": ["-p"]})
+        ok = self.build("writer", **{"profiles.writer": ["--permission-mode=acceptEdits"], "profiles.common": ["-p"]})
+        self.assertIn("--permission-mode=acceptEdits", ok)
+
+    def test_model_name_cannot_inject_a_placeholder(self):
+        argv = self.build("writer", model="{schema}")
+        self.assertEqual(argv[argv.index("--model") + 1], "{schema}")
+
     def test_prompt_never_in_argv(self):
         argv = self.build()
         self.assertEqual(argv.count("-p"), 1)
@@ -389,6 +440,25 @@ class ArgvTest(unittest.TestCase):
         text = P._cmd_script(" ".join(f'"{P._bat_text(a)}"' for a in argv) + " %*")
         self.assertEqual(A.unwrap_cmd_shim(text, Path("C:/w/fake.cmd")), argv)
 
+    def test_wrapper_recognizer_is_strict(self):
+        # catches: unwrapping any batch file that merely has a quoted line followed by %*
+        script = P._cmd_script
+        self.assertIsNone(A.unwrap_cmd_shim('@echo off\r\n"C:\\npm\\claude.cmd" %*\r\n', Path("x.cmd")))
+        self.assertIsNone(A.unwrap_cmd_shim(script('"%LOCALAPPDATA%\\claude\\claude.exe" %*'), Path("x.cmd")))
+        self.assertIsNone(A.unwrap_cmd_shim(script('"a" %*').replace("setlocal", 'set "PATH=C:\\evil"'), Path("x.cmd")))
+        self.assertIsNone(A.unwrap_cmd_shim(script('"a" %*') + 'echo more\r\n', Path("x.cmd")))
+        self.assertEqual(A.unwrap_cmd_shim(script('"C:\\p\\python.exe" "50%%" %*'), Path("x.cmd")),
+                         ["C:\\p\\python.exe", "50%"])
+
+    def test_wrapper_pointing_at_another_batch_file_is_refused(self):
+        # PD-41: the inline schema must never reach cmd.exe, also through a wrapper of a wrapper
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            outer = Path(tmp) / "claude.cmd"
+            outer.write_text(P._cmd_script('"C:\\npm\\claude.cmd" %*'), encoding="utf-8", newline="")
+            with mock.patch.object(P, "which", lambda name: name), self.assertRaises(ArtelError) as cm:
+                A.agent_argv(runtime_cfg(agent_command=[str(outer)]))
+            self.assertIn("agent_command", str(cm.exception))
+
     def test_unknown_batch_file_refused(self):
         self.assertIsNone(A.unwrap_cmd_shim("@echo off\r\necho hello\r\n", Path("x.cmd")))
         self.assertIsNone(A.unwrap_cmd_shim("", Path("x.cmd")))
@@ -403,7 +473,7 @@ class ArgvTest(unittest.TestCase):
     def test_agent_argv_unwraps_cmd_and_keeps_extra_args(self):
         with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
             shim = Path(tmp) / "Claude.CMD"   # the suffix test is case-insensitive
-            shim.write_text('@echo off\r\n"C:\\Py\\python.exe" "C:\\a\\fake.py" %*\r\n', encoding="utf-8", newline="")
+            shim.write_text(P._cmd_script('"C:\\Py\\python.exe" "C:\\a\\fake.py" %*'), encoding="utf-8", newline="")
             with mock.patch.object(P, "which", lambda name: name):
                 argv = A.agent_argv(runtime_cfg(agent_command=[str(shim), "--bare"]))
             self.assertEqual(argv, ["C:\\Py\\python.exe", "C:\\a\\fake.py", "--bare"])

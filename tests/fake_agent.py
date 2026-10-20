@@ -25,30 +25,43 @@ def emit(line: str) -> None:
     sys.stdout.flush()
 
 
-def locked_update_counts(fake_dir: Path, key: str) -> int:
-    """Increment and return the 1-based call count of `key`; agents may run in parallel."""
-    lock = fake_dir / "counts.lock"
-    deadline = time.monotonic() + 10
-    while True:
-        try:
-            fd = os.open(str(lock), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.close(fd)
-            break
-        except FileExistsError:
-            if time.monotonic() > deadline:
-                break   # a stale lock must not wedge a test
-            time.sleep(0.01)
-    try:
+class FileLock:
+    """Cross-process lock by exclusive file creation; the agents of one test run in parallel."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.held = False
+
+    def __enter__(self):
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                os.close(os.open(str(self.path), os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+                self.held = True
+                return self
+            except (FileExistsError, PermissionError):   # PermissionError: a delete-pending file on Windows
+                if time.monotonic() > deadline:
+                    return self   # proceed unlocked rather than wedge a test; never delete a lock we do not hold
+                time.sleep(0.01)
+
+    def __exit__(self, *exc):
+        if self.held:
+            try:
+                os.unlink(str(self.path))
+            except OSError:
+                pass
+
+
+def record_call(fake_dir: Path, record: dict, key: str) -> int:
+    """Append the call and return the 1-based count of `key`, both under one lock."""
+    with FileLock(fake_dir / "fake.lock"):
+        with open(fake_dir / "calls.jsonl", "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(record, ensure_ascii=False) + "\n")
         path = fake_dir / "counts.json"
         counts = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         counts[key] = counts.get(key, 0) + 1
         path.write_text(json.dumps(counts), encoding="utf-8", newline="\n")
         return counts[key]
-    finally:
-        try:
-            os.unlink(str(lock))
-        except OSError:
-            pass
 
 
 def pick_actions(scenario: dict, task: str, stage: str, n: int) -> list:
@@ -79,12 +92,10 @@ def main() -> int:
     stage = os.environ.get("ARTEL_STAGE", "")
     argv = sys.argv[1:]
     model = argv[argv.index("--model") + 1] if "--model" in argv and argv.index("--model") + 1 < len(argv) else None
-    with open(fake_dir / "calls.jsonl", "a", encoding="utf-8", newline="\n") as fh:
-        fh.write(json.dumps({"argv": argv, "stage": stage, "task": task, "model": model, "prompt": prompt,
-                             "cwd": os.getcwd(), "pid": os.getpid()}, ensure_ascii=False) + "\n")
     scenario_path = fake_dir / "scenario.json"
     scenario = json.loads(scenario_path.read_text(encoding="utf-8")) if scenario_path.exists() else {}
-    n = locked_update_counts(fake_dir, f"{task}:{stage}")
+    n = record_call(fake_dir, {"argv": argv, "stage": stage, "task": task, "model": model, "prompt": prompt,
+                               "cwd": os.getcwd(), "pid": os.getpid()}, f"{task}:{stage}")
     emit(A.sample_init_line())
     usage = None
     denials: list[dict] = []
@@ -101,7 +112,7 @@ def main() -> int:
         elif name == "note":
             run_note(*arg)
         elif name == "assistant":
-            usage = arg
+            usage = {k: usage.get(k, 0) + v for k, v in arg.items()} if usage else dict(arg)   # the final usage sums calls (Q6)
             emit(A.sample_assistant_line("working", arg))
         elif name == "rate_limit":
             status, resets_at, limit_type, utilization = arg

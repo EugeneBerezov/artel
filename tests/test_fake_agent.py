@@ -78,8 +78,38 @@ class FakeAgentTest(RepoTestCase):
         res = self.run_fake(stage="review")
         parser, events = self.parse(res.stdout)
         self.assertEqual([(e.status, e.rank, e.utilization) for e in events], [("allowed_warning", 1, 0.93)])
-        self.assertEqual(parser.usage.input_tokens, 4)   # the result carries the usage of the last assistant action
+        self.assertEqual(parser.usage.input_tokens, 4)   # the result carries the usage of the assistant actions
         self.assertEqual(parser.max_rank, 1)
+
+    def test_fake_result_usage_sums_assistant_calls(self):
+        self.scenario({"*": [{"assistant": {"input_tokens": 4, "output_tokens": 2}},
+                             {"assistant": {"input_tokens": 6, "output_tokens": 3}},
+                             {"result": {"outcome": "pass", "summary": "x"}}]})
+        parser, _ = self.parse(self.run_fake(stage="review").stdout)
+        self.assertEqual((parser.usage.input_tokens, parser.usage.output_tokens), (10, 5))   # a SUM, like Q6
+        self.assertEqual(parser.usage.last_call["input_tokens"], 6)
+
+    def test_fake_parallel_agents_keep_every_call(self):
+        self.scenario({"*": [{"sleep": 0.1}, {"result": {"outcome": "pass", "summary": "x"}}]})
+        procs = []
+        env = subprocess_env(ARTEL_FAKE_DIR=str(self.fake_dir), ARTEL_STAGE="review")
+        for task in ("1", "2", "3", "4", "5", "6"):
+            e = dict(env, ARTEL_TASK=task)
+            procs.append(subprocess.Popen([sys.executable, str(FAKE_AGENT)], stdin=subprocess.PIPE,
+                                          stdout=subprocess.PIPE, cwd=str(self.repo_path), env=e))
+        for proc in procs:
+            proc.communicate(b"p")
+            self.assertEqual(proc.returncode, 0)
+        self.assertEqual(sorted(c["task"] for c in self.calls()), ["1", "2", "3", "4", "5", "6"])
+        self.assertEqual(json.loads((self.fake_dir / "counts.json").read_text(encoding="utf-8")),
+                         {f"{t}:review": 1 for t in "123456"})
+
+    def test_fake_sleep_really_sleeps(self):
+        import time
+        self.scenario({"*": [{"sleep": 0.6}, {"result": {"outcome": "pass", "summary": "x"}}]})
+        start = time.monotonic()
+        self.run_fake()
+        self.assertGreaterEqual(time.monotonic() - start, 0.6)
 
     def test_fake_error_and_denial(self):
         self.scenario({"1:write": [{"denied": ["Bash", {"command": "rm -rf x"}]}, {"result_error": True}],
