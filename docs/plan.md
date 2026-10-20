@@ -95,6 +95,7 @@ Added after controller attack #1 — all **(controller, 2026-10-20, owner to con
 - **PD-43 Conflict fix skips setup.** A `fix` with `fix_kind=conflict` does not run setup (the merge may leave markers in `setup_inputs`, e.g. a lockfile, and setup would pause the board forever); the following verify rechecks `setup_inputs` (§5 step 7).
 - **PD-44 String `agent_command`.** A string `argv` setting is one executable name or path and is never split (shlex would eat Windows backslashes); arguments need the list form.
 - **PD-45 Integrate exactly the verified commit.** *(controller, 2026-10-20, owner to confirm; from s2's SPEC-GAP in T14)* `finish_verify` on green stores the verified commit in meta `verified:<task_id>` (full sha). `integrate_task` fast-forwards `artel/integration` only to that sha and only if `rev(artel/<id>)` still equals it; a different tip (anything committed after verify) → `ff_impossible` → reverify (R37). The key is deleted on `done`, on reset/delete of the branch, and whenever the task leaves `verified`/`awaiting_accept`. Spec §5 step 8.
+- **PD-46 A branch reset supersedes open review findings.** *(controller, 2026-10-20, owner to confirm; from the opus review of T13)* When a transition's effects include `reset_branch` (R17), every open review finding of the task is closed with a `CLOSE` entry by `artel` reading `superseded: branch reset (R17)`; attack findings stay open (they concern the task, not the code). The first review after a reset is a fresh review, so it must not inherit findings it cannot close (PD-3).
 
 ## Waves, slice, shared files
 
@@ -1992,9 +1993,11 @@ Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence
       # rank=2, resets_at=None, limit_type=None, utilization=None, windows={});
       # result = validate_result(stage, parser.structured) unless parser.failed();
       # new_commits (PD-35): write → `git rev-list --count artel/integration..HEAD` > 0; fix (review/verify)
-      # → HEAD != task.fix_base (fix_base None → compare with head_before); merge_committed = the commit
-      # start_conflict_merge merged (recorded in the plan) is an ancestor of HEAD and HEAD is a merge commit
-      # — not the current integration tip, which may move meanwhile (s1 SPEC-GAP, controller 2026-10-20);
+      # → HEAD != task.fix_base (fix_base None → compare with head_before); merge_committed = BOTH the commit
+      # start_conflict_merge merged (recorded in the plan) AND the branch tip before the fix (head_before)
+      # are ancestors of HEAD — a follow-up commit after the merge is fine; `reset --hard <integration>`
+      # (work dropped) is not; never compare with the current integration tip, which may move meanwhile
+      # (s1 SPEC-GAP + opus review of T13, controller 2026-10-20);
       # slots.leave_slot always (finally);
       # finish_run with usage, measurements and session id (PD-23)
   def classify(task: Task, stage: str, run: StageRun, board) -> str
