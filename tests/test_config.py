@@ -2,6 +2,10 @@ import argparse
 import contextlib
 import io
 import os
+import re
+import subprocess
+import sys
+import tempfile
 import tomllib
 import unittest
 from pathlib import Path
@@ -11,17 +15,38 @@ from artel.errors import UsageError
 from artel.gitutil import Repo
 from tests.helpers import RepoTestCase, git
 
+PROTECTED_PATHS = [".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "artel.toml", ".artel/", ".github/",
+                   ".gitlab-ci.yml", ".githooks/", ".husky/", ".pre-commit-config.yaml", ".gitattributes",
+                   "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock",
+                   "uv.lock", "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock"]
+PROBE_PROFILE = ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
+                 "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config",
+                 "--permission-mode", "default", "--max-turns", "1", "--disallowedTools",
+                 "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task TodoWrite"]
+
 EXPECTED_DEFAULTS = {
     "base": "main", "max_agents": 2, "max_attempts": 2, "review_rounds": 2, "max_verify_fixes": 2,
+    "verify_reruns": 1, "max_stage_runs": 12, "max_consecutive_failures": 3, "max_branch_resets": 1,
     "merge": "auto", "stage_timeout": "90m", "setup_timeout": "20m", "verify_timeout": "30m",
-    "kill_grace": "30s", "context_budget": 8000, "limit_stop": "allowed_warning", "min_free_disk": "3G",
-    "slots_dir": ".claude/worktrees", "slot_keep": ["node_modules"], "log_keep_tasks": 50,
-    "poll_interval": "5s", "setup_retry": "15m", "autoapprove": "non_risky",
+    "kill_grace": "30s", "context_budget": 8000, "limit_stop": "allowed_warning",
+    "quota_stop_five_hour": 0.95, "quota_stop_seven_day": 0.8, "night_budget_seven_day": 0.15,
+    "limit_retry": "30m", "limit_probes": 4, "min_free_disk": "3G",
+    "base_cache_ttl": "6h", "shadow_verify": True,
+    "slots_dir": ".artel/slots", "slot_keep": ["node_modules", ".venv", "venv"], "log_keep_tasks": 50,
+    "poll_interval": "5s", "setup_retry": "15m", "autoapprove": "none",
+    "protected_paths": PROTECTED_PATHS,
+    "test_paths": ["tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
+                   "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*"],
+    "test_markers": [r"^\s*@(unittest\.)?skip\(", r"^\s*@pytest\.mark\.skip\b(?!if)",
+                     r"\b(it|test|describe)\.skip\(", r"\bx(it|describe|test)\(", r"\.only\(",
+                     r"pytest\.mark\.xfail", r"\bxfail\(", r"@(unittest\.)?expectedFailure", r"os\._exit\("],
+    "test_assert_markers": ["assert", "expect("],
+    "verify_test_id_regex": [r"^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$", r"^PASSED (\S+)"],
     "risk_signals": ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"],
     "rotation.writer_max_tasks": 1, "rotation.writer_max_context": 0, "rotation.same_area_only": True,
-    "rotation.fix_resumes_writer": True, "templates_dir": ".artel/templates", "agent_command": "claude",
+    "rotation.fix_resumes_writer": False, "templates_dir": ".artel/templates", "agent_command": "claude",
     "shell": "auto", "models.write": "sonnet", "models.review": "sonnet", "models.strong": "opus",
-    "models.strong_diff_lines": 300, "commands.setup": "", "commands.setup_inputs": [],
+    "models.strong_diff_lines": 300, "models.probe": "haiku", "commands.setup": "", "commands.setup_inputs": [],
     "commands.verify": "", "commands.heavy_lock": "", "commands.heavy_lock_check": "",
     "commands.project_tools": [], "commands.project_read_tools": [],
     "profiles.common": ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
@@ -31,10 +56,16 @@ EXPECTED_DEFAULTS = {
     "profiles.writer": ["--permission-mode", "acceptEdits", "--allowedTools",
                         "Bash(artel note *) Bash(artel add *) Bash(artel heavy *) Bash(git add *) "
                         "Bash(git commit *) Bash(git status *) Bash(git diff *)", "{project_tools}"],
-    "profiles.reviewer": ["--permission-mode", "default", "--disallowedTools", "Edit Write NotebookEdit",
-                          "--allowedTools", "Bash(artel note *) Bash(git diff *) Bash(git log *) "
-                          "Bash(git show *) Bash(git status *)", "{project_read_tools}"],
-    "notify.on": ["blocked", "stuck", "paused", "resumed", "runner_stopped", "error"],
+    "profiles.reviewer": ["--permission-mode", "acceptEdits", "--allowedTools",
+                          "Bash(artel note *) Bash(artel heavy *) Bash(git diff *) Bash(git log *) "
+                          "Bash(git show *) Bash(git status *)", "{project_tools}", "{project_read_tools}",
+                          "--disallowedTools", "Bash(git * --output*)"],
+    "profiles.attacker": ["--permission-mode", "default", "--disallowedTools",
+                          "Edit Write NotebookEdit Bash(git * --output*)", "--allowedTools",
+                          "Bash(artel note *) Bash(git diff *) Bash(git log *) Bash(git show *) "
+                          "Bash(git status *)", "{project_read_tools}"],
+    "profiles.probe": PROBE_PROFILE,
+    "notify.on": ["blocked", "stuck", "awaiting_accept", "paused", "resumed", "runner_stopped", "error"],
     "notify.command": "", "notify.telegram_enabled": False, "notify.telegram_token_env": "ARTEL_TELEGRAM_TOKEN",
     "notify.telegram_token_file": "", "notify.telegram_chat_env": "ARTEL_TELEGRAM_CHAT",
     "notify.telegram_chat_file": "", "notify.telegram_api_base": "https://api.telegram.org",
@@ -46,6 +77,117 @@ def setting(key):
 
 
 class SchemaTest(unittest.TestCase):
+    def test_owner_defaults_explain_their_reason(self):
+        """Mutation caught: a default changed without its visible reason (spec §10)."""
+        self.assertIn(".claude/worktrees", setting("slots_dir").explain)
+        self.assertIn("approve", setting("autoapprove").explain)
+        self.assertIn("Task 25", setting("rotation.fix_resumes_writer").explain)
+
+    def test_protected_paths_default_exact(self):
+        """Mutation caught: a reordered, dropped or extra protected path (order included)."""
+        self.assertEqual(setting("protected_paths").default, PROTECTED_PATHS)
+        self.assertEqual(setting("protected_paths").kind, "str_list")
+        self.assertEqual(setting("protected_paths").meaning,
+                         "Paths whose change forces merge=ask and a strong-model review.")
+        self.assertEqual(setting("protected_paths").cost, "A strong-model review for tasks that touch them.")
+
+    def test_protected_paths_default_has_lockfiles(self):
+        """Mutation caught: lockfiles missing from the default (dependency changes would pass unprotected)."""
+        for name in ("package-lock.json", "yarn.lock", "uv.lock", "Cargo.lock", "go.sum", "composer.lock"):
+            self.assertIn(name, setting("protected_paths").default)
+        self.assertIn("setup_inputs", setting("protected_paths").explain)
+
+    def test_review_rounds_explain_mentions_zero(self):
+        """Mutation caught: review_rounds = 0 allowed without saying that reviews cannot be turned off."""
+        self.assertIn("0 behaves like 1", setting("review_rounds").explain)
+        self.assertEqual(setting("review_rounds").minimum, 0)
+
+    def test_max_attempts_explain_says_consecutive(self):
+        """Mutation caught: the old 'retried N times' wording (PD-49: a success resets the count)."""
+        self.assertIn("consecutive failed runs of one stage", setting("max_attempts").explain.lower())
+        self.assertIn("success resets", setting("max_attempts").explain)
+
+    def test_notify_on_default_has_awaiting_accept(self):
+        """Mutation caught: awaiting_accept missing from the choices or the default."""
+        self.assertIn("awaiting_accept", setting("notify.on").choices)
+        self.assertIn("awaiting_accept", setting("notify.on").default)
+
+    def test_profiles_probe_has_no_schema_or_tools(self):
+        """Mutation caught: copying profiles.common into the probe (schema, notice, tools)."""
+        probe = setting("profiles.probe").default
+        text = " ".join(probe)
+        self.assertNotIn("--json-schema", probe)
+        self.assertNotIn("{unattended_notice}", text)
+        self.assertNotIn("{schema}", text)
+        self.assertEqual(probe[probe.index("--max-turns") + 1], "1")
+        self.assertIn("--disallowedTools", probe)
+
+    def test_profiles_deny_git_output(self):
+        """Mutation caught: a profile that lets `git diff --output=FILE` write a file."""
+        for key in ("profiles.reviewer", "profiles.attacker"):
+            self.assertIn("Bash(git * --output*)", " ".join(setting(key).default), key)
+
+    def test_profiles_reviewer_never_commits(self):
+        """Mutation caught: copying the writer profile into the reviewer."""
+        text = " ".join(setting("profiles.reviewer").default)
+        self.assertNotIn("Bash(git commit", text)
+        self.assertNotIn("Bash(git add", text)
+        self.assertIn("acceptEdits", text)
+        self.assertIn("Probes make reviews longer", setting("profiles.reviewer").cost)
+
+    def test_profiles_attacker_read_only(self):
+        """Mutation caught: an attacker profile that may edit."""
+        attacker = setting("profiles.attacker").default
+        self.assertEqual(attacker[attacker.index("--permission-mode") + 1], "default")
+        denied = attacker[attacker.index("--disallowedTools") + 1].split()
+        for tool in ("Edit", "Write", "NotebookEdit"):
+            self.assertIn(tool, denied)
+
+    def test_fraction_kind_bounds(self):
+        """Mutation caught: accepting 0, a value above 1, or a non-number."""
+        s = setting("quota_stop_seven_day")
+        self.assertEqual(s.kind, "fraction")
+        for bad in (0, 0.0, 1.5, -0.1, "x", "0", True, float("nan"), "nan"):
+            with self.assertRaises(UsageError, msg=repr(bad)):
+                C.coerce(s, bad)
+        for good, expected in ((0.8, 0.8), ("0.5", 0.5), (1, 1.0), (1.0, 1.0)):
+            self.assertEqual(C.coerce(s, good), expected)
+
+    def test_fraction_renders_as_toml_float(self):
+        """Mutation caught: a fraction written as a string or an int."""
+        data = tomllib.loads(C.render_toml())
+        self.assertEqual(data["quota_stop_five_hour"], 0.95)
+        self.assertIsInstance(data["quota_stop_five_hour"], float)
+
+    def test_regex_settings_validated(self):
+        """Mutation caught: an unvalidated regex reaching the runner."""
+        for key, bad in (("verify_test_id_regex", [r"PASSED \S+"]), ("verify_test_id_regex", ["("]),
+                         ("verify_test_id_regex", ["(a)(b)"]), ("test_markers", ["("])):
+            with self.assertRaises(UsageError, msg=f"{key} {bad}") as cm:
+                C.coerce(setting(key), bad)
+            self.assertIn(key, str(cm.exception))
+        self.assertEqual(C.coerce(setting("verify_test_id_regex"), [r"^PASSED (\S+)"]), [r"^PASSED (\S+)"])
+
+    def test_default_test_id_regex_reads_unittest_v(self):
+        """Mutation caught: a default that misses a real `unittest -v` line, with or without a docstring line."""
+        code = ("import unittest\n"
+                "class A(unittest.TestCase):\n"
+                "    def test_plain(self): pass\n"
+                "    def test_doc(self):\n"
+                "        'A docstring line.'\n"
+                "        pass\n")
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            (Path(d) / "sample_ids.py").write_text(code, encoding="utf-8")
+            out = subprocess.run([sys.executable, "-m", "unittest", "-v", "sample_ids"], cwd=d,
+                                 encoding="utf-8", errors="replace", capture_output=True)
+        regexes = [re.compile(r, re.MULTILINE) for r in setting("verify_test_id_regex").default]
+        ids = {m.group(1) for m in regexes[0].finditer(out.stderr)}
+        self.assertEqual(ids, {"test_plain (sample_ids.A.test_plain)", "test_doc (sample_ids.A.test_doc)"})
+        crlf = "test_x (m.A.test_x)\r\nDoc ... ok\r\n"
+        self.assertEqual([m.group(1) for m in regexes[0].finditer(crlf)], ["test_x (m.A.test_x)"])
+        self.assertEqual([m.group(1) for m in regexes[1].finditer("PASSED tests/a.py::t\nFAILED x")],
+                         ["tests/a.py::t"])
+
     def test_keys_and_defaults_match_plan_table(self):
         # catches: a renamed/missing/extra key or a changed default
         self.assertEqual({s.key: s.default for s in S.SETTINGS}, EXPECTED_DEFAULTS)
@@ -110,7 +252,9 @@ class SchemaTest(unittest.TestCase):
     def test_both_profiles_pass_permission_mode(self):
         writer, reviewer = setting("profiles.writer").default, setting("profiles.reviewer").default
         self.assertEqual(writer[writer.index("--permission-mode") + 1], "acceptEdits")
-        self.assertEqual(reviewer[reviewer.index("--permission-mode") + 1], "default")
+        self.assertEqual(reviewer[reviewer.index("--permission-mode") + 1], "acceptEdits")
+        attacker = setting("profiles.attacker").default
+        self.assertEqual(attacker[attacker.index("--permission-mode") + 1], "default")
         for s in S.SETTINGS:
             self.assertNotIn("bypassPermissions", str(s.default), s.key)
             self.assertNotIn("bypassPermissions", s.explain, s.key)

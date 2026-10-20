@@ -342,11 +342,14 @@ class ArgvTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--append-system-prompt-file") + 1], str(Path("/n/notice.md")))
         self.assertNotIn("--disallowedTools", argv)
 
-    def test_reviewer_argv_is_read_only_profile(self):
+    def test_reviewer_argv_is_probing_profile_that_never_commits(self):
+        """Reviewer = PD-66 probing profile (acceptEdits, no git add/commit, git --output denied)."""
         argv = self.build("reviewer")
-        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
-        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Edit Write NotebookEdit")
-        self.assertNotIn("acceptEdits", argv)
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "acceptEdits")
+        self.assertEqual(argv[argv.index("--disallowedTools") + 1], "Bash(git * --output*)")
+        allowed = argv[argv.index("--allowedTools") + 1]
+        self.assertNotIn("git commit", allowed)
+        self.assertNotIn("git add", allowed)
 
     def test_unknown_profile(self):
         with self.assertRaises(ValueError):

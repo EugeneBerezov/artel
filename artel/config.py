@@ -79,6 +79,20 @@ def _list_from(raw: object, key: str) -> list[str]:
     raise UsageError(f"{key}: expected a list of strings, got {raw!r}")
 
 
+_REGEX_LISTS = ("test_markers", "verify_test_id_regex")
+
+
+def _check_regexes(key: str, items: list[str]) -> None:
+    for item in items:
+        try:
+            compiled = re.compile(item, re.MULTILINE)
+        except re.error as e:
+            raise UsageError(f"{key}: entry {item!r} is not a valid regular expression: {e}") from None
+        if key == "verify_test_id_regex" and compiled.groups != 1:
+            raise UsageError(f"{key}: entry {item!r} must have exactly one group (the test id), "
+                             f"it has {compiled.groups}")
+
+
 def _normalize(setting: Setting, raw: object) -> object:
     """Validate `raw` (a TOML value or a string from env / `config set`); return it TOML-typed."""
     key, kind = setting.key, setting.kind
@@ -92,6 +106,15 @@ def _normalize(setting: Setting, raw: object) -> object:
         if setting.minimum is not None and raw < setting.minimum:
             raise UsageError(f"{key}: must be at least {setting.minimum}, got {raw}")
         return raw
+    if kind == "fraction":
+        if isinstance(raw, str):
+            try:
+                raw = float(raw.strip())
+            except ValueError:
+                raise UsageError(f"{key}: expected a decimal above 0 and at most 1, got {raw!r}") from None
+        if isinstance(raw, bool) or not isinstance(raw, (int, float)) or not 0 < raw <= 1:   # NaN fails too
+            raise UsageError(f"{key}: expected a decimal above 0 and at most 1, got {raw!r}")
+        return float(raw)
     if kind == "str":
         if not isinstance(raw, str):
             raise UsageError(f"{key}: expected a string, got {raw!r}")
@@ -111,7 +134,10 @@ def _normalize(setting: Setting, raw: object) -> object:
             raise UsageError(f"{key}: must be greater than zero, got {raw!r}")
         return raw.strip() if isinstance(raw, str) else raw
     if kind == "str_list":
-        return _list_from(raw, key)
+        items = _list_from(raw, key)
+        if key in _REGEX_LISTS:
+            _check_regexes(key, items)
+        return items
     if kind == "enum":
         if raw not in setting.choices:
             raise UsageError(f"{key}: must be one of {', '.join(setting.choices)}, got {raw!r}")

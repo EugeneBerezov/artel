@@ -7,6 +7,7 @@ import fnmatch
 import hashlib
 import json
 import os
+import re
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -79,8 +80,9 @@ def _kept(line_path: str, keep: Sequence[str]) -> bool:
 
 
 def _adoptable(repo: Repo, wt, keep: Sequence[str], registered: bool) -> str | None:
-    """Why an existing worktree at a slot path must not be taken over, or None. `.claude/worktrees` is also
-    where Claude Code and users keep their own worktrees: scrubbing one would destroy their work."""
+    """Why an existing worktree at a slot path must not be taken over, or None. A slots_dir such as
+    `.claude/worktrees` is also where Claude Code and users keep their own worktrees: scrubbing one would
+    destroy their work."""
     if wt.branch is not None and not wt.branch.startswith("artel/"):
         return f"it has branch {wt.branch!r} checked out"
     if registered:
@@ -92,8 +94,28 @@ def _adoptable(repo: Repo, wt, keep: Sequence[str], registered: bool) -> str | N
     return None
 
 
+def _exclude_slots_dir(repo: Repo, cfg) -> None:
+    """Hide the slots from `git status` in the main worktree: one `/<slots_dir>/` line in info/exclude, once."""
+    try:
+        rel = _slots_root(repo, cfg).relative_to(repo.root).as_posix()
+    except ValueError:
+        return   # slots_dir outside the repository: nothing in the main worktree to hide
+    if rel == ".." or rel.startswith("../"):
+        return
+    line = "/" + re.sub(r"([\\*?\[!# ])", r"\\\1", rel) + "/"
+    exclude = repo.common_dir / "info" / "exclude"
+    text = exclude.read_text(encoding="utf-8", errors="replace") if exclude.is_file() else ""
+    if line in (l.rstrip("\r") for l in text.splitlines()):
+        return
+    exclude.parent.mkdir(parents=True, exist_ok=True)
+    prefix = "" if not text or text.endswith("\n") else "\n"
+    with open(exclude, "a", encoding="utf-8", newline="") as f:
+        f.write(f"{prefix}{line}\n")
+
+
 def ensure_slots(repo: Repo, board, cfg, count: int) -> list[int]:
     _check_slots_dir(repo, cfg)
+    _exclude_slots_dir(repo, cfg)
     repo.git("worktree", "prune")
     known = {wt.path.resolve(): wt for wt in repo.worktrees()}
     registered = {s.n: Path(s.path).resolve() for s in board.list_slots()}

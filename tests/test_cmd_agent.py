@@ -87,11 +87,36 @@ class CmdAgentTest(RepoTestCase):
         self.assertEqual((code, out.strip()), (0, "#1 proposed"))
         self.assertEqual(self.board().get_task(1).created_by, "agent:5")
 
+    def test_add_review_zero_accepted_with_warning(self):
+        """Mutation caught: the old `< 1` check (0 refused) or a missing PD-51 warning."""
+        code, _, err = self.run_cmd(CA.run_add, "add", "x", "--review", "0")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.board().get_task(1).review_rounds, 0)
+        self.assertIn("warning: --review 0 behaves like 1: one review, blocking findings go to you (no fix round)",
+                      err)
+
+    def test_add_review_zero_no_warning_when_add_fails(self):
+        """Mutation caught: the warning printed before validation finishes (for a task never added)."""
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), self.assertRaises(UsageError):
+            CA.run_add(self.parse("add", "x", "--review", "0", "--after", "99"))
+        self.assertEqual(err.getvalue(), "")
+
+    def test_add_review_negative_refused(self):
+        """Mutation caught: dropping the check entirely (a negative round count stored)."""
+        with self.assertRaises(UsageError) as cm:
+            self.run_cmd(CA.run_add, "add", "x", "--review", "-1")
+        self.assertIn("--review must be at least 0", str(cm.exception))
+        self.assertEqual(self.board().list_tasks(), [])
+
+    def test_add_review_one_no_warning(self):
+        """Mutation caught: the warning printed for every value."""
+        code, _, err = self.run_cmd(CA.run_add, "add", "x", "--review", "1")
+        self.assertEqual((code, err), (0, ""))
+
     def test_add_unknown_after_rejected(self):
         with self.assertRaises(UsageError):
             self.run_cmd(CA.run_add, "add", "x", "--after", "99")
-        with self.assertRaises(UsageError):
-            self.run_cmd(CA.run_add, "add", "x", "--review", "0")
         with self.assertRaises(UsageError):
             self.run_cmd(CA.run_add, "add", "x", "--after", "1", "--after", "99")   # one id valid, one not
         self.assertEqual(self.board().list_tasks(), [])   # catches validating after the insert

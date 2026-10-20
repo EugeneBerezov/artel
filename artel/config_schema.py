@@ -10,19 +10,36 @@ from artel.errors import UsageError
 @dataclass(frozen=True)
 class Setting:
     key: str                 # dotted: "max_agents", "models.write", "commands.verify", "notify.on"
-    kind: str                # int | str | bool | duration | size | str_list | enum | enum_list | command | argv
+    kind: str                # int | fraction | str | bool | duration | size | str_list | enum | enum_list | command | argv
     default: object          # TOML-typed default as written to artel.toml
     meaning: str             # one line: what it controls
     cost: str                # one line: quota/cost effect ("" when none)
     explain: str             # long explanation and trade-offs
     choices: tuple[str, ...] = ()
-    minimum: int | None = None   # int kind only
+    minimum: int | None = None   # int kind only; `fraction` is a decimal 0 < x <= 1
 
 
 _ROTATION_NOTE = (" Takes effect only when writer session rotation is built (Task 26, which may be skipped"
                   " after Task 25); until then every writer is fresh.")
 _PLACEHOLDERS = ("Placeholders: {model}, {schema} (the schema's inline JSON text), {unattended_notice},"
                  " {project_tools}, {project_read_tools}.")
+
+
+_PROTECTED_PATHS = (
+    ".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "artel.toml", ".artel/", ".github/", ".gitlab-ci.yml",
+    ".githooks/", ".husky/", ".pre-commit-config.yaml", ".gitattributes",
+    "package-lock.json", "npm-shrinkwrap.json", "yarn.lock", "pnpm-lock.yaml", "poetry.lock", "uv.lock",
+    "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock")
+_TEST_PATHS = ("tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
+               "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*")
+_TEST_MARKERS = (r"^\s*@(unittest\.)?skip\(", r"^\s*@pytest\.mark\.skip\b(?!if)", r"\b(it|test|describe)\.skip\(",
+                 r"\bx(it|describe|test)\(", r"\.only\(", r"pytest\.mark\.xfail", r"\bxfail\(",
+                 r"@(unittest\.)?expectedFailure", r"os\._exit\(")
+_VERIFY_TEST_ID_REGEX = (r"^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$", r"^PASSED (\S+)")
+_PROBE_PROFILE = ("-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
+                  "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config",
+                  "--permission-mode", "default", "--max-turns", "1", "--disallowedTools",
+                  "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task TodoWrite")
 
 
 def _s(key, kind, default, meaning, explain, cost="", choices=(), minimum=None) -> Setting:
@@ -37,18 +54,35 @@ SETTINGS: tuple[Setting, ...] = (
        "Each running agent occupies one slot (a git worktree). More agents finish the queue sooner and burn"
        " the usage limit faster; tasks with overlapping areas never run together.",
        cost="Linear in the number of agents: N agents spend quota N times as fast.", minimum=1),
-    _s("max_attempts", "int", 2, "How many times a stage that crashed or timed out is retried.",
-       "A stage that fails without a result (crash, timeout, unparsable output) is retried; after this many"
-       " attempts the task becomes stuck.",
+    _s("max_attempts", "int", 2, "How many consecutive failed runs of one stage are tolerated.",
+       "Consecutive failed runs of one stage (a success resets the count, PD-49). A stage that fails without a"
+       " result (crash, timeout, unparsable output) is retried; after this many failures the task becomes stuck.",
        cost="Each retry is a full extra agent run.", minimum=1),
     _s("review_rounds", "int", 2, "Review rounds before a task is blocked for a human.",
        "Round 1 is a full review, later rounds only check that findings were closed. When blocking findings"
-       " remain after the last round the task is blocked.",
+       " remain after the last round the task is blocked. 0 behaves like 1: one review, blocking findings go"
+       " to you; reviews cannot be turned off.",
        cost="Each round is one fresh reviewer run (plus a fix run when findings exist).", minimum=0),
     _s("max_verify_fixes", "int", 2, "Fix attempts after a red verify on the merged tree.",
        "When verification on the merged tree fails, the writer gets the failure and tries to fix it. After"
        " this many tries the task is blocked.",
        cost="Each attempt is one writer run plus one verify run.", minimum=0),
+    _s("verify_reruns", "int", 1, "Extra runs of a red task verify before it counts as red.",
+       "A red verify of a task runs again this many times; a green rerun means the test is flaky and the merge"
+       " waits for `artel accept` (merge = ask). 0 = a red verify counts at once.",
+       cost="Each rerun is one more verify run (no agent tokens).", minimum=0),
+    _s("max_stage_runs", "int", 12, "Finished agent runs per task, since a human last moved it, before it is stuck.",
+       "Bounds the total work one task can consume whatever the loop: when a task reaches this many agent runs"
+       " it becomes stuck until you answer, rework or retry it.",
+       cost="Upper bound on the agent runs one task can spend unattended.", minimum=1),
+    _s("max_consecutive_failures", "int", 3, "Failed agent stages in a row (across at least two tasks) that pause the runner.",
+       "When this many agent stages fail one after another and at least two different tasks are among them, the"
+       " runner pauses (an environment fault, not one bad task) until `artel resume`.",
+       cost="Stops a broken environment from burning one failed run per task.", minimum=2),
+    _s("max_branch_resets", "int", 1, "How often a fix stage that used up its attempts may reset the branch.",
+       "a fix stage that used up max_attempts may reset the branch and rewrite the task this often; then the"
+       " task is stuck (PD-63).",
+       cost="Each reset is a fresh writer run on the task from scratch.", minimum=0),
     _s("merge", "enum", "auto", "Whether verified tasks merge on their own or wait for `artel accept`.",
        "auto: a verified task is fast-forwarded into the integration branch. ask: it waits in"
        " awaiting_accept until you run `artel accept`.", choices=("auto", "ask")),
@@ -70,13 +104,40 @@ SETTINGS: tuple[Setting, ...] = (
        " the API rejects a request.",
        cost="rejected uses every last bit of quota but wastes the run that gets rejected.",
        choices=("allowed_warning", "rejected")),
+    _s("quota_stop_five_hour", "fraction", 0.95, "Five-hour window utilization at which the runner pauses.",
+       "A decimal above 0 and at most 1. The quota pause starts when the five-hour window reaches this share"
+       " of the plan's limit and ends at its reset.",
+       cost="Lower = more of the window stays free for you."),
+    _s("quota_stop_seven_day", "fraction", 0.8, "Weekly window utilization at which the runner pauses.",
+       "A decimal above 0 and at most 1. The quota pause starts when the weekly window reaches this share; the"
+       " rest of the week stays for you.",
+       cost="Lower = more of the week stays free for you."),
+    _s("night_budget_seven_day", "fraction", 0.15, "Most weekly utilization artel may use in any 24 hours.",
+       "A decimal above 0 and at most 1. When the weekly window grew by this much within 24 hours the quota"
+       " pause starts, so an unattended night cannot spend the week.",
+       cost="Lower = slower unattended progress, more quota kept."),
+    _s("limit_retry", "duration", "30m", "Gap unit between probes while no reset time is known.",
+       "When the limit gives no reset time, the gap before the k-th probe is k times this (30, 60, 90, 120"
+       " minutes by default). A probe is one tiny model call on models.probe.",
+       cost="Each probe is one one-turn call without tools."),
+    _s("limit_probes", "int", 4, "Probes in any 24 hours before waiting for `artel resume`.",
+       "After this many probes within 24 hours the pause is marked exhausted and a notification says `resume`"
+       " is needed. 0 = never probe.",
+       cost="Each probe is one one-turn call without tools.", minimum=0),
     _s("min_free_disk", "size", "3G", "Free disk space below which the runner pauses.",
        "Checked before a slot is used. Sizes: 500M, 3G, plain bytes."),
-    _s("slots_dir", "str", ".claude/worktrees", "Directory (relative to the repository) holding slots.",
-       "Slots are git worktrees named artel-<n> under this directory, never inside .git."),
-    _s("slot_keep", "str_list", ["node_modules"], "Paths kept when a slot is cleaned between stages.",
+    _s("base_cache_ttl", "duration", "6h", "How long a green check of the base branch is trusted.",
+       "A red task verify first checks whether artel/integration is red on its own; a green result is reused"
+       " for this long (PD-68).", cost="A base check is one verify run (no agent tokens)."),
+    _s("shadow_verify", "bool", True, "Verify the reviewed commit when a review finds a blocker or major.",
+       "A shadow verify measures whether verify alone would have caught what review found (PD-69). It runs in"
+       " an idle slot and uses no agent tokens.", cost="One verify run per blocking review."),
+    _s("slots_dir", "str", ".artel/slots", "Directory (relative to the repository) holding slots.",
+       "Slots are git worktrees named artel-<n> under this directory, never inside .git. The default is kept"
+       " apart from `.claude/worktrees`, where Claude Code and people keep their own worktrees."),
+    _s("slot_keep", "str_list", ["node_modules", ".venv", "venv"], "Setup output kept when a slot is cleaned.",
        "After each stage `git clean -ffdx` runs in the slot except for these paths, so installed"
-       " dependencies survive."),
+       " dependencies survive. Setup output outside this list makes the next stage run setup again (PD-73)."),
     _s("log_keep_tasks", "int", 50, "How many finished tasks keep their agent logs.",
        "Older logs are deleted; board rows stay.", minimum=0),
     _s("poll_interval", "duration", "5s", "How often the runner looks for work.",
@@ -84,11 +145,39 @@ SETTINGS: tuple[Setting, ...] = (
     _s("setup_retry", "duration", "15m", "How long the setup_failed pause lasts before setup is retried.",
        "The pause also ends when the setup command or commands.setup_inputs change, and at once with"
        " `artel resume --force`."),
-    _s("autoapprove", "enum", "non_risky", "Which vetted tasks start without human approval.",
-       "Agent-proposed tasks are vetted first. none: a human approves every task. non_risky: tasks without"
-       " risk signals start by themselves. all: every vetted task starts.",
+    _s("autoapprove", "enum", "none", "Which vetted tasks start without human approval.",
+       "Agent-proposed tasks are vetted first. none: a human approves every task (the v0.1 default: agent-proposed"
+       " tasks wait for `artel approve`). non_risky: tasks without risk signals start by themselves. all: every"
+       " vetted task starts.",
        cost="Every approved task costs agent runs; all can multiply the queue unattended.",
        choices=("none", "non_risky", "all")),
+    _s("protected_paths", "str_list", list(_PROTECTED_PATHS),
+       "Paths whose change forces merge=ask and a strong-model review.",
+       "A path matches case-insensitively on `/`-separated names. An entry without an inner `/` (a trailing `/`"
+       " is allowed) matches any path with a component equal to it (`CLAUDE.md` matches `docs/CLAUDE.md`,"
+       " `.claude/` matches `.claude/settings.json`); an entry with an inner `/` is a root-anchored prefix"
+       " (`scripts/verify.sh`, `tools/ci/`). Derived entries are added to this list: templates_dir, every"
+       " commands.setup_inputs entry, and files named by list-form setup/verify commands as exact paths"
+       " (string-form commands are not parsed: list their scripts here). An empty list disables only the"
+       " entries listed here.",
+       cost="A strong-model review for tasks that touch them."),
+    _s("test_paths", "str_list", list(_TEST_PATHS), "Paths that are tests or test configuration.",
+       "Changes to these paths are checked by the test guard: a deleted test, fewer assertions or an added"
+       " skip marker makes the merge wait for `artel accept`. Entries with `*` or `?` match file names;"
+       " others match like protected_paths. Only pure test files and pure test configuration belong here:"
+       " manifests such as package.json or pyproject.toml also change for dependencies, so they are left"
+       " out; add them when the project's test configuration lives there."),
+    _s("test_markers", "str_list", list(_TEST_MARKERS), "Regexes that mark an added test line as disabling a test.",
+       "Each entry is a regular expression tried on every added line of a test_paths file; a match makes the"
+       " merge wait for `artel accept`. The defaults are unconditional skips, `.only(`, xfail and"
+       " `os._exit(`, not conditional skips. Every entry must compile."),
+    _s("test_assert_markers", "str_list", ["assert", "expect("], "Substrings that count a line as an assertion.",
+       "Case-sensitive. A test file that loses more lines containing one of these than it gains makes the"
+       " merge wait for `artel accept`; comment lines count on neither side."),
+    _s("verify_test_id_regex", "str_list", list(_VERIFY_TEST_ID_REGEX), "Regexes that read passed test ids from verify output.",
+       "Each entry is a regular expression compiled with re.MULTILINE and with exactly one group: the id of a"
+       " passed test. The verify command must print test ids, e.g. `python -m unittest -v` or `pytest -rA`."
+       " A task whose verify passes fewer of the base branch's tests makes the merge wait for `artel accept`."),
     _s("risk_signals", "str_list",
        ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"],
        "Phrases the vetting agent looks for to mark a task risky.",
@@ -99,9 +188,9 @@ SETTINGS: tuple[Setting, ...] = (
        "0 = no threshold; measure first with `artel stats`." + _ROTATION_NOTE, minimum=0),
     _s("rotation.same_area_only", "bool", True, "Reuse a writer session only for tasks in the same area.",
        "When true a session is never carried over to a task with a different area." + _ROTATION_NOTE),
-    _s("rotation.fix_resumes_writer", "bool", True, "Fix stages resume the writer's session.",
+    _s("rotation.fix_resumes_writer", "bool", False, "Fix stages resume the writer's session.",
        "When true a fix after review or verify continues the writer's own session instead of starting a"
-       " fresh one." + _ROTATION_NOTE),
+       " fresh one. Off until resume is measured (spike Q8, Task 25)." + _ROTATION_NOTE),
     _s("templates_dir", "str", ".artel/templates", "Directory (relative to the repository) with prompt templates.",
        "Templates found here override the built-in ones; `artel templates export` writes the built-ins."),
     _s("agent_command", "argv", "claude", "The agent executable.",
@@ -117,6 +206,9 @@ SETTINGS: tuple[Setting, ...] = (
     _s("models.strong", "str", "opus", "Model for strong tasks and large diffs.",
        "Used for tasks marked strong and for reviews of diffs over models.strong_diff_lines.",
        cost="The most expensive model; every use counts against the usage limit."),
+    _s("models.probe", "str", "haiku", "Model for limit and agent_unavailable probes.",
+       "Passed to the agent as --model for the one-turn probe call that tells whether the agent works again.",
+       cost="One tiny call per probe."),
     _s("models.strong_diff_lines", "int", 300, "Diff size (lines) above which reviews use the strong model.",
        "Counts added plus removed lines against the integration branch.",
        cost="Lower = more reviews on the strong model.", minimum=0),
@@ -150,17 +242,33 @@ SETTINGS: tuple[Setting, ...] = (
        "Always passes --permission-mode explicitly. " + _PLACEHOLDERS,
        cost="Wider permissions let a writer do more per run, and more damage."),
     _s("profiles.reviewer", "str_list",
-       ["--permission-mode", "default", "--disallowedTools", "Edit Write NotebookEdit", "--allowedTools",
+       ["--permission-mode", "acceptEdits", "--allowedTools",
+        "Bash(artel note *) Bash(artel heavy *) Bash(git diff *) Bash(git log *) Bash(git show *)"
+        " Bash(git status *)", "{project_tools}", "{project_read_tools}", "--disallowedTools",
+        "Bash(git * --output*)"],
+       "Extra arguments for review stages: may write probe files and run project checks, never commits.",
+       "acceptEdits lets a reviewer write probe files and run project checks through `artel heavy`; it has no"
+       " git add or git commit. " + _PLACEHOLDERS,
+       cost="Probes make reviews longer and catch defects green tests miss."),
+    _s("profiles.attacker", "str_list",
+       ["--permission-mode", "default", "--disallowedTools", "Edit Write NotebookEdit Bash(git * --output*)",
+        "--allowedTools",
         "Bash(artel note *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *)",
         "{project_read_tools}"],
-       "Extra arguments for reviewer, attack and vet stages.",
+       "Extra arguments for vet and attack stages (read-only).",
        "Read-only: permission mode default plus a deny list for edit tools. " + _PLACEHOLDERS,
-       cost="Reviewers that cannot read enough produce weaker reviews."),
-    _s("notify.on", "enum_list", ["blocked", "stuck", "paused", "resumed", "runner_stopped", "error"],
+       cost="Attackers that cannot read enough produce weaker reviews."),
+    _s("profiles.probe", "str_list", list(_PROBE_PROFILE),
+       "Arguments of the limit probe: one turn, no tools, no schema, no notice.",
+       "Used instead of profiles.common for the probe call (PD-55). {model} is models.probe. Keep --max-turns 1"
+       " and the --disallowedTools list: a probe must cost almost nothing.",
+       cost="One tiny call per probe."),
+    _s("notify.on", "enum_list",
+       ["blocked", "stuck", "awaiting_accept", "paused", "resumed", "runner_stopped", "error"],
        "Events that send a notification.",
-       "Choose from blocked, stuck, paused, resumed, done, runner_stopped, error. error is an internal runner"
-       " failure; its text names the task and stage, never a traceback.",
-       choices=("blocked", "stuck", "paused", "resumed", "done", "runner_stopped", "error")),
+       "Choose from blocked, stuck, awaiting_accept, paused, resumed, done, runner_stopped, error. error is an"
+       " internal runner failure; its text names the task and stage, never a traceback.",
+       choices=("blocked", "stuck", "awaiting_accept", "paused", "resumed", "done", "runner_stopped", "error")),
     _s("notify.command", "command", "", "Command that receives each notification text.",
        "Empty = no command notifier. The text arrives on stdin and in ARTEL_NOTIFY_TEXT."),
     _s("notify.telegram_enabled", "bool", False, "Send notifications to Telegram.",
