@@ -52,10 +52,14 @@ def choose_model(cfg, task: Task, stage: str, diff: int) -> tuple[str, str]:
     return cfg["models.review"], "models.review"
 
 
-def branchless(task: Task, stage: str) -> bool:
-    """Vet and attack run before any code exists: detached at the integration tip (PD-32). A task only reaches
-    the attack stage without a branch (the writer creates it later); a vet-triggered attack has `then` set."""
-    return stage == "vet" or stage == "attack"
+def branchless(task: Task, stage: str, has_branch: bool | None = None) -> bool:
+    """Vet, and attack while `then` is set (vet-triggered) or no task branch exists (PD-32): detached at the
+    integration tip. `has_branch` None means "no branch yet" — the writer creates it after the attack."""
+    if stage == "vet":
+        return True
+    if stage == "attack":
+        return task.then is not None or not has_branch
+    return False
 
 
 def closure_round(task: Task, stage: str) -> bool:
@@ -118,13 +122,13 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
         raise ArtelError(f"task {task.id} in state {task.state} has no supported stage")
     model, model_reason = choose_model(cfg, task, stage, diff_lines(repo, task.id) if stage == "review" else 0)
     conflict_paths: tuple[str, ...] = ()
-    if branchless(task, stage):
-        head = slots.prepare_detached(repo, board, cfg, slot_n)
-    else:
-        head = slots.prepare_slot(repo, board, cfg, slot_n, task.id)
-    try:   # from here on any failure must leave the slot (a half-started conflict merge included)
-        if stage == "fix" and task.fix_kind == "conflict":
-            conflict_paths = tuple(slots.start_conflict_merge(repo, board, cfg, slot_n))
+    try:   # any failure from the first slot command on must leave the slot (a half-started merge included)
+        if branchless(task, stage, repo.branch_exists(task_branch(task.id))):
+            head = slots.prepare_detached(repo, board, cfg, slot_n)
+        else:
+            head = slots.prepare_slot(repo, board, cfg, slot_n, task.id)
+            if stage == "fix" and task.fix_kind == "conflict":
+                conflict_paths = tuple(slots.start_conflict_merge(repo, board, cfg, slot_n))
         history = journal.task_entries(board, task.id)
         open_review = journal.open_findings(board, task.id, stages=("review",))
         template = prompts.template_name(stage, task)
@@ -152,7 +156,10 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
         run = board.start_run(task_id=task.id, stage=stage, round=task.round, model=model,
                               model_reason=model_reason, slot=slot_n, log_path=str(log_path))
     except BaseException:
-        slots.leave_slot(repo, board, cfg, slot_n)
+        try:
+            slots.leave_slot(repo, board, cfg, slot_n)
+        except ArtelError:
+            pass   # the original failure is the one to report
         raise
     return StagePlan(task_id=task.id, stage=stage, round=task.round, model=model, model_reason=model_reason,
                      profile=profile, prompt=prompt, argv=argv, env=env, base_env=dict(base_env),
@@ -184,8 +191,10 @@ def _commit_facts(repo, path: Path, task: Task, plan: StagePlan, merge_target: s
         new = False
     merged = False
     if merge_target and tip:
-        merged = slots._git(repo, "merge-base", "--is-ancestor", merge_target, tip, cwd=path,
-                            check=False).returncode == 0
+        # BOTH the merged commit and where the fix started must be in the branch: a follow-up commit is fine,
+        # `git reset --hard <integration>` (the work dropped) is not
+        merged = all(slots._git(repo, "merge-base", "--is-ancestor", ancestor, tip, cwd=path,
+                                check=False).returncode == 0 for ancestor in (merge_target, plan.head_before))
         new = tip != plan.head_before
     return new, merged
 
@@ -318,10 +327,7 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     if event == "setup_failed":
         journal.append(board, "FAIL", f"setup {run.setup}: the stage was not started (see the setup log)",
                        author="runner", **common)
-    for denial in run.denials:                                                       # PD-24
-        detail = json.dumps(denial.get("tool_input"), ensure_ascii=False)
-        journal.append(board, "FAIL", _clip(f"denied: {denial.get('tool_name')} {detail}"),
-                       author="runner", **common)
+    record_denials(board, task, plan, run)
     label = {"ready": "READY", "review_clear": "PASS", "attack_clear": "PASS", "review_blocking": "FINDINGS",
              "attack_blocker": "FINDINGS", "stage_failed": "FAIL"}.get(event)
     if label is not None:
@@ -343,6 +349,23 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
         journal.append(board, "VERDICT", _clip(head), author="runner", **common)
 
 
+def record_denials(board, task: Task, plan: StagePlan, run: StageRun) -> None:
+    for denial in run.denials:                                                       # PD-24: every denial
+        detail = json.dumps(denial.get("tool_input"), ensure_ascii=False)
+        journal.append(board, "FAIL", _clip(f"denied: {denial.get('tool_name')} {detail}"), author="runner",
+                       task_id=task.id, stage=plan.stage, round=plan.round)
+
+
+SUPERSEDED = "superseded: branch reset (R17)"
+
+
+def supersede_review_findings(board, task_id: int, round: int) -> None:
+    """PD-46: a reset branch makes every open REVIEW finding moot; attack findings concern the task and stay."""
+    for finding in journal.open_findings(board, task_id, stages=("review",)):
+        journal.close_finding(board, finding.id, task_id=task_id, round=round, basis=SUPERSEDED, author="runner",
+                              text=SUPERSEDED)
+
+
 def _ask_open_findings(board, task_id: int, common: dict) -> None:
     open_now = journal.open_findings(board, task_id)
     listing = "; ".join(f"#{e.id} [{e.severity}] {e.text}" for e in open_now) or "(none)"
@@ -353,8 +376,9 @@ def _ask_open_findings(board, task_id: int, common: dict) -> None:
 def _cause_verdict(board, tr: Transition, plan: StagePlan, common: dict) -> None:
     if not tr.cause:
         return
-    if tr.to_state in ("blocked", "stuck") or tr.event in ("stage_failed", "internal_error"):
-        word = tr.to_state.upper() if tr.to_state in ("blocked", "stuck") else "RETRY"
+    if tr.to_state in ("blocked", "stuck") or tr.event in ("stage_failed", "internal_error", "review_blocking"):
+        word = (tr.to_state.upper() if tr.to_state in ("blocked", "stuck")
+                else "FIX" if tr.event == "review_blocking" else "RETRY")
         journal.append(board, "VERDICT", _clip(f"{word} {plan.stage} r{plan.round}: {tr.cause}"),
                        author="runner", **common)                                    # names the setting
 
@@ -366,13 +390,19 @@ def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun)
         return None
     event = classify(task, plan.stage, run, board)
     if event == "requeue":
-        board.clear_running(task_id)
+        try:
+            record_denials(board, task, plan, run)   # a requeued run's denials are still facts (PD-24)
+        finally:
+            board.clear_running(task_id)
         return None
     try:
-        record_stage(board, task, plan, run, event)
-        tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
-                               has_branch=repo.branch_exists(task_branch(task_id)),
-                               tip=repo.rev(task_branch(task_id)))
+        with board.tx():   # the entries and the transition are one unit: a lost CAS must not leave duplicates
+            record_stage(board, task, plan, run, event)
+            tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
+                                   has_branch=repo.branch_exists(task_branch(task_id)),
+                                   tip=repo.rev(task_branch(task_id)))
+            if "reset_branch" in tr.effects:
+                supersede_review_findings(board, task_id, plan.round)       # PD-46
     finally:
         board.clear_running(task_id)
     common = dict(task_id=task_id, stage=plan.stage, round=plan.round)
