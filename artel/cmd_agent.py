@@ -50,8 +50,8 @@ def run_add(args) -> int:
     repo = Repo.discover(Path.cwd())
     if not args.title.strip():
         raise UsageError("a task needs a title")
-    if args.review is not None and args.review < 1:
-        raise UsageError("--review must be at least 1")
+    if args.review is not None and args.review < 0:
+        raise UsageError("--review must be at least 0")
     areas = [clean_area(a) for a in args.area]
     board = open_board(repo.board_path)
     try:
@@ -66,6 +66,9 @@ def run_add(args) -> int:
             board, event, title=args.title, created_by=created_by, body=args.body or "", area=areas,
             priority=args.priority, attack=args.attack, strong=args.strong, review_rounds=args.review,
             merge=args.merge, after=args.after)
+        if args.review == 0:
+            print("warning: --review 0 behaves like 1: one review, blocking findings go to you (no fix round)",
+                  file=sys.stderr)
         print(f"#{task_id} {board.get_task(task_id).state}")
     finally:
         board.close()

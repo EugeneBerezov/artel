@@ -48,13 +48,50 @@ class EnsureTest(SlotsCase):
     def test_ensure_creates_detached_worktrees_under_slots_dir(self):
         self.assertEqual(self.slot(2), [1, 2])
         for n in (1, 2):
-            path = self.repo_path / ".claude" / "worktrees" / f"artel-{n}"
+            path = self.repo_path / ".artel" / "slots" / f"artel-{n}"
             self.assertTrue(path.is_dir())
             self.assertEqual(self.branch_of(path), "")   # detached
             self.assertEqual(self.head(path), git(self.repo_path, "rev-parse", INTEGRATION))
         self.assertEqual([(s.n, Path(s.path)) for s in self.board.list_slots()],
                          [(n, slots.slot_path(self.repo, self.cfg, n)) for n in (1, 2)])
-        self.assertEqual(slots.slot_path(self.repo, self.cfg, 1), self.repo.root / ".claude/worktrees/artel-1")
+        self.assertEqual(slots.slot_path(self.repo, self.cfg, 1), self.repo.root / ".artel/slots/artel-1")
+
+    def test_ensure_slots_excludes_slots_dir(self):
+        """Mutation caught: no exclude line (slots show up as untracked) or one appended on every call."""
+        self.assertEqual(git(self.repo_path, "status", "--porcelain"), "")
+        self.slot(2)
+        self.slot(2)
+        self.assertEqual(git(self.repo_path, "status", "--porcelain"), "")
+        exclude = (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(exclude.count("/.artel/slots/"), 1)
+
+    def test_ensure_slots_excludes_custom_slots_dir_once(self):
+        """Mutation caught: the exclude line hard-coding the default directory."""
+        self.slot(1, slots_dir="work/pool")
+        self.slot(1, slots_dir="work/pool")
+        exclude = (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(exclude.count("/work/pool/"), 1)
+        self.assertNotIn("/.artel/slots/", exclude)
+
+    def test_exclude_appends_after_unterminated_crlf_file(self):
+        """Mutation caught: no newline before the line, CRLF dedupe dropped, missing info/ dir not created."""
+        exclude = self.repo.common_dir / "info" / "exclude"
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        exclude.write_bytes(b"foo/\r\n/.artel/slots/\r\nbar")
+        self.slot(1)
+        self.assertEqual(exclude.read_bytes(), b"foo/\r\n/.artel/slots/\r\nbar")   # CRLF line counts as present
+        exclude.write_bytes(b"bar")
+        self.slot(1)
+        self.assertEqual(exclude.read_bytes(), b"bar\n/.artel/slots/\n")
+
+    def test_exclude_skipped_outside_repo_and_creates_info_dir(self):
+        """Mutation caught: a crash or a '/../x/' line for a slots_dir outside the repository."""
+        import shutil
+        shutil.rmtree(self.repo.common_dir / "info", ignore_errors=True)
+        self.slot(1)
+        self.assertIn("/.artel/slots/", (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8"))
+        self.assertIsNone(slots._exclude_slots_dir(self.repo, {"slots_dir": "../outside-pool"}))
+        self.assertNotIn("outside-pool", (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8"))
 
     def test_ensure_is_idempotent(self):
         self.slot(2)
@@ -147,6 +184,7 @@ class AdoptionTest(SlotsCase):
         user.parent.mkdir(parents=True, exist_ok=True)
         git(self.repo_path, "worktree", "add", "-q", "--detach", str(user), "main")
         link = slots.slot_path(self.repo, self.cfg, 2)
+        link.parent.mkdir(parents=True, exist_ok=True)
         P.link_dir(link, user)
         with self.assertRaises(ArtelError) as cm:
             self.slot(2)

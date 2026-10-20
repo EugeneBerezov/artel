@@ -180,7 +180,7 @@ class WriteTest(StagesCase):
         review = self.task_in("reviewing", round=1, with_commit=True)
         plan = stages.plan_stage(self.repo, self.board, self.cfg, self.task(review), 1, base_env=self.base_env)
         self.assertEqual((plan.profile, plan.stage, plan.round), ("reviewer", "review", 1))
-        self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "default")
+        self.assertEqual(plan.argv[plan.argv.index("--permission-mode") + 1], "acceptEdits")
         self.assertIn(f"{INTEGRATION}...artel/{review}", plan.prompt)
         self.assertEqual(plan.prompt.count("\r"), 0)
         slots.leave_slot(self.repo, self.board, self.cfg, 1)
