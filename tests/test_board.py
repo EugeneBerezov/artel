@@ -241,11 +241,21 @@ class BoardTest(unittest.TestCase):
     def test_all_bool_columns_roundtrip(self):
         tid = self.new_task()
         t = self.board.get_task(tid)
-        names = ["attack", "strong", "review_closure", "answered", "running"]
+        names = ["attack", "strong", "answered", "running"]
         self.board.update_task(tid, expect_state="open", expect_version=t.version, **{n: True for n in names})
         t = self.board.get_task(tid)
         for n in names:
             self.assertIs(getattr(t, n), True, n)
+
+    def test_review_closure_roundtrips_as_int(self):
+        """Mutation caught: the bool coercion (a stored 2 reading back as True; the verify-fix template never ran)."""
+        tid = self.new_task()
+        for value in (2, 1, 0):
+            t = self.board.get_task(tid)
+            self.board.update_task(tid, expect_state="open", expect_version=t.version, review_closure=value)
+            got = self.board.get_task(tid).review_closure
+            self.assertEqual(got, value)
+            self.assertIs(type(got), int)
 
     def test_second_writer_times_out_with_board_busy(self):
         other = B.open_board(self.path, busy_timeout_ms=50)
@@ -379,12 +389,12 @@ class BoardTest(unittest.TestCase):
         self.assertTrue(self.board.update_task(
             tid, expect_state="reviewing", expect_version=t.version, state="blocked",
             then="awaiting_approval", rejected_by="vet", cause="ask", stuck_from="writing",
-            review_closure=True, fix_kind="conflict", asked_by="review", last_verify="conflict",
+            review_closure=2, fix_kind="conflict", asked_by="review", last_verify="conflict",
             fix_base="abc123", accepted=True, risky=True))
         t = self.board.get_task(tid)
         self.assertEqual((t.then, t.rejected_by, t.cause, t.stuck_from, t.fix_kind, t.asked_by, t.last_verify),
                          ("awaiting_approval", "vet", "ask", "writing", "conflict", "review", "conflict"))
-        self.assertIs(t.review_closure, True)
+        self.assertEqual(t.review_closure, 2)
         self.assertEqual(t.fix_base, "abc123")
         self.assertIs(t.accepted, True)
         self.assertIs(t.risky, True)

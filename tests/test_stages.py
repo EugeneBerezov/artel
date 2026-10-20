@@ -159,13 +159,42 @@ class PureTest(StagesCase):
             ("stage_failed", run(timed_out=True, result=ok, new_commits=True)),
             ("stage_failed", run()),
             ("stage_failed", run(result=dict(ok, outcome="fail"))),
-            ("stage_failed", run(result=ok, new_commits=False)),
+            ("ready_no_commits", run(result=ok, new_commits=False)),
             ("ready", run(result=ok, new_commits=True)),
             ("ask", run(result=dict(ok, outcome="ask", question="q?"))),
         ]
         for want, r in cases:
             with self.subTest(want=want):
                 self.assertEqual(stages.classify(task, "write", r, self.board), want)
+
+
+    def test_classify_ready_without_commits_is_ready_no_commits(self):
+        """Mutation caught: a write or verify fix without commits left as stage_failed (PD-53)."""
+        for task in (make_task(state="writing"), make_task(state="fixing", fix_kind="verify")):
+            stage = "write" if task.state == "writing" else "fix"
+            with self.subTest(stage=stage):
+                self.assertEqual(stages.classify(task, stage, self.plain_run(), self.board), "ready_no_commits")
+
+    def test_classify_review_fix_without_commits_is_stage_failed(self):
+        """Mutation caught: merging the outcomes back (a failed review fix is retried in place, PD-63)."""
+        for kind in ("review", "conflict"):
+            with self.subTest(fix_kind=kind):
+                task = make_task(state="fixing", fix_kind=kind)
+                self.assertEqual(stages.classify(task, "fix", self.plain_run(), self.board), "stage_failed")
+
+    def test_classify_timeout_is_stage_failed(self):
+        """Mutation caught: a timed-out verify fix classified as ready_no_commits."""
+        task = make_task(state="fixing", fix_kind="verify")
+        self.assertEqual(stages.classify(task, "fix", self.plain_run(timed_out=True), self.board), "stage_failed")
+        self.assertEqual(stages.classify(task, "fix", self.plain_run(result=None), self.board), "stage_failed")
+
+    def plain_run(self, **kw):
+        base = dict(result={"outcome": "ready", "summary": "x", "question": "", "findings": [], "closed": []},
+                    invalid_reason=None, usage={}, exit_code=0, timed_out=False, stopped=False, rate_limited=False,
+                    new_commits=False, merge_committed=False, setup="skipped", denials=[], session_id=None,
+                    first_context=None, last_context=None)
+        base.update(kw)
+        return stages.StageRun(**base)
 
 
 class WriteTest(StagesCase):
@@ -423,6 +452,88 @@ class FixTest(StagesCase):
         self.go(tid)
         self.assertEqual(self.task(tid).state, "reviewing")   # the fix commit predates this run but follows fix_base
 
+    def verify_fix_task(self, **fields):
+        tid = self.task_in("fixing", fix_kind="verify", with_commit=True, round=1, **fields)
+        base = git(self.repo_path, "rev-parse", f"artel/{tid}")
+        self.board.update_task(tid, expect_state="fixing", expect_version=self.task(tid).version, fix_base=base)
+        return tid
+
+    def test_verify_fix_no_change_journals_ask_and_blocks(self):
+        """Mutation caught: R15b without its question (the blocked notification and `answer` need an ASK)."""
+        tid = self.verify_fix_task(attempts=1)
+        self.scenario({f"{tid}:fix": [{"result": {"outcome": "ready", "summary": "nothing to change"}}]})
+        self.go(tid)
+        task = self.task(tid)
+        self.assertEqual((task.state, task.asked_by, task.cause, task.attempts), ("blocked", "verify", "ask", 1))
+        self.assertTrue(self.repo.branch_exists(f"artel/{tid}"))   # the branch is kept (PD-53)
+        (ask,) = self.entries(tid, "ASK")
+        self.assertEqual(ask.text, "fixer made no change: nothing to change")
+        # not a failure (spec §3.1 Counters): a FAIL verdict would be miscounted by the breaker
+        self.assertFalse(any(v.text.startswith("FAIL") for v in self.entries(tid, "VERDICT")))
+
+    def test_verify_fix_ready_goes_reviewing(self):
+        """Mutation caught: R15 left at verifying (the old assertion), or the closure marker lost."""
+        tid = self.verify_fix_task(attempts=1)
+        self.scenario({f"{tid}:fix": [*self.commit_action("fix.txt", "the fix"), {"result": READY}]})
+        self.go(tid)
+        task = self.task(tid)
+        self.assertEqual((task.state, task.review_closure, task.attempts, task.fix_kind),
+                         ("reviewing", 2, 0, None))
+        self.assertEqual(task.round, 1)   # no round added
+
+    def test_attempts_reset_after_success(self):
+        """Mutation caught: stages overwriting the table's reset (a failed write then a good one leaves attempts 1)."""
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [{"result": {"outcome": "fail", "summary": "no"}}]})
+        self.go(tid)
+        self.assertEqual((self.task(tid).state, self.task(tid).attempts), ("open", 1))
+        task = self.task(tid)
+        self.board.update_task(tid, expect_state="open", expect_version=task.version, state="writing")
+        self.scenario({f"{tid}:write": [*self.commit_action("w.txt", "w"), {"result": READY}]})
+        self.go(tid)
+        self.assertEqual((self.task(tid).state, self.task(tid).attempts), ("reviewing", 0))
+
+    def verify_fix_review_task(self):
+        tid = self.verify_fix_task(attempts=0)
+        self.make_branch(tid, name="fix.txt", content="fix\n")
+        task = self.task(tid)
+        self.board.update_task(tid, expect_state="fixing", expect_version=task.version, state="reviewing",
+                               fix_kind=None, review_closure=2, round=1)
+        log_dir = self.repo.logs_dir / str(tid)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        (log_dir / "verify-1.log").write_text("FAILED test_x: boom-marker\n", encoding="utf-8", newline="\n")
+        return tid
+
+    def test_verify_fix_review_prompt_has_open_findings(self):
+        """Mutation caught: closure_list filled only for review-closure.md (the old template == condition)."""
+        tid = self.verify_fix_review_task()
+        journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major", text="open-marker",
+                            basis="a.py:1", author="agent:review")
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "pass", "summary": "ok"}}]})
+        plan, _, _ = self.go(tid)
+        self.assertEqual(plan.prompt.count("open-marker"), 2)   # once in the history, once as the closure list
+        self.assertIn("weakens, skips, deletes or loosens", plan.prompt)   # it is the verify-fix template
+
+    def test_verify_fix_review_prompt_has_verify_log(self):
+        """Mutation caught: verify_log only for stage == "fix"."""
+        tid = self.verify_fix_review_task()
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "pass", "summary": "ok"}}]})
+        plan, _, _ = self.go(tid)
+        self.assertIn("boom-marker", plan.prompt)
+
+    def test_verify_fix_review_diff_range_is_the_fix(self):
+        """Mutation caught: a full-branch diff for the verify-fix review (it must see the fix only, PD-48)."""
+        tid = self.verify_fix_review_task()
+        fix_base = self.task(tid).fix_base
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "pass", "summary": "ok"}}]})
+        plan, _, _ = self.go(tid)
+        self.assertIn(f"{fix_base}..artel/{tid}", plan.prompt)
+        self.assertNotIn("artel/integration...", plan.prompt)
+
+    def test_verify_fix_review_without_fix_base_falls_back_to_the_branch_diff(self):
+        task = make_task(id=5, state="reviewing", review_closure=2, fix_base=None)
+        self.assertEqual(stages._diff_range(task), f"{INTEGRATION}...artel/5")
+
     def test_fix_ready_with_no_commit_since_fix_base_fails(self):
         tid = self.task_in("fixing", fix_kind="review", with_commit=True)
         base = git(self.repo_path, "rev-parse", f"artel/{tid}")
@@ -508,7 +619,7 @@ class FixTest(StagesCase):
         self.assertEqual(plan.conflict_paths, ("shared.txt",))
         self.assertIn("shared.txt", plan.prompt)
         task = self.task(tid)
-        self.assertEqual((task.state, task.review_closure, task.round), ("reviewing", True, 1))
+        self.assertEqual((task.state, task.review_closure, task.round), ("reviewing", 1, 1))
         self.assertTrue(run.merge_committed)
         self.assertEqual(run.setup, "skipped")   # PD-43
         self.assert_slot_left()

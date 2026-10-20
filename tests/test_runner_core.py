@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from artel import events, integrate, journal, pauses, platform, procs, slots, stages
+from artel import events, integrate, journal, pauses, platform, procs, prompts, requests, slots, stages, transitions
 from artel import runner as runner_module
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION
@@ -69,8 +69,48 @@ class RunnerCoreTest(E2ECase):
                        "fix": [{"write": ["fixed.txt", "yes\n"]}, {"commit": "make verify green"},
                                {"result": {"outcome": "ready", "summary": "fixed"}}]})
         self.run_to_done(tid, self.runner(max_agents=1))
-        self.assertEqual([c["stage"] for c in self.calls()], ["write", "review", "fix"])   # R15: a verify fix re-verifies
+        calls = self.calls()
+        # R15: a verify fix is reviewed (the verify-fix template, the fix only) before it is verified again
+        self.assertEqual([c["stage"] for c in calls], ["write", "review", "fix", "review"])
+        self.assertIn("weakens, skips, deletes or loosens", calls[3]["prompt"])
+        self.assertNotIn("weakens, skips, deletes or loosens", calls[1]["prompt"])
         self.assertEqual(self.board.get_task(tid).verify_fixes, 1)
+
+    def test_accept_blocked_verify_fix_reverifies(self):
+        """Replaces Task 18's test_accept_on_blocked_is_an_error_until_r35b. Mutation caught: R35b missing (the
+        request ends in an error and the task stays blocked) or `accepted` set."""
+        marker = self.tmp / "verify-ran.flag"
+        self.write_toml({"commands.verify": py_cmd(
+            f"import os, sys; p = {str(marker)!r}; ok = os.path.exists(p); "
+            "open(p, 'w', encoding='utf-8').close(); sys.exit(0 if ok else 1)")})
+        tid = self.add_task("Add hello")
+        self.scenario({"write": WRITE, "review": PASS,
+                       "fix": [{"result": {"outcome": "ready", "summary": "nothing to change"}}]})   # no commit
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            self.drive(r, lambda: self.board.get_task(tid).state == "blocked")
+            task = self.board.get_task(tid)
+            self.assertEqual((task.asked_by, task.cause), ("verify", "ask"))
+            requests.enqueue(self.repo, self.board, "accept", tid, {})
+            self.drive(r, lambda: self.board.get_task(tid).state == "done")
+        finally:
+            r.shutdown()
+        self.assertEqual([c["stage"] for c in self.calls()], ["write", "review", "fix"])   # no second fix
+        self.assertFalse(self.board.get_task(tid).accepted)
+
+    def test_verify_fix_review_template_through_board(self):
+        """Mutation caught: the bool round-trip that unit tests with a hand-built Task miss — after R15 on a real
+        board, plan_stage picks review-verify-fix.md and the fix-only diff range."""
+        tid = self.add_task("Add hello")
+        task = self.board.get_task(tid)
+        self.board.update_task(tid, expect_state="open", expect_version=task.version, state="fixing",
+                               fix_kind="verify", round=1, fix_base="abc123")
+        transitions.apply(self.board, tid, "ready", transitions.Limits.from_cfg(self.board.get_task(tid), self.cfg))
+        task = self.board.get_task(tid)
+        self.assertEqual((task.state, task.review_closure), ("reviewing", 2))
+        self.assertEqual(prompts.template_name("review", task), "review-verify-fix.md")
+        self.assertEqual(stages._diff_range(task), f"abc123..artel/{tid}")
 
     def test_two_tasks_two_slots_disjoint_areas(self):
         def work(name):

@@ -73,7 +73,8 @@ class Transition:
 EVENTS = ("add_human", "add_agent", "pick", "vet_ok", "vet_risky", "vet_inadequate", "approve",
           "reject", "attack_clear", "attack_blocker", "stage_failed", "ready", "ask",
           "setup_failed", "internal_error", "review_clear", "review_blocking", "answer", "rework",
-          "verify_green", "verify_red", "verify_conflict", "accept", "ff_ok", "ff_impossible")
+          "verify_green", "verify_red", "verify_conflict", "accept", "ff_ok", "ff_impossible",
+          "ready_no_commits")
 EFFECTS = ("delete_branch", "reset_branch", "terminate_running", "append_findings", "append_answer",
            "ask_open_findings", "pause_setup_failed", "notify_internal_error")
 
@@ -86,18 +87,20 @@ TABLE = (
     Row("R01", (), "add_human", "open"),
     Row("R02", (), "add_agent", "proposed"),
     Row("R03", ("proposed",), "pick", "vetting"),
-    Row("R04a", ("vetting",), "vet_ok", "open", when=("auto=non_risky|all",), cause="autoapprove"),
-    Row("R04b", ("vetting",), "vet_ok", "awaiting_approval", when=("auto=none",), cause="autoapprove"),
+    Row("R04a", ("vetting",), "vet_ok", "open", when=("auto=non_risky|all",),
+        sets=("attempts=0",), cause="autoapprove"),
+    Row("R04b", ("vetting",), "vet_ok", "awaiting_approval", when=("auto=none",),
+        sets=("attempts=0",), cause="autoapprove"),
     Row("R04c", ("vetting",), "vet_risky", "attacking", when=("auto=none|non_risky",),
-        sets=("then=awaiting_approval", "risky=1"), cause="autoapprove"),
-    Row("R04d", ("vetting",), "vet_risky", "attacking", when=("auto=all",), sets=("then=open", "risky=1"),
+        sets=("attempts=0", "then=awaiting_approval", "risky=1"), cause="autoapprove"),
+    Row("R04d", ("vetting",), "vet_risky", "attacking", when=("auto=all",), sets=("attempts=0", "then=open", "risky=1"),
         cause="autoapprove"),
-    Row("R05", ("vetting",), "vet_inadequate", "rejected", sets=("rejected_by=vet",)),
+    Row("R05", ("vetting",), "vet_inadequate", "rejected", sets=("attempts=0", "rejected_by=vet",)),
     Row("R06", ("vetting",), "stage_failed", "=", sets=("attempts+1",), stuck_on_cap=True,
         cause="max_attempts"),
     Row("R07a", ("attacking",), "attack_clear", "awaiting_approval", when=("then=awaiting_approval",),
-        sets=("then=none",), effects=("append_findings",)),
-    Row("R07b", ("attacking",), "attack_clear", "open", when=("then=open",), sets=("then=none",),
+        sets=("attempts=0", "then=none",), effects=("append_findings",)),
+    Row("R07b", ("attacking",), "attack_clear", "open", when=("then=open",), sets=("attempts=0", "then=none",),
         effects=("append_findings",)),
     Row("R08", ("proposed", "awaiting_approval", "rejected"), "approve", "open",
         when=("approvable",), sets=("rejected_by=none",)),
@@ -105,28 +108,37 @@ TABLE = (
         effects=("terminate_running", "delete_branch")),
     Row("R10a", ("open",), "pick", "attacking", when=("attack",)),
     Row("R10b", ("open",), "pick", "writing", when=("not_attack",)),
-    Row("R11", ("attacking",), "attack_clear", "writing", when=("then=none",), effects=("append_findings",)),
-    Row("R12", ("attacking",), "attack_blocker", "blocked", sets=("asked_by=attack", "cause=ask")),
+    Row("R11", ("attacking",), "attack_clear", "writing", when=("then=none",), effects=("append_findings",),
+        sets=("attempts=0",)),
+    Row("R12", ("attacking",), "attack_blocker", "blocked", sets=("attempts=0", "asked_by=attack", "cause=ask")),
     Row("R13", ("attacking", "reviewing"), "stage_failed", "=", sets=("attempts+1",),
         stuck_on_cap=True, cause="max_attempts"),
-    Row("R14a", ("writing",), "ready", "reviewing", sets=("round+1",)),
-    Row("R14b", ("fixing",), "ready", "reviewing", when=("fix_kind=review",), sets=("round+1", "fix_kind=none")),
-    Row("R15", ("fixing",), "ready", "verifying", when=("fix_kind=verify",), sets=("fix_kind=none",)),
+    Row("R14a", ("writing",), "ready", "reviewing", sets=("attempts=0", "round+1",)),
+    Row("R14b", ("fixing",), "ready", "reviewing", when=("fix_kind=review",),
+        sets=("attempts=0", "round+1", "fix_kind=none")),
+    Row("R15", ("fixing",), "ready", "reviewing", when=("fix_kind=verify",),
+        sets=("fix_kind=none", "review_closure=2", "attempts=0")),   # PD-48: fix_base is kept
     Row("R16", ("fixing",), "ready", "reviewing", when=("fix_kind=conflict",),
-        sets=("fix_kind=none", "review_closure=1")),
+        sets=("attempts=0", "fix_kind=none", "review_closure=1")),
     Row("R17", ("writing", "fixing"), "stage_failed", "open",
         sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0",
               "review_closure=0"),   # the reset branch gets a fresh first review, never a closure
         effects=("reset_branch",), stuck_on_cap=True, cause="max_attempts"),
+    Row("R17r", ("writing",), "ready_no_commits", "open",
+        sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0",
+              "review_closure=0"),
+        effects=("reset_branch",), stuck_on_cap=True, cause="max_attempts"),                # PD-53
+    Row("R15b", ("fixing",), "ready_no_commits", "blocked", when=("fix_kind=verify",),
+        sets=("asked_by=verify", "cause=ask")),                                              # PD-53, PD-62
     Row("R18", STAGE_STATES, "ask", "blocked", sets=("asked_by=stage", "cause=ask")),
     Row("R19", JOB_STATES, "setup_failed", "=", effects=("pause_setup_failed",)),
     Row("R20", JOB_STATES, "internal_error", "=", sets=("attempts+1",),
         effects=("notify_internal_error",), stuck_on_cap=True, cause="max_attempts"),
-    Row("R21", ("reviewing",), "review_clear", "verifying", sets=("review_closure=0",)),
+    Row("R21", ("reviewing",), "review_clear", "verifying", sets=("attempts=0", "review_closure=0",)),
     Row("R22a", ("reviewing",), "review_blocking", "fixing", when=("round<rounds",),
-        sets=("fix_kind=review", "review_closure=0", "fix_base=tip"), cause="review_rounds"),
+        sets=("attempts=0", "fix_kind=review", "review_closure=0", "fix_base=tip"), cause="review_rounds"),
     Row("R22b", ("reviewing",), "review_blocking", "blocked", when=("round>=rounds",),
-        sets=("asked_by=review", "cause=cap", "review_closure=0"), effects=("ask_open_findings",),
+        sets=("attempts=0", "asked_by=review", "cause=cap", "review_closure=0"), effects=("ask_open_findings",),
         cause="review_rounds"),
     Row("R23", ("blocked",), "answer", "attacking", when=("asked_by=attack",), sets=("clear_ask",),
         effects=("append_answer",)),
@@ -139,9 +151,11 @@ TABLE = (
         effects=("append_answer",)),
     Row("R27", ("blocked",), "answer", "vetting", when=("asked_by=vet",), sets=("clear_ask",),
         effects=("append_answer",)),
-    Row("R28", ("blocked",), "answer", "fixing", when=("asked_by=verify",),
+    Row("R28", ("blocked",), "answer", "fixing", when=("asked_by=verify", "cause=cap"),
         sets=("fix_kind=verify", "extra_verify_fixes+1", "clear_ask", "fix_base=tip"),
         effects=("append_answer",)),
+    Row("R28a", ("blocked",), "answer", "fixing", when=("asked_by=verify", "cause=ask"),
+        sets=("fix_kind=verify", "clear_ask", "fix_base=tip"), effects=("append_answer",)),
     Row("R29a", ("blocked",), "rework", "fixing", when=("has_branch",),
         sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip"),
         effects=("append_answer",)),
@@ -149,20 +163,23 @@ TABLE = (
         sets=("fix_kind=review", "extra_review_rounds+1", "attempts=0", "stuck_from=none", "answered=1",
               "fix_base=tip", "accepted=0"),
         effects=("append_answer",)),
-    Row("R30", ("stuck",), "rework", "@stuck_from", when=("no_branch",),
+    Row("R30", ("stuck",), "rework", "@stuck_from", when=("no_branch", "stuck_from=vetting|attacking|writing"),
         sets=("attempts=0", "stuck_from=none", "answered=1"), effects=("append_answer",)),
-    Row("R31a", ("verifying",), "verify_green", "verified", when=("merge=auto|accepted",), cause="merge"),
+    Row("R31a", ("verifying",), "verify_green", "verified", when=("merge=auto|accepted",),
+        sets=("attempts=0",), cause="merge"),
     Row("R31b", ("verifying",), "verify_green", "awaiting_accept", when=("merge=ask", "not_accepted"),
-        cause="merge"),
+        cause="merge", sets=("attempts=0",)),
     Row("R32", ("verifying",), "verify_conflict", "fixing", when=("vfix<cap",),
-        sets=("fix_kind=conflict", "verify_fixes+1", "accepted=0"), cause="max_verify_fixes"),
+        sets=("attempts=0", "fix_kind=conflict", "verify_fixes+1", "accepted=0"), cause="max_verify_fixes"),
     Row("R33", ("verifying",), "verify_red", "fixing", when=("vfix<cap",),
-        sets=("fix_kind=verify", "verify_fixes+1", "accepted=0", "fix_base=tip"), cause="max_verify_fixes"),
+        sets=("attempts=0", "fix_kind=verify", "verify_fixes+1", "accepted=0", "fix_base=tip"), cause="max_verify_fixes"),
     Row("R34a", ("verifying",), "verify_red", "blocked", when=("vfix>=cap",),
-        sets=("asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
+        sets=("attempts=0", "asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
     Row("R34b", ("verifying",), "verify_conflict", "blocked", when=("vfix>=cap",),
-        sets=("asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
+        sets=("attempts=0", "asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
     Row("R35", ("awaiting_accept",), "accept", "verified", sets=("accepted=1",)),
+    Row("R35b", ("blocked",), "accept", "verifying", when=("asked_by=verify", "cause=ask"),
+        sets=("clear_ask", "fix_kind=none")),                                                # PD-62: no `accepted`
     Row("R36", ("verified",), "ff_ok", "done", effects=("delete_branch",)),
     Row("R37", ("verified",), "ff_impossible", "verifying"),
 )
@@ -170,8 +187,8 @@ TABLE = (
 _STAGE_OF_STATE = {"vetting": "vet", "attacking": "attack", "writing": "write", "reviewing": "review",
                    "fixing": "fix"}
 _STATE_OF_STAGE = {"write": "writing", "fix": "fixing"}
-_BOOL_COLUMNS = {"accepted", "risky", "review_closure", "answered"}
-_INT_COLUMNS = {"attempts", "round", "verify_fixes"}
+_BOOL_COLUMNS = {"accepted", "risky", "answered"}
+_INT_COLUMNS = {"attempts", "round", "verify_fixes", "review_closure"}
 
 
 class _Ctx:
@@ -224,7 +241,7 @@ def _guard(name: str, c: _Ctx) -> bool:
         return c.limits.autoapprove in options
     if key == "merge":
         return any(t.accepted if o == "accepted" else c.limits.merge == o for o in options)
-    if key in ("fix_kind", "then", "asked_by", "cause"):
+    if key in ("fix_kind", "then", "asked_by", "cause", "stuck_from"):
         current = getattr(t, key)
         return any((current is None) if o == "none" else current == o for o in options)
     raise AssertionError(f"unknown guard {name!r}")
@@ -329,7 +346,7 @@ def decide(task: Task | None, event: str, limits: Limits | None, *, stage: str |
     if row.stuck_on_cap and updates["attempts"] >= c.limits.max_attempts:
         stuck = True
         to = "stuck"
-        updates["stuck_from"] = "writing" if row.rid == "R17" else task.state   # R17 reset the branch (PD-28)
+        updates["stuck_from"] = "writing" if row.rid in ("R17", "R17r") else task.state   # R17 reset the branch (PD-28)
     cause = _cause(row, c, stuck, updates.get("attempts")) if row.cause else ""
     return Transition(row.rid, event, task.state, to, updates, row.effects, cause)
 

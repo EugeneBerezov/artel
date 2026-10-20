@@ -36,11 +36,24 @@ class TemplatesTest(RepoTestCase):
         needs = {"write.md": ("$findings", "$task_history", "$title", "$body"),
                  "review.md": ("$diff_range", "$task_history"),
                  "review-closure.md": ("$closure_list", "$diff_range"),
+                 "review-verify-fix.md": ("$closure_list", "$diff_range", "$verify_log", "$task_history"),
                  "fix.md": ("$findings", "$verify_log", "$conflict_paths"),
                  "attack.md": ("$body",)}
         for name, placeholders in needs.items():
             for placeholder in placeholders:
                 self.assertIn(placeholder, T.builtin_text(name), (name, placeholder))
+
+    def test_template_names_exact(self):
+        """Mutation caught: the verify-fix template missing from (or misplaced in) the export list."""
+        self.assertEqual(T.TEMPLATE_NAMES, ("vet.md", "attack.md", "write.md", "review.md", "review-closure.md",
+                                            "review-verify-fix.md", "fix.md"))
+
+    def test_verify_fix_template_names_the_blocker_rules(self):
+        """Mutation caught: the template losing its reason to exist (what a verify-fix review blocks)."""
+        text = T.builtin_text("review-verify-fix.md")
+        for needle in ("weakens, skips, deletes or loosens", "verify or CI configuration", "special-cases",
+                       "read-only"):
+            self.assertIn(needle, text)
 
     def test_vet_template_mentions_duplicates_and_risk(self):
         text = T.builtin_text("vet.md")

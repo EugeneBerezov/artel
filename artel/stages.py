@@ -116,6 +116,12 @@ def _latest_verify_log(repo, task_id: int) -> str:
     return max(numbered)[1].read_text(encoding="utf-8", errors="replace")
 
 
+def _diff_range(task: Task) -> str:
+    if task.review_closure == 2 and task.fix_base:                  # PD-48: the verify-fix review sees the fix only
+        return f"{task.fix_base}..{task_branch(task.id)}"
+    return f"{INTEGRATION}...{task_branch(task.id)}"
+
+
 def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[str, str]) -> StagePlan:
     stage = STATE_TO_STAGE.get(task.state)
     if stage not in SUPPORTED_STAGES:
@@ -142,9 +148,10 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
             task, journal.recent_entries(board, exclude_task=task.id), areas, cfg["context_budget"])
         inputs = prompts.PromptInputs(
             task=task, stage=stage, history=history, findings=findings,
-            closure_list=open_review if template == "review-closure.md" else [], context=context,
-            verify_log=_latest_verify_log(repo, task.id) if stage == "fix" else "",
-            conflict_paths=conflict_paths, diff_range=f"{INTEGRATION}...{task_branch(task.id)}")
+            closure_list=open_review if template in ("review-closure.md", "review-verify-fix.md") else [],
+            context=context,
+            verify_log=_latest_verify_log(repo, task.id) if stage == "fix" or task.review_closure == 2 else "",
+            conflict_paths=conflict_paths, diff_range=_diff_range(task))
         prompt = prompts.render(templates.load_template(repo, cfg, template), inputs,
                                 budget=cfg["context_budget"])
         profile = "writer" if stage in ("write", "fix") else "reviewer"
@@ -284,7 +291,11 @@ def classify(task: Task, stage: str, run: StageRun, board) -> str:
     if stage in ("write", "fix"):
         if task.fix_kind == "conflict" and stage == "fix":
             return "ready" if run.merge_committed else "stage_failed"
-        return "ready" if run.new_commits else "stage_failed"                       # PD-35
+        if run.new_commits:
+            return "ready"
+        # PD-35, PD-53: a valid `ready` without commits is its own event for a write and for a verify fix;
+        # a review fix's `ready` without commits stays a failure (a failed review fix is retried in place)
+        return "ready_no_commits" if stage == "write" or task.fix_kind == "verify" else "stage_failed"
     if stage == "review":
         open_ids = {e.id: e for e in journal.open_findings(board, task.id)}
         closed = {i for i in result["closed"] if i in open_ids}                     # PD-42: other ids are ignored
@@ -336,16 +347,21 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
                                 basis=journal.truncate_utf8(finding["basis"], journal.BASIS_LIMIT), author=author)
     if event == "ask":
         journal.append(board, "ASK", _clip(result["question"]), author=author, **common)
+    if event == "ready_no_commits" and plan.stage == "fix":                       # R15b: the question for `answer`
+        journal.append(board, "ASK", _clip(f"fixer made no change: {result['summary']}"), author=author, **common)
     if event == "setup_failed":
         journal.append(board, "FAIL", f"setup {run.setup}: the stage was not started (see the setup log)",
                        author="runner", **common)
     record_denials(board, task, plan, run)
     label = {"ready": "READY", "review_clear": "PASS", "attack_clear": "PASS", "review_blocking": "FINDINGS",
-             "attack_blocker": "FINDINGS", "stage_failed": "FAIL"}.get(event)
+             "attack_blocker": "FINDINGS", "stage_failed": "FAIL",
+             "ready_no_commits": "FAIL" if plan.stage == "write" else "NOCHANGE"}.get(event)   # a verify fix is a question
     if label is not None:
         head = f"{label} {plan.stage} r{plan.round} model={plan.model} ({plan.model_reason})"
-        if event == "stage_failed":
-            if run.timed_out:
+        if event in ("stage_failed", "ready_no_commits"):
+            if event == "ready_no_commits":
+                why = "ready without new commits"
+            elif run.timed_out:
                 why = "timed out"
             elif result is None:
                 why = run.invalid_reason or "no valid result"
@@ -388,7 +404,7 @@ def _ask_open_findings(board, task_id: int, common: dict) -> None:
 def _cause_verdict(board, tr: Transition, plan: StagePlan, common: dict) -> None:
     if not tr.cause:
         return
-    if tr.to_state in ("blocked", "stuck") or tr.event in ("stage_failed", "internal_error", "review_blocking"):
+    if tr.to_state in ("blocked", "stuck") or tr.event in ("stage_failed", "internal_error", "review_blocking", "ready_no_commits"):
         word = (tr.to_state.upper() if tr.to_state in ("blocked", "stuck")
                 else "FIX" if tr.event == "review_blocking" else "RETRY")
         journal.append(board, "VERDICT", _clip(f"{word} {plan.stage} r{plan.round}: {tr.cause}"),
