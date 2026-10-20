@@ -1,7 +1,7 @@
 """`artel config`, `artel config explain KEY`, `artel config set KEY VALUE` (spec §10)."""
 from pathlib import Path
 
-from artel import config as C
+from artel import config as C, templates
 from artel.config_schema import SETTINGS, by_key, toml_literal
 from artel.errors import UsageError
 from artel.gitutil import Repo
@@ -20,6 +20,8 @@ def run(args) -> int:
         cfg = C.load_config(repo)
         for setting in SETTINGS:
             print(_line(cfg, setting.key))
+        for name in (*templates.TEMPLATE_NAMES, templates.NOTICE_NAME):
+            print(f"template {name}: {templates.template_source(repo, cfg, name)}")
         return 0
     if key is None:
         raise UsageError(f"artel config {command}: a setting key is required")

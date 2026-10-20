@@ -486,7 +486,7 @@ class CommandTest(RepoTestCase):
         return out.getvalue()
 
     def test_config_lists_every_key_with_source(self):
-        lines = self.run_cmd().splitlines()
+        lines = [l for l in self.run_cmd().splitlines() if not l.startswith("template ")]   # Task 11 appends those
         self.assertEqual(len(lines), len(S.SETTINGS))
         for s, line in zip(S.SETTINGS, lines):
             self.assertTrue(line.startswith(f"{s.key} = "), line)

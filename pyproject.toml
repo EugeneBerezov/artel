@@ -14,7 +14,7 @@ dependencies = []
 artel = "artel.cli:main"
 
 [tool.setuptools]
-packages = ["artel"]
+packages = ["artel", "artel.builtin_templates"]
 
 [tool.setuptools.package-data]
 artel = ["builtin_templates/*.md"]
