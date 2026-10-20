@@ -356,3 +356,4 @@ def delete_task_branch(repo: Repo, board, cfg, task_id: int) -> None:
 def apply_git_effects(repo: Repo, board, cfg, task_id: int, effects: Sequence[str]) -> None:
     if any(effect in ("delete_branch", "reset_branch") for effect in effects):
         delete_task_branch(repo, board, cfg, task_id)
+        board.del_meta(f"verified:{task_id}")   # PD-45: the verified commit is gone with its branch

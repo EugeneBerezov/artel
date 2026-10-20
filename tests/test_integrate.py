@@ -53,7 +53,9 @@ class IntegrateCase(RepoTestCase):
         return tid
 
     def verified_task_with_commit(self, rel):
-        return self.task_with_commit("verified", rel)
+        tid = self.task_with_commit("verified", rel)
+        self.board.set_meta(f"verified:{tid}", git(self.repo_path, "rev-parse", task_branch(tid)))   # PD-45
+        return tid
 
     def verify(self, tid, **kw):
         task = self.board.get_task(tid)
@@ -373,6 +375,52 @@ class IntegrateTaskTest(IntegrateCase):
         with self.assertRaises(T.TransitionError):
             integrate.integrate_task(self.repo, self.board, self.cfg, tid)
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)   # the state is checked first
+
+    def test_commit_after_verify_is_not_integrated_but_reverified(self):
+        """PD-45. Mutation caught: fast-forwarding to the current branch tip instead of the verified commit."""
+        tid = self.verified_task_with_commit("a.txt")
+        verified = git(self.repo_path, "rev-parse", task_branch(tid))
+        path = self.temp_worktree(task_branch(tid))
+        self.commit_file("late.txt", "after verify\n", "late commit", cwd=path)
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        before = git(self.repo_path, "rev-parse", INTEGRATION)
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "reverify")
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)   # nothing unverified got in
+        self.assertEqual(self.board.get_task(tid).state, "verifying")
+        self.assertIsNone(self.board.get_meta(f"verified:{tid}"))
+        self.assertNotEqual(git(self.repo_path, "rev-parse", task_branch(tid)), verified)
+
+    def test_missing_verified_record_means_reverify(self):
+        tid = self.verified_task_with_commit("a.txt")
+        self.board.del_meta(f"verified:{tid}")
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "reverify")
+
+    def test_finish_verify_green_stores_the_verified_commit_and_done_clears_it(self):
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.finish(tid, result)
+        self.assertEqual(self.board.get_meta(f"verified:{tid}"), result.commit)
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "done")
+        self.assertIsNone(self.board.get_meta(f"verified:{tid}"))
+
+    def test_the_verified_record_survives_accept_and_goes_with_a_reject(self):
+        self.configure(merge="ask")
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.finish(tid, result)
+        T.apply(self.board, tid, "accept", T.Limits.from_cfg(self.board.get_task(tid), self.cfg))
+        self.assertEqual(self.board.get_meta(f"verified:{tid}"), result.commit)
+        tr = T.apply(self.board, tid, "reject", T.Limits.from_cfg(self.board.get_task(tid), self.cfg))
+        slots.apply_git_effects(self.repo, self.board, self.cfg, tid, tr.effects)
+        self.assertIsNone(self.board.get_meta(f"verified:{tid}"))
+        self.assertFalse(self.repo.branch_exists(task_branch(tid)))
+
+    def test_red_verify_drops_a_stale_verified_record(self):
+        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.board.set_meta(f"verified:{tid}", "0" * 40)
+        self.finish(tid, self.verify(tid))
+        self.assertIsNone(self.board.get_meta(f"verified:{tid}"))
 
     def test_task_branch_checked_out_elsewhere_is_held(self):
         """Only the verified commit may be integrated: somebody committing on the branch holds it back."""

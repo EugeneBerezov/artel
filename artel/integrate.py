@@ -14,6 +14,10 @@ from artel.gitutil import INTEGRATION, Repo, task_branch
 
 OnStart = procs.OnStart
 _INTEGRATION_REF = f"refs/heads/{INTEGRATION}"
+
+
+def _verified_key(task_id: int) -> str:
+    return f"verified:{task_id}"
 _RUNNER = "runner"
 
 
@@ -141,6 +145,10 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
                                  last_verify=result.kind):
             raise transitions.StaleTask(f"task {task_id} changed under us (verify result)")
     tr = transitions.apply(board, task_id, _EVENT[result.kind], limits, tip=tip)
+    if result.kind == "green" and result.commit:
+        board.set_meta(_verified_key(task_id), result.commit)   # PD-45: exactly this commit may be integrated
+    elif result.kind != "setup_failed":
+        board.del_meta(_verified_key(task_id))
     log = _rel(repo, result.log_path)
     verdict = f"verify {result.kind}: {result.detail}; {tr.from_state} -> {tr.to_state} [{tr.rid}]"
     if tr.cause:
@@ -189,12 +197,17 @@ def integrate_task(repo: Repo, board, cfg, task_id: int) -> str:
     old = repo.rev(INTEGRATION)
     if tip is None or old is None:
         raise ArtelError(f"cannot integrate task {task_id}: {task_branch(task_id)} or {INTEGRATION} is missing")
-    if not repo.is_ancestor(old, tip):
+    verified = board.get_meta(_verified_key(task_id))
+    if verified is None or tip != verified or not repo.is_ancestor(old, tip):
+        # PD-45: anything committed after verify (or no record of a verified commit) is not integrated;
+        # a moved integration branch needs a fresh verify on the new merge
         transitions.apply(board, task_id, "ff_impossible", limits)
+        board.del_meta(_verified_key(task_id))
         return "reverify"
     if repo.git("update-ref", _INTEGRATION_REF, tip, old, check=False).returncode != 0:
         return "retry"   # integration moved between the read and the update: nothing changed
     tr = transitions.apply(board, task_id, "ff_ok", limits)
+    board.del_meta(_verified_key(task_id))
     text = f"integrated {tip[:12]}"
     usage = _usage_summary(board, task_id)
     if usage:
