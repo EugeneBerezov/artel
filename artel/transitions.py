@@ -270,8 +270,9 @@ def _target(row: Row, c: _Ctx) -> str:
 
 def _cause(row: Row, c: _Ctx, stuck: bool, attempts: int | None) -> str:
     t = c.task
-    if stuck:
-        return f"attempts {attempts} >= max_attempts {c.limits.max_attempts}"
+    if row.cause == "max_attempts":
+        op = ">=" if stuck else "<"
+        return f"attempts {attempts} {op} max_attempts {c.limits.max_attempts}"
     if row.cause == "autoapprove":
         return f"autoapprove={c.limits.autoapprove}"
     if row.cause == "merge":

@@ -67,11 +67,14 @@ class RowTests(unittest.TestCase):
         self.assertEqual(t.cause, "attempts 2 >= max_attempts 2")
 
     def test_R07a_attack_clear_awaits_approval_when_vet_asked_for_it(self):
-        self.check(tr("attacking", "attack_clear", task={"then": "awaiting_approval"}), "R07a",
-                   "awaiting_approval", then=None)
+        t = tr("attacking", "attack_clear", task={"then": "awaiting_approval"})
+        self.check(t, "R07a", "awaiting_approval", then=None)
+        self.assertEqual(t.effects, ("append_findings",))
 
     def test_R07b_attack_clear_opens_when_vet_said_open(self):
-        self.check(tr("attacking", "attack_clear", task={"then": "open"}), "R07b", "open", then=None)
+        t = tr("attacking", "attack_clear", task={"then": "open"})
+        self.check(t, "R07b", "open", then=None)
+        self.assertEqual(t.effects, ("append_findings",))
 
     def test_R08_approve_from_proposed_awaiting_and_vet_rejected(self):
         for state, extra in (("proposed", {}), ("awaiting_approval", {}), ("rejected", {"rejected_by": "vet"})):
@@ -81,7 +84,10 @@ class RowTests(unittest.TestCase):
             tr("rejected", "approve", task={"rejected_by": "human"})
 
     def test_R09_reject_from_every_live_state(self):
-        for state in T.LIVE:
+        spec_sources = ("proposed", "vetting", "awaiting_approval", "open", "attacking", "writing", "reviewing",
+                        "fixing", "verifying", "verified", "blocked", "stuck", "awaiting_accept")
+        self.assertEqual(set(T.LIVE), set(spec_sources))   # catches dropping stuck/awaiting_accept from LIVE
+        for state in spec_sources:
             with self.subTest(state=state):
                 t = tr(state, "reject")
                 self.check(t, "R09", "rejected", rejected_by="human")
@@ -148,7 +154,7 @@ class RowTests(unittest.TestCase):
             tr("writing", "ask")
 
     def test_R19_setup_failed_changes_nothing_but_pauses(self):
-        for state in T.JOB_STATES:
+        for state in ("vetting", "attacking", "writing", "reviewing", "fixing", "verifying"):
             with self.subTest(state=state):
                 t = tr(state, "setup_failed")
                 self.check(t, "R19", state)
@@ -160,6 +166,8 @@ class RowTests(unittest.TestCase):
         self.check(t, "R20", "verifying", attempts=1)
         self.assertEqual(t.effects, ("notify_internal_error",))
         self.check(tr("writing", "internal_error", task={"attempts": 1}), "R20", "stuck", stuck_from="writing")
+        for state in ("reviewing", "verifying", "vetting"):   # catches R20 borrowing R17's stuck_from=writing
+            self.check(tr(state, "internal_error", task={"attempts": 1}), "R20", "stuck", stuck_from=state)
 
     def test_R21_review_clear_goes_verifying(self):
         self.check(tr("reviewing", "review_clear", task={"review_closure": True}), "R21", "verifying",
@@ -266,8 +274,8 @@ class RowTests(unittest.TestCase):
         self.assertEqual(t.cause, "verify_fixes 2 >= max_verify_fixes 2")
 
     def test_R34b_conflict_at_cap_blocks_with_a_question(self):
-        self.check(tr("verifying", "verify_conflict", task={"verify_fixes": 2}), "R34b", "blocked",
-                   asked_by="verify", cause="cap")
+        self.check(tr("verifying", "verify_conflict", task={"verify_fixes": 2, "accepted": True}), "R34b",
+                   "blocked", asked_by="verify", cause="cap", accepted=False)
         self.check(tr("verifying", "verify_conflict", task={"verify_fixes": 2, "extra_verify_fixes": 0}),
                    "R34b", "blocked")
 
@@ -403,6 +411,29 @@ class MetaTests(unittest.TestCase):
         self.assertEqual(t.to_state, "verifying")
         t = tr("verifying", "verify_green", ask, task={"accepted": True})
         self.assertEqual((t.rid, t.to_state), ("R31a", "verified"))
+
+    def test_every_answering_row_clears_the_ask_and_records_the_answer(self):
+        cases = [("blocked", {"asked_by": "vet", "cause": "ask"}, "answer", {}),
+                 ("blocked", {"asked_by": "attack", "cause": "ask"}, "answer", {}),
+                 ("blocked", {"asked_by": "write", "cause": "ask"}, "answer", {}),
+                 ("blocked", {"asked_by": "fix", "cause": "ask"}, "answer", {}),
+                 ("blocked", {"asked_by": "review", "cause": "ask"}, "answer", {}),
+                 ("blocked", {"asked_by": "review", "cause": "cap"}, "answer", {"tip": "t"}),
+                 ("blocked", {"asked_by": "verify", "cause": "cap"}, "answer", {"tip": "t"}),
+                 ("blocked", {"asked_by": "review", "cause": "cap"}, "rework", {"has_branch": True, "tip": "t"}),
+                 ("stuck", {"stuck_from": "writing"}, "rework", {"has_branch": True, "tip": "t"}),
+                 ("stuck", {"stuck_from": "writing"}, "rework", {"has_branch": False})]
+        for state, fields, event, kw in cases:
+            with self.subTest(fields=fields, event=event):
+                t = tr(state, event, task=fields, **kw)
+                self.assertEqual(t.effects, ("append_answer",))
+                self.assertIs(t.updates["answered"], True)
+                if state == "blocked":
+                    self.assertEqual((t.updates["asked_by"], t.updates["cause"]), (None, None))
+
+    def test_counted_failures_below_the_cap_carry_a_cause(self):
+        t = tr("vetting", "stage_failed", task={"attempts": 0})
+        self.assertEqual(t.cause, "attempts 1 < max_attempts 2")
 
     def test_decide_is_pure(self):
         task = make_task(state="verifying", verify_fixes=0)
