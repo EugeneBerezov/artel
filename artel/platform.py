@@ -7,8 +7,8 @@ import shutil
 import signal
 import subprocess
 import sys
-import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
 
@@ -71,6 +71,7 @@ class FileLock:
 
 # --- Windows kernel32 plumbing -------------------------------------------------------------
 
+_BREAK_WARNED = False
 _JOBS: dict[int, int] = {}   # pid -> job handle (Windows only)
 
 if IS_WINDOWS:
@@ -185,14 +186,19 @@ def soft_terminate(pid: int, group: int) -> None:
             os.kill(pid, signal.CTRL_BREAK_EVENT)
         else:
             os.killpg(group, signal.SIGTERM)
-    except OSError:
-        pass
+    except OSError as exc:
+        global _BREAK_WARNED
+        if IS_WINDOWS and not _BREAK_WARNED and pid_alive(pid):   # no shared console: every stop is a hard kill
+            _BREAK_WARNED = True
+            print(f"artel: cannot send CTRL_BREAK to {pid} ({exc}); stops will be hard kills", file=sys.stderr)
 
 
-def hard_kill(pid: int, group: int) -> None:
+def hard_kill(pid: int, group: int, fingerprint: str | None = None) -> None:
     if IS_WINDOWS:
         if _close_job(pid, terminate=True):
             return
+        if fingerprint is not None and process_fingerprint(pid) != fingerprint:
+            return   # pid reused
         subprocess.run(["taskkill", "/T", "/F", "/PID", str(pid)], capture_output=True,
                        encoding="utf-8", errors="ignore")
         return
@@ -258,6 +264,28 @@ def _is_zombie(pid: int) -> bool:
     return out.stdout.strip().startswith("Z")
 
 
+def _group_has_live_member(group: int) -> bool:
+    """POSIX: is any non-zombie process still in the process group?"""
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                rest = (entry / "stat").read_text(encoding="utf-8", errors="replace").rpartition(")")[2].split()
+            except OSError:
+                continue
+            if rest[2] == str(group) and rest[0] != "Z":   # fields 3 (state), 5 (pgrp)
+                return True
+        return False
+    out = subprocess.run(["ps", "-ax", "-o", "pgid=,stat="], capture_output=True, encoding="utf-8",
+                         errors="replace", env={**os.environ, "LC_ALL": "C"})
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == str(group) and not parts[1].startswith("Z"):
+            return True
+    return False
+
+
 def process_fingerprint(pid: int) -> str | None:
     if IS_WINDOWS:
         if not pid_alive(pid):   # an open handle keeps an exited process queryable
@@ -308,26 +336,36 @@ def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None =
     while time.monotonic() < deadline:
         if not tree_alive(pid, group):
             break
-        if not IS_WINDOWS and _is_zombie(pid):
-            break   # unreaped leader (the caller's own child): killpg(0) would keep succeeding
+        if not IS_WINDOWS and _is_zombie(pid) and not _group_has_live_member(group):
+            break   # unreaped leader alone (the caller's own child): killpg(0) would keep succeeding
         time.sleep(0.05)
     # Finish with a hard kill: it sweeps stragglers that ignored the soft stop (POSIX group, Windows job)
     # and releases the job handle; it is harmless when nothing is left.
     if IS_WINDOWS or tree_alive(pid, group):
-        hard_kill(pid, group)
+        hard_kill(pid, group, current)
     return True
 
 
-def install_stop_handlers(callback: Callable[[], None]) -> None:
-    """The signal handler only hands off: `callback` runs on a helper thread, never in signal context
-    (it may print or take locks). It must be thread-safe, e.g. set an Event."""
+@dataclass
+class StopRequest:
+    count: int = 0   # signals received; the handler only increments it
+
+    def requested(self) -> bool:
+        return self.count > 0
+
+
+def install_stop_handlers() -> StopRequest:
+    """The handler does no I/O, takes no lock and starts nothing (a print, Event.set or Thread.start from
+    signal context can raise "reentrant call" or deadlock). Callers poll `requested()`."""
+    request = StopRequest()
     names = ("SIGINT", "SIGBREAK") if IS_WINDOWS else ("SIGINT", "SIGTERM")
 
     def handler(signum, frame):
-        threading.Thread(target=callback, daemon=True).start()
+        request.count += 1
 
     for name in names:
         signal.signal(getattr(signal, name), handler)
+    return request
 
 
 def which(name: str) -> str | None:
@@ -364,7 +402,7 @@ def find_git_bash() -> str:
             return str(candidate)
     found = which("bash")
     system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-    if found and system32 not in Path(found).parents:
+    if found and system32 not in Path(found).parents and "WindowsApps" not in Path(found).parts:
         return found
     raise ArtelError("cannot find bash; install Git for Windows (https://gitforwindows.org)")
 
@@ -372,19 +410,23 @@ def find_git_bash() -> str:
 def shell_argv(shell: str, command: str, *, windows: bool = IS_WINDOWS) -> list[str]:
     if shell == "auto":
         return [find_git_bash(), "-c", command] if windows else ["sh", "-c", command]
+    if shell == "bash" and windows:   # System32\bash.exe and the WindowsApps alias are WSL launchers
+        return [find_git_bash(), "-c", command]
     if shell in ("sh", "bash"):
-        if windows:   # System32\bash.exe and the WindowsApps alias are WSL launchers
-            return [find_git_bash(), "-c", command]
         return [which(shell) or shell, "-c", command]
     if shell == "pwsh":
         return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
     if shell == "cmd":
-        if windows and '"' in command:
-            # list2cmdline escapes quotes as \", which cmd.exe does not understand; no portable fix.
-            raise ArtelError("a command run through cmd cannot contain double quotes; "
-                             "use the list form or shell = \"pwsh\"")
         return ["cmd", "/d", "/s", "/c", command]
     raise ArtelError(f"unknown shell {shell!r} (expected auto, sh, bash, pwsh or cmd)")
+
+
+def command_line(argv: Sequence[str], *, windows: bool = IS_WINDOWS) -> str | list[str]:
+    """What to pass to Popen/run. list2cmdline writes \\" for a quote, which cmd.exe does not understand,
+    so a `cmd /d /s /c <command>` argv becomes a hand-built string with the command verbatim."""
+    if windows and list(argv[:4]) == ["cmd", "/d", "/s", "/c"] and len(argv) == 5:
+        return 'cmd /d /s /c "' + argv[4] + '"'
+    return list(argv)
 
 
 def prefix_argv(shell: str, prefix: str, command_argv: Sequence[str], *,
@@ -398,19 +440,26 @@ def _bat_text(text: str) -> str:
     return text.replace("%", "%%")   # cmd expands %VAR% even inside quotes
 
 
-def _write_batch(path: Path, content: str) -> None:
-    # cmd.exe reads batch files in the OEM code page, not UTF-8 (a non-ASCII profile path would break).
-    try:
-        data = content.encode("oem" if IS_WINDOWS else "utf-8")
-    except UnicodeEncodeError:
-        raise ArtelError(f"{path.name}: path not representable in the console code page")
-    path.write_bytes(data)
+def _cmd_script(command: str) -> str:
+    """PD-33: cmd.exe decodes a batch file in the console code page. Save it, switch to UTF-8 for the
+    command, restore it and exit with the command's exit code. Lines before `chcp` are ASCII."""
+    lines = [
+        "@echo off",
+        "setlocal",
+        "for /f \"tokens=2 delims=:.\" %%a in ('chcp') do set \"ARTEL_CP=%%a\"",
+        "chcp 65001 >nul",
+        command,
+        "set \"ARTEL_RC=%ERRORLEVEL%\"",
+        "chcp %ARTEL_CP% >nul",
+        "exit /b %ARTEL_RC%",
+    ]
+    return "".join(line + "\r\n" for line in lines)
 
 
 def shim_files(python: str, *, windows: bool = IS_WINDOWS) -> dict[str, str]:
     files = {"artel": f'#!/bin/sh\nexec "{python}" -m artel "$@"\n'}
     if windows:
-        files["artel.cmd"] = f'@"{_bat_text(python)}" -m artel %*\r\n'
+        files["artel.cmd"] = _cmd_script(f'"{_bat_text(python)}" -m artel %*')
     return files
 
 
@@ -418,11 +467,8 @@ def write_shim(bin_dir: Path, python: str) -> Path:
     bin_dir = Path(bin_dir)
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name, content in shim_files(python).items():
-        if name.endswith(".cmd"):
-            _write_batch(bin_dir / name, content)
-        else:
-            with open(bin_dir / name, "w", encoding="utf-8", newline="") as fh:
-                fh.write(content)
+        with open(bin_dir / name, "w", encoding="utf-8", newline="") as fh:
+            fh.write(content)
     if not IS_WINDOWS:
         (bin_dir / "artel").chmod(0o755)
     return bin_dir
@@ -436,7 +482,8 @@ def write_wrapper(stem: Path, argv: Sequence[str]) -> list[str]:
     stem = Path(stem)
     if IS_WINDOWS:
         path = stem.with_name(stem.name + ".cmd")
-        _write_batch(path, "@" + " ".join(f'"{_bat_text(a)}"' for a in argv) + " %*\r\n")
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(_cmd_script(" ".join(f'"{_bat_text(a)}"' for a in argv) + " %*"))
     else:
         path = stem
         body = "#!/bin/sh\nexec " + " ".join(shlex.quote(a) for a in argv) + ' "$@"\n'
