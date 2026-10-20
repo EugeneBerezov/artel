@@ -38,8 +38,12 @@ _TEST_MARKERS = (r"^\s*@(unittest\.)?skip\(", r"^\s*@pytest\.mark\.skip\b(?!if)"
 _VERIFY_TEST_ID_REGEX = (r"^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$", r"^PASSED (\S+)")
 _PROBE_PROFILE = ("-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
                   "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config",
-                  "--permission-mode", "default", "--max-turns", "1", "--disallowedTools",
+                  "--permission-mode", "default", "--max-turns", "1", "--tools", "", "--disallowedTools",
                   "Bash Edit Write NotebookEdit Read Glob Grep WebFetch WebSearch Task TodoWrite")
+_EDIT_TOOLS = "Bash,Edit,Write,Read,Glob,Grep"   # Task 44: no messaging, scheduling, sub-agent or web tools
+_TOOLS_NOTE = (" --tools is an allowlist: a list here replaces the whole default, so a project that needs"
+               " another tool restates the full --tools value. Write it as a TOML list: the comma form splits"
+               " \"Bash,Edit,...\" into separate arguments.")
 
 
 def _s(key, kind, default, meaning, explain, cost="", choices=(), minimum=None) -> Setting:
@@ -223,45 +227,53 @@ SETTINGS: tuple[Setting, ...] = (
     _s("commands.heavy_lock_check", "command", "", "Command that tells whether the heavy lock is free.",
        "Exit code 0 = free. Empty = artel uses its own lock only."),
     _s("commands.project_tools", "str_list", [], "Extra tool patterns the writer may use.",
-       "Substituted for {project_tools} in profiles.writer, e.g. \"Bash(npm test *)\"."),
+       "Substituted for {project_tools} in profiles.writer, e.g. \"Bash(npm test *)\". A pattern only grants"
+       " permission: its tool must also be in the profile's --tools list."),
     _s("commands.project_read_tools", "str_list", [], "Extra read-only tool patterns the reviewer may use.",
-       "Substituted for {project_read_tools} in profiles.reviewer."),
+       "Substituted for {project_read_tools} in profiles.reviewer. A pattern only grants permission: its tool"
+       " must also be in the profile's --tools list."),
     _s("profiles.common", "str_list",
        ["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose", "--json-schema", "{schema}",
         "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config",
-        "--exclude-dynamic-system-prompt-sections", "--append-system-prompt-file", "{unattended_notice}"],
+        "--exclude-dynamic-system-prompt-sections", "--append-system-prompt-file", "{unattended_notice}",
+        "--setting-sources", "project,local"],
        "Agent arguments shared by every stage.",
-       "The prompt goes on stdin. " + _PLACEHOLDERS + " --setting-sources is deliberately absent; add"
-       " \"--setting-sources\", \"project,local\" to ignore user-level settings.",
+       "The prompt goes on stdin. " + _PLACEHOLDERS + " --setting-sources project,local keeps user-level"
+       " settings (MCP servers, skills, hooks, plugins) out of unattended agents; the probe takes only this"
+       " pair from here. A list here replaces the whole default; write it as a TOML list (the comma form splits"
+       " \"project,local\").",
        cost="Changing these changes every agent run."),
     _s("profiles.writer", "str_list",
-       ["--permission-mode", "acceptEdits", "--allowedTools",
+       ["--permission-mode", "acceptEdits", "--tools", _EDIT_TOOLS, "--allowedTools",
         "Bash(artel note *) Bash(artel add *) Bash(artel heavy *) Bash(git add *) Bash(git commit *)"
         " Bash(git status *) Bash(git diff *)", "{project_tools}"],
        "Extra arguments for writer and fix stages.",
-       "Always passes --permission-mode explicitly. " + _PLACEHOLDERS,
+       "Always passes --permission-mode explicitly. " + _PLACEHOLDERS + _TOOLS_NOTE,
        cost="Wider permissions let a writer do more per run, and more damage."),
     _s("profiles.reviewer", "str_list",
-       ["--permission-mode", "acceptEdits", "--allowedTools",
+       ["--permission-mode", "acceptEdits", "--tools", _EDIT_TOOLS, "--allowedTools",
         "Bash(artel note *) Bash(artel heavy *) Bash(git diff *) Bash(git log *) Bash(git show *)"
         " Bash(git status *)", "{project_tools}", "{project_read_tools}", "--disallowedTools",
         "Bash(git * --output*)"],
        "Extra arguments for review stages: may write probe files and run project checks, never commits.",
        "acceptEdits lets a reviewer write probe files and run project checks through `artel heavy`; it has no"
-       " git add or git commit. " + _PLACEHOLDERS,
+       " git add or git commit. " + _PLACEHOLDERS + _TOOLS_NOTE,
        cost="Probes make reviews longer and catch defects green tests miss."),
     _s("profiles.attacker", "str_list",
-       ["--permission-mode", "default", "--disallowedTools", "Edit Write NotebookEdit Bash(git * --output*)",
+       ["--permission-mode", "default", "--tools", "Bash,Read,Glob,Grep",
+        "--disallowedTools", "Edit Write NotebookEdit Bash(git * --output*)",
         "--allowedTools",
         "Bash(artel note *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *)",
         "{project_read_tools}"],
        "Extra arguments for vet and attack stages (read-only).",
-       "Read-only: permission mode default plus a deny list for edit tools. " + _PLACEHOLDERS,
+       "Read-only: permission mode default, a --tools list without edit tools, plus a deny list for edit tools"
+       " and `git --output` (a Bash pattern --tools cannot express). " + _PLACEHOLDERS + _TOOLS_NOTE,
        cost="Attackers that cannot read enough produce weaker reviews."),
     _s("profiles.probe", "str_list", list(_PROBE_PROFILE),
        "Arguments of the limit probe: one turn, no tools, no schema, no notice.",
        "Used instead of profiles.common for the probe call (PD-55). {model} is models.probe. Keep --max-turns 1"
-       " and the --disallowedTools list: a probe must cost almost nothing.",
+       " and both fences, --tools \"\" (no tools at all) and the --disallowedTools list: a probe must cost almost"
+       " nothing. Keep it a list: an empty item cannot be written in the comma form.",
        cost="One tiny call per probe."),
     _s("notify.on", "enum_list",
        ["blocked", "stuck", "awaiting_accept", "paused", "resumed", "runner_stopped", "error"],
