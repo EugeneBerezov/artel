@@ -126,7 +126,7 @@ runs again later, with no counter. Every transition not in the table is an error
 | verifying | verify green **on its first run** (on every run, for a task with an earlier red job — §5 step 7), and `merge=auto` with no guard forcing `merge=ask` (protected path, test guard — §4; empty verify — below) — or the task was `accept`ed from `awaiting_accept` | verified | |
 | verifying | verify green only on a rerun, or — for a task with an earlier red job — green on some runs and red on others (`flaky` — always, even if the task was `accept`ed) | awaiting_accept | slot freed; the branch keeps the verified commit; FAIL entry with the red log path; the VERDICT says `flaky` |
 | verifying | verify green on its first run, `merge=ask` or a guard forces it (§4 protected paths, test guard; empty verify), not `accept`ed | awaiting_accept | slot freed; the branch keeps the verified commit; the VERDICT names the reason and the setting |
-| verifying | verify red (not a timeout), reruns left in this verify job (`verify_reruns`) | same state | the whole verify runs again on the same merged tree (§5 step 7) |
+| verifying | verify red (not a timeout), reruns left in this verify job (`verify_reruns`) — for a `red_seen` task also after a green run | same state | the whole verify runs again on the same merged tree (§5 step 7) |
 | verifying | merge conflict, `verify_fixes < max_verify_fixes` | fixing (`fix_kind=conflict`) | `verify_fixes += 1`; the runner leaves the merge in progress (`merge --no-commit`) for the agent to resolve and commit |
 | verifying | verify red after its reruns, and `artel/integration` alone is red too (§5 step 7) — checked before the cap | same state | no counter, no fixer; `running` cleared; board paused (`base_conflict`), notify |
 | verifying | verify red after its reruns (`artel/integration` alone green), or `verify_timeout` (no base check: a timeout says nothing about the base), `verify_fixes < max_verify_fixes` | fixing (`fix_kind=verify`) | `verify_fixes += 1` |
@@ -195,9 +195,9 @@ next tick through the table above. Without a running runner, requests wait;
 `artel status` lists them.
 Every process the runner starts (agents, `setup`, `verify`, probes, and what
 they run) carries `ARTEL_CHILD=1` in its environment. Human commands, `artel
-run` and a human `artel add` refuse to run under it, and also when their
-working directory is inside `slots_dir` (test runners that scrub the
-environment keep the directory): an agent, a test or a
+run` and a human `artel add` refuse to run under it (only the variable
+decides: the slots are also where the project's own tests run, so a
+working-directory rule would refuse legitimate test calls): an agent, a test or a
 setup script cannot answer, accept, approve, resume or add work in the
 human's name by mistake. This guards against confused agents, not against
 hostile code, which runs as the same OS user and could write the board
@@ -216,7 +216,7 @@ removes another kind. Kinds:
 | Kind | Cause | Ends |
 |---|---|---|
 | `manual` | `artel pause` | `resume` |
-| `base_conflict` | base merge conflicts or its verify is red (§5); or `artel/integration` alone is red before a verify fix (§5 step 7) | `resume` after the human fixed `artel/integration` or the environment; `resume` forgets every cached base result, so the base is verified again before the board can pause on it again |
+| `base_conflict` | base merge conflicts or its verify is red (§5); or `artel/integration` alone is red before a verify fix (§5 step 7) | `resume` after the human fixed `artel/integration` or the environment; `resume` forgets every cached base-check result (not the recorded test ids, §4), so the base is verified again before the board can pause on it again |
 | `integration_moved` | `artel/integration` is not at the commit the runner last left it (§5 step 8) | `resume` (the runner then records the current tip) |
 | `failures` | the failure breaker (§5 step 6) | `resume` (resets the breaker count) |
 | `limit` | usage limit reported by the agent CLI (§5 step 5) | by itself at the reset time; without one, when a probe passes (§5 step 5); after `limit_probes` failed probes, `resume` |
@@ -327,7 +327,10 @@ a snapshot: every ref under `refs/heads/artel/`, `refs/stash` and
 slot's `config.worktree`, the worktree list, and `git status` of every slot
 that had no job during the stage. Refs of tasks that had a job of their own
 during the stage are left out (their agents move them), and so is
-`artel/integration` (the runner checks it itself, §5 step 8). For a vet,
+`artel/integration` (the runner checks it itself, §5 step 8), and so is every ref the runner
+itself moved or deleted during the stage (integrating, rejecting,
+accepting, resetting or deleting another task's branch) and every slot it
+added; the runner keeps that record. For a vet,
 attack or review stage the task's own branch and the slot's `HEAD` must
 also be unchanged; a writer or fixer may only add commits to its own
 branch. On any other change the runner restores what it can (refs set back
@@ -371,10 +374,14 @@ protected path) only on **hard signals**:
   The verify command must print ids (`-v`); totals are not enough, because
   `Ran N tests` counts skipped tests and new tests hide removed ones. No
   recorded ids for the tip (a fresh board, a tip a human repaired) → no id
-  check, and `artel status` says so;
+  check, and the task's VERDICT says `test-id check off: no ids recorded
+  for <sha>` (`artel status` too, once it exists). The ids are kept per
+  sha and only for green verifies: a later red result for the same sha, or
+  `resume` forgetting the base-check cache, never removes them;
 - a matching file whose diff removes more lines containing an assertion
   marker (`test_assert_markers`: `assert`, `expect(` by default) than it
-  adds;
+  adds; comment lines (starting with `#`, `//`, `/*` or `*`) count on
+  neither side, so commenting an assertion out is a removal;
 - an added line in a matching file that matches one of `test_markers`
   (regexes): an unconditional skip, `.only(`, an added `xfail` or expected
   failure, `os._exit` — conditional skips (`skipIf`, platform checks) and
@@ -574,7 +581,8 @@ Loop:
    the cheap signal. Base red → no fix and no counter: the task stays
    `verifying` and the board pauses `base_conflict` naming the red log,
    because no task fix can repair a red base; the first red task finds it
-   and the rest wait. `resume` forgets the cache (§3.1 Pauses). Base green →
+   and the rest wait. `resume` forgets the cache (§3.1 Pauses), not the
+   recorded test ids, which are a separate record (§4). Base green →
    the verify-fix rows of §3.1. The ids of the tests each green verify
    passed (`verify_test_id_regex`) are stored with it for the test guard
    (§4). Each verify run is a `runs` row (stage
@@ -810,10 +818,11 @@ protected_paths = [".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "art
 test_paths = ["tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
               "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*"]
 test_markers = ['^\s*@(unittest\.)?skip\(', '^\s*@pytest\.mark\.skip\b(?!if)', '\b(it|test|describe)\.skip\(',
-                '\bx(it|describe|test)\(', '\.only\(', 'xfail', '@(unittest\.)?expectedFailure', 'os\._exit\(']
+                '\bx(it|describe|test)\(', '\.only\(', 'pytest\.mark\.xfail', '\bxfail\(', '@(unittest\.)?expectedFailure',
+                'os\._exit\(']
                                   # regexes on added lines of test_paths files → ask (§4); not conditional skips
 test_assert_markers = ["assert", "expect("]   # a test file losing more of these lines than it gains → ask
-verify_test_id_regex = ['^(\w+ \([\w.]+\))(?:\n[^\n]*)? \.\.\. ok$', '^PASSED (\S+)']
+verify_test_id_regex = ['^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$', '^PASSED (\S+)']
                                   # ids of passed tests (unittest -v, pytest -rA); verify must print them
 base_cache_ttl = "6h"             # a cached green base verify older than this is verified again
 shadow_verify = true              # verify the reviewed commit when a review finds a blocker/major (no tokens)
