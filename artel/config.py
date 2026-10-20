@@ -393,4 +393,8 @@ def set_value(path: Path, key: str, raw: str) -> None:
     tmp = path.with_name(path.name + ".tmp")   # same directory: os.replace is atomic
     with open(tmp, "w", encoding="utf-8", newline="") as f:
         f.write(bom + updated)
-    os.replace(tmp, path)
+    try:
+        os.replace(tmp, path)
+    except OSError:
+        tmp.unlink(missing_ok=True)   # never leave artel.toml.tmp dirtying the tree
+        raise
