@@ -4,7 +4,8 @@ Dev tool (not part of the `artel` package). Python >= 3.11 (`python3`), stdlib o
 State lives in `<git-common-dir>/artel-dev/` (`board.json`, `journal.md`, `cursors/<session>`, lock files), shared by all worktrees. Every mutation takes an exclusive flock. Global option: `--repo DIR` (default `.`).
 
     python3 dev/board.py init --from docs/plan.md [--force]   # parse tasks; --force moves board, journal and cursors to artel-dev/backup-<time>/ and starts clean
-    python3 dev/board.py claim --session S                    # next task (lowest wave, then id, deps done); exit 3 if none
+    python3 dev/board.py claim --session S [--review-only]    # a cross-review of the other session's merge first, else next task (lowest wave, then id, deps done and cross-reviewed); exit 3 if none
+    python3 dev/board.py review ID --verdict pass|fail --reason R --session S   # cross-review verdict; fail reopens the task
     python3 dev/board.py release ID [--reason R]              # back to open
     python3 dev/board.py fail ID --reason R                   # back to open; stuck after 2 fails
     python3 dev/board.py note FACT|FAIL|NOTE|SPEC-GAP ID TEXT [--basis B] [--session S]   # text <= 400 B, basis <= 200 B

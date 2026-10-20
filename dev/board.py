@@ -309,6 +309,69 @@ def describe(board, t, session):
     ])
 
 
+def dep_ok(t):
+    """A dependency counts once merged and not waiting on a cross-review."""
+    return t["state"] == "done" and t.get("review") in (None, "pass")
+
+
+def _review_for(tasks, session, review_only):
+    """The cross-review this session holds, or the next one it may take.
+
+    A session never reviews its own merge. A session holding a claimed task
+    finishes it first (unless review_only).
+    """
+    pending = [t for t in tasks if t["state"] == "done"
+               and t.get("review") == "pending"
+               and t.get("author") != session]
+    mine = [t for t in pending if t.get("reviewer") == session]
+    if mine:
+        return mine[0]
+    if not review_only and any(t["state"] == "claimed"
+                               and t["session"] == session for t in tasks):
+        return None
+    free = [t for t in pending if not t.get("reviewer")]
+    return min(free, key=lambda t: (t["wave"], t["id"])) if free else None
+
+
+def describe_review(board, t):
+    lo, hi = t["plan_lines"]
+    return "\n".join([
+        "kind: review",
+        "id: %d" % t["id"],
+        "title: %s" % t["title"],
+        "risky: %s" % ("yes" if t["risky"] else "no"),
+        "author: %s" % t.get("author", "-"),
+        "merge: %s" % t["merge_sha"],
+        "diff: git diff %s^1 %s" % (t["merge_sha"], t["merge_sha"]),
+        "plan: %s:%d-%d" % (board["source"], lo, hi),
+        "verdict: board.py review %d --verdict pass|fail --reason R "
+        "--session <you>" % t["id"],
+    ])
+
+
+def cmd_review(args):
+    session = check_session(args.session)
+    store = Store(args.repo)
+    with store.lock():
+        board = store.load()
+        t = find_task(board, args.id)
+        if t["state"] != "done" or t.get("review") != "pending":
+            raise BoardError("T%d has no pending review" % args.id)
+        if t.get("reviewer") != session:
+            raise BoardError("T%d review is held by %s, not %s" % (
+                args.id, t.get("reviewer") or "nobody", session))
+        if args.verdict == "pass":
+            t["review"] = "pass"
+            store.journal(session, "REVIEW-PASS", args.id, args.reason,
+                          basis=t["merge_sha"])
+        else:
+            t["state"], t["merge_sha"], t["review"] = "open", None, None
+            t["reviewer"] = None
+            store.journal(session, "REVIEW-FAIL", args.id, args.reason)
+        store.save(board)
+    print("T%d review %s" % (args.id, args.verdict))
+
+
 def cmd_claim(args):
     session = check_session(args.session)
     store = Store(args.repo)
@@ -320,9 +383,23 @@ def cmd_claim(args):
             if t["state"] == "claimed" and t["session"] == session:
                 print(describe(board, t, session))
                 return 0
+        review = _review_for(tasks, session, args.review_only)
+        if review is not None:
+            if review.get("reviewer") != session:
+                review["reviewer"] = session
+                store.save(board)
+                store.journal(session, "REVIEW", review["id"],
+                              "cross-review of %s's merge"
+                              % review.get("author", "-"),
+                              basis=review["merge_sha"])
+            print(describe_review(board, review))
+            return 0
+        if args.review_only:
+            print("no review pending for %s" % session, file=sys.stderr)
+            return EXIT_NOTHING
         cands = [t for t in tasks if t["state"] == "open"
                  and not t["controller"]
-                 and all(by_id[d]["state"] == "done" for d in t["deps"])]
+                 and all(dep_ok(by_id[d]) for d in t["deps"])]
         if not cands:
             print(_nothing_claimable(tasks, by_id), file=sys.stderr)
             return EXIT_NOTHING
@@ -386,6 +463,7 @@ def cmd_reopen(args):
             t["fails"] = 0
         t["state"], t["merge_sha"] = "open", None
         t["session"], t["claimed_at"] = None, None
+        t["review"], t["reviewer"] = None, None
         store.save(board)
         store.journal(who, "REOPEN", args.id, args.reason)
         held = [d for d in board["tasks"] if args.id in d["deps"]
@@ -406,6 +484,9 @@ def _nothing_claimable(tasks, by_id):
             dep = by_id[d]
             if dep["state"] == "claimed":
                 held.setdefault(dep["id"], dep["session"])
+            elif dep["state"] == "done" and not dep_ok(dep):
+                held.setdefault(dep["id"], "review by %s" % (
+                    dep.get("reviewer") or "the other session"))
     parts = []
     if held:
         parts.append("nothing claimable: tasks are waiting on dependencies "
@@ -528,7 +609,10 @@ def cmd_status(args):
             title = title[:43] + "…"
         flags = ("yes" if t["risky"] else "") + (
             " ctrl" if t["controller"] else "")
-        rows.append(("T%d" % t["id"], "W%d" % t["wave"], title, t["state"],
+        state = t["state"]
+        if state == "done" and t.get("review") == "pending":
+            state = "review(%s)" % (t.get("reviewer") or "-")
+        rows.append(("T%d" % t["id"], "W%d" % t["wave"], title, state,
                      t["session"] or "-", flags.strip() or "-"))
     widths = [max(len(r[i]) for r in rows) for i in range(6)]
     for r in rows:
@@ -649,6 +733,7 @@ def cmd_integrate(args):
                       file=sys.stderr)
             t["state"], t["merge_sha"] = "done", sha
             t["session"], t["claimed_at"] = None, None
+            t["author"], t["review"], t["reviewer"] = session, "pending", None
             store.save(board)
             store.journal(session, "DONE", args.id,
                           "merged %s into main" % args.branch, basis=sha)
@@ -786,9 +871,18 @@ def build_parser():
     s.add_argument("--session")
     s.set_defaults(fn=cmd_reopen)
 
-    s = sub.add_parser("claim", help="take the next claimable task")
+    s = sub.add_parser("claim", help="take the next cross-review or task")
     s.add_argument("--session", required=True)
+    s.add_argument("--review-only", action="store_true",
+                   help="only take a cross-review (controller)")
     s.set_defaults(fn=cmd_claim)
+
+    s = sub.add_parser("review", help="verdict on a held cross-review")
+    s.add_argument("id", type=int)
+    s.add_argument("--verdict", choices=("pass", "fail"), required=True)
+    s.add_argument("--reason", required=True)
+    s.add_argument("--session", required=True)
+    s.set_defaults(fn=cmd_review)
 
     s = sub.add_parser("release", help="give a task back")
     s.add_argument("id", type=int)
