@@ -107,6 +107,19 @@ class GitutilMoreTest(RepoTestCase):
         self.assertEqual(repo.rev("v-test"), head)
         self.assertIsNone(repo.rev(git(self.repo_path, "rev-parse", "HEAD^{tree}")))
 
+    def test_discover_error_carries_gits_own_message(self):
+        """Mutation caught: the opaque 'not inside a git repository' that hid 'dubious ownership' (CI, twice)."""
+        fake = mock.Mock(returncode=128, stdout="", stderr="fatal: detected dubious ownership in repository at 'X'\n")
+        with mock.patch.object(gitutil, "_run", return_value=fake):
+            with self.assertRaises(ArtelError) as cm:
+                gitutil.Repo.discover(self.repo_path)
+        self.assertIn("not inside a git repository", str(cm.exception))
+        self.assertIn("dubious ownership", str(cm.exception))
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:   # a real non-repository still reads well
+            with self.assertRaises(ArtelError) as cm:
+                gitutil.Repo.discover(Path(d))
+        self.assertTrue(str(cm.exception).startswith("not inside a git repository"))
+
     def test_git_missing_raises_artel_error(self):
         """Mutation caught: a missing git reported as 'not inside a git repository' / a leaked FileNotFoundError."""
         repo = self.repo()
