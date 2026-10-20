@@ -8,6 +8,7 @@ import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -457,21 +458,79 @@ def _cmd_script(command: str) -> str:
     return "".join(line + "\r\n" for line in lines)
 
 
-def shim_files(python: str, *, windows: bool = IS_WINDOWS) -> dict[str, str]:
-    files = {"artel": f'#!/bin/sh\nexec "{python}" -m artel "$@"\n'}
+# ROOT goes first only when it is not already on sys.path (a pip-installed artel: site-packages must not
+# shadow the stdlib)
+SHIM_CODE = ("import sys; p = sys.argv.pop(1); p in sys.path or sys.path.insert(0, p); "
+             "from artel.cli import main; raise SystemExit(main())")
+
+
+def _sh_path(path: str, windows: bool) -> str:
+    """A path as Git Bash reads it: forward slashes, C:\\x -> C:/x (the /c/x form breaks under MSYS_NO_PATHCONV),
+    a UNC path \\\\h\\s -> //h/s. POSIX paths are only quoted."""
     if windows:
-        files["artel.cmd"] = _cmd_script(f'"{_bat_text(python)}" -m artel %*')
+        path = path.replace("\\", "/")
+    return shlex.quote(path)
+
+
+def _cmd_arg(text: str) -> str:
+    text = _bat_text(text)
+    text += text[len(text.rstrip("\\")):]   # a trailing backslash would escape the closing quote (D:\ at a drive root)
+    return '"' + text + '"'   # inside double quotes only % is special to cmd.exe
+
+
+def shim_files(python: str, root: str, *, zipapp: bool = False, windows: bool = IS_WINDOWS) -> dict[str, str]:
+    """The `artel` on the agent's PATH: the runner's own Python, isolated (-I: no cwd, no PYTHONPATH, no user
+    site), with the runner's artel location baked in, so nothing in a slot can stand in for it (spec §6).
+    -X utf8 keeps UTF-8 I/O although -I ignores PYTHONIOENCODING and PYTHONUTF8."""
+    py, rt = _sh_path(python, windows), _sh_path(root, windows)
+    if zipapp:
+        files = {"artel": f'#!/bin/sh\nexec {py} -X utf8 -I {rt} "$@"\n'}
+    else:
+        files = {"artel": f"#!/bin/sh\nexec {py} -X utf8 -I -c {shlex.quote(SHIM_CODE)} {rt} \"$@\"\n"}
+    if windows:
+        if zipapp:
+            line = f"{_cmd_arg(python)} -X utf8 -I {_cmd_arg(root)} %*"
+        else:
+            line = f"{_cmd_arg(python)} -X utf8 -I -c {_cmd_arg(SHIM_CODE)} {_cmd_arg(root)} %*"
+        files["artel.cmd"] = _cmd_script(line)
     return files
 
 
-def write_shim(bin_dir: Path, python: str) -> Path:
+def _replace_retrying(tmp: Path, target: Path) -> None:
+    for attempt in range(5):
+        try:
+            os.replace(tmp, target)
+            return
+        except PermissionError:   # Windows: cmd.exe may hold artel.cmd open in another slot
+            if attempt == 4:
+                raise
+            time.sleep(0.2)
+
+
+def write_shim(bin_dir: Path, python: str, root: str, *, zipapp: bool = False) -> Path:
+    """Writes a file only when its content differs, atomically (temp file in bin_dir + os.replace)."""
     bin_dir = Path(bin_dir)
     bin_dir.mkdir(parents=True, exist_ok=True)
-    for name, content in shim_files(python).items():
-        with open(bin_dir / name, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
-    if not IS_WINDOWS:
-        (bin_dir / "artel").chmod(0o755)
+    for name, content in shim_files(python, root, zipapp=zipapp).items():
+        target = bin_dir / name
+        try:
+            with open(target, encoding="utf-8", newline="") as fh:
+                if fh.read() == content:
+                    if not IS_WINDOWS and name == "artel":
+                        target.chmod(0o755)   # a lost exec bit is repaired without touching the content
+                    continue
+        except OSError:
+            pass
+        fd, tmp_name = tempfile.mkstemp(dir=bin_dir, prefix=name + ".", suffix=".tmp")
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
+            if not IS_WINDOWS and name == "artel":
+                tmp.chmod(0o755)
+            _replace_retrying(tmp, target)
+        finally:
+            tmp.unlink(missing_ok=True)
     return bin_dir
 
 

@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -7,6 +8,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from artel import platform as P
 from artel.errors import ArtelError
@@ -345,21 +347,191 @@ class ShimTest(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.tmp = Path(self._tmp.name)
 
-    def test_shim_files_posix_and_windows(self):
-        posix = P.shim_files("/usr/bin/python3", windows=False)
-        self.assertEqual(posix, {"artel": '#!/bin/sh\nexec "/usr/bin/python3" -m artel "$@"\n'})
-        win = P.shim_files("C:\\Py\\python.exe", windows=True)
-        self.assertEqual(win["artel"], '#!/bin/sh\nexec "C:\\Py\\python.exe" -m artel "$@"\n')
+    def test_cmd_shim_text(self):
+        """Mutation caught: ROOT spliced into the code string, `-I`/`-X utf8` dropped, unquoted or unescaped
+        arguments, LF line endings, `%*` missing."""
+        win = P.shim_files("C:\\Py\\python.exe", "C:\\100%\\src", windows=True)
         cmd = win["artel.cmd"]
         self.assertIn("chcp 65001 >nul", cmd)                      # PD-33 preamble
-        self.assertIn('set "ARTEL_CP=%%a"', cmd)                    # save ...
-        self.assertIn("chcp %ARTEL_CP% >nul", cmd)                  # ... and restore the code page
-        self.assertIn('"C:\\Py\\python.exe" -m artel %*\r\n', cmd)
+        self.assertIn('set "ARTEL_CP=%%a"', cmd)
+        self.assertIn("chcp %ARTEL_CP% >nul", cmd)
+        line = f'"C:\\Py\\python.exe" -X utf8 -I -c "{P.SHIM_CODE}" "C:\\100%%\\src" %*\r\n'
+        self.assertIn(line, cmd)
         self.assertTrue(cmd.rstrip().endswith("exit /b %ARTEL_RC%"))
-        self.assertLess(cmd.index("chcp 65001"), cmd.index("-m artel"))
+        self.assertLess(cmd.index("chcp 65001"), cmd.index("-X utf8"))
         self.assertNotIn("\n", cmd.replace("\r\n", ""))
-        pct = P.shim_files("C:\\100%\\python.exe", windows=True)["artel.cmd"]
-        self.assertIn('"C:\\100%%\\python.exe" -m artel', pct)
+        self.assertNotIn('"', P.SHIM_CODE)
+        self.assertNotIn("%", P.SHIM_CODE)
+        self.assertNotIn("100", P.SHIM_CODE)                       # the root is an argument, not part of the code
+
+    def test_cmd_shim_quotes_code_with_double_quotes(self):
+        """Mutation caught: single quotes around the code (cmd.exe does not honour them)."""
+        cmd = P.shim_files("C:\\Py\\python.exe", "C:\\r", windows=True)["artel.cmd"]
+        self.assertIn(f'-c "{P.SHIM_CODE}"', cmd)
+        self.assertNotIn(f"-c '{P.SHIM_CODE}'", cmd)
+
+    def test_sh_shim_text_and_git_bash_paths(self):
+        """Mutation caught: Windows paths left with backslashes, or as /c/x (breaks under MSYS_NO_PATHCONV); ROOT inside the quoted code."""
+        posix = P.shim_files("/usr/bin/python3", "/src/artel", windows=False)
+        self.assertEqual(list(posix), ["artel"])
+        self.assertEqual(posix["artel"], "#!/bin/sh\nexec /usr/bin/python3 -X utf8 -I -c "
+                         f"'{P.SHIM_CODE}' /src/artel \"$@\"\n")
+        win = P.shim_files("C:\\Py\\python.exe", "C:\\a b\\x", windows=True)["artel"]
+        self.assertIn("exec C:/Py/python.exe -X utf8 -I -c", win)
+        self.assertIn("'C:/a b/x' \"$@\"", win)
+        unc = P.shim_files("\\\\h\\s\\python.exe", "\\\\h\\s\\src", windows=True)["artel"]
+        self.assertIn("exec //h/s/python.exe", unc)
+        self.assertIn(" //h/s/src ", unc)
+
+    def test_shim_code_adds_root_only_when_not_on_sys_path(self):
+        """Mutation caught: an unconditional insert(0) (site-packages ahead of the stdlib for a pip install)."""
+        code = P.SHIM_CODE.replace("from artel.cli import main; raise SystemExit(main())", "print(sys.path[:2])")
+        probe = lambda root, extra: subprocess.run(  # noqa: E731
+            [sys.executable, "-I", "-c", code, root], capture_output=True, encoding="utf-8",
+            env={**os.environ, "PYTHONPATH": ""}).stdout
+        self.assertTrue(probe("/fresh/root", "").startswith("['/fresh/root'"))
+        prog = ("import sys, runpy; sys.path.append('/known'); sys.argv = ['-c', '/known']; "
+                f"exec({code!r}.replace('print(sys.path[:2])', 'print(sys.path.count(\"/known\"), sys.path[0] == \"/known\")'))")
+        out = subprocess.run([sys.executable, "-I", "-c", prog], capture_output=True, encoding="utf-8").stdout
+        self.assertEqual(out.strip(), "1 False")
+        self.assertNotIn('"', P.SHIM_CODE)
+        self.assertNotIn("%", P.SHIM_CODE)
+
+    def test_cmd_shim_root_ending_in_backslash(self):
+        """Mutation caught: `"D:\\"` (a drive-root checkout): the backslash escapes the closing quote."""
+        cmd = P.shim_files("C:\\py.exe", "D:\\", windows=True)["artel.cmd"]
+        self.assertIn(f'"{P.SHIM_CODE}" "D:\\\\" %*', cmd)
+
+    def test_write_shim_repairs_a_lost_exec_bit(self):
+        if P.IS_WINDOWS:
+            self.skipTest("no exec bit")
+        bin_dir = P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        (bin_dir / "artel").chmod(0o644)
+        P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        self.assertTrue(os.access(bin_dir / "artel", os.X_OK))
+
+    def test_zipapp_shim_text(self):
+        """Mutation caught: the source form (`-c ... artel.cli`) used for a .pyz."""
+        sh = P.shim_files("/py", "/x/artel.pyz", zipapp=True, windows=False)["artel"]
+        self.assertEqual(sh, '#!/bin/sh\nexec /py -X utf8 -I /x/artel.pyz "$@"\n')
+        cmd = P.shim_files("C:\\py.exe", "C:\\x\\artel.pyz", zipapp=True, windows=True)["artel.cmd"]
+        self.assertIn('"C:\\py.exe" -X utf8 -I "C:\\x\\artel.pyz" %*', cmd)
+        self.assertNotIn("-c", cmd.split("chcp 65001 >nul")[1])
+
+    def slot_with(self, **modules: str) -> Path:
+        slot = self.tmp / "slot"
+        (slot / "artel").mkdir(parents=True, exist_ok=True)
+        (slot / "artel" / "__init__.py").write_text("", encoding="utf-8")
+        (slot / "artel" / "cli.py").write_text("print('SLOT')\n", encoding="utf-8")
+        for name, text in modules.items():
+            (slot / name).write_text(text, encoding="utf-8")
+        return slot
+
+    def run_shim(self, slot: Path, *args: str, root: str = str(REPO_ROOT), **env_extra: str):
+        shim = P.shim_invocation(P.write_shim(self.tmp / "bin", sys.executable, root))
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONPATH"}   # the shim adds nothing itself
+        env.update(PYTHONIOENCODING="utf-8", **env_extra)
+        return subprocess.run(shim + list(args), cwd=slot, env=env, capture_output=True, encoding="utf-8",
+                              errors="replace")
+
+    def test_shim_runs_runner_artel_not_slot_package(self):
+        """Mutation caught: `python -m artel` (the slot's artel/ package would run)."""
+        res = self.run_shim(self.slot_with(), "--help")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("SLOT", res.stdout + res.stderr)
+        self.assertIn("usage", res.stdout.lower())
+
+    def test_shim_slot_stdlib_shadow_is_ignored(self):
+        """Mutation caught: dropping -I (the cwd would be on sys.path and argparse.py would run)."""
+        slot = self.slot_with(**{"argparse.py": "print('SLOT')\nraise SystemExit(9)\n"})
+        res = self.run_shim(slot, "--help")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("SLOT", res.stdout + res.stderr)
+
+    def test_shim_ignores_empty_pythonpath_entry(self):
+        """Mutation caught: -P instead of -I (an empty PYTHONPATH entry means the cwd)."""
+        slot = self.slot_with(**{"argparse.py": "print('SLOT')\nraise SystemExit(9)\n"})
+        res = self.run_shim(slot, "--help", PYTHONPATH=os.pathsep)
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("SLOT", res.stdout + res.stderr)
+
+    def test_shim_ignores_pythonpath_pointing_at_slot(self):
+        """Mutation caught: dropping both -I and -E (e.g. -P alone) while the slot is on PYTHONPATH."""
+        slot = self.slot_with(**{"argparse.py": "print('SLOT')\nraise SystemExit(9)\n"})
+        res = self.run_shim(slot, "--help", PYTHONPATH=str(slot))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertNotIn("SLOT", res.stdout + res.stderr)
+
+    def test_shim_root_with_special_characters(self):
+        """Mutation caught: ROOT spliced into the code string, or double-quoted in sh."""
+        name = "a b'c%d&e \u00fc" if P.IS_WINDOWS else "a b'c\"d$e"
+        root = self.tmp / name
+        shutil.copytree(REPO_ROOT / "artel", root / "artel", ignore=shutil.ignore_patterns("__pycache__"))
+        res = self.run_shim(self.slot_with(), "--version", root=str(root))
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(res.stdout.strip(), "0.1.0")
+
+    def test_shim_passes_arguments_and_exit_code(self):
+        res = self.run_shim(self.slot_with(), "add")   # argparse error: missing title
+        self.assertEqual(res.returncode, 2)
+        self.assertIn("title", res.stderr)
+
+    @unittest.skipUnless(P.IS_WINDOWS, "Git Bash on Windows")
+    def test_shim_via_git_bash_on_windows(self):
+        """Mutation caught: an sh form that only works with POSIX paths."""
+        bin_dir = P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        res = subprocess.run([P.find_git_bash(), str(bin_dir / "artel"), "--version"], capture_output=True,
+                             encoding="utf-8", cwd=self.tmp)
+        self.assertEqual(res.stdout.strip(), "0.1.0", res.stderr)
+
+    def test_shim_zipapp_form(self):
+        """Mutation caught: the source form used for a .pyz."""
+        pyz = self.tmp / "artel.pyz"
+        built = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "build_pyz.py"), "--out", str(pyz),
+                                "--staging", str(self.tmp / "stage")], cwd=self.tmp, capture_output=True,
+                               encoding="utf-8", errors="replace")
+        self.assertEqual(built.returncode, 0, built.stderr)
+        shim = P.shim_invocation(P.write_shim(self.tmp / "bin", sys.executable, str(pyz), zipapp=True))
+        env = {k: v for k, v in os.environ.items() if k.upper() != "PYTHONPATH"}
+        res = subprocess.run(shim + ["--version"], cwd=self.slot_with(), env=env, capture_output=True,
+                             encoding="utf-8", errors="replace")
+        self.assertEqual(res.stdout.strip(), "0.1.0", res.stderr)
+
+    def test_write_shim_unchanged_content_not_rewritten(self):
+        """Mutation caught: truncating/rewriting the file on every stage."""
+        bin_dir = P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        files = [bin_dir / name for name in P.shim_files(sys.executable, str(REPO_ROOT))]
+        for f in files:
+            os.utime(f, ns=(10**18, 10**18))
+        P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        self.assertEqual([f.stat().st_mtime_ns for f in files], [10**18] * len(files))
+        P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT / "other"))   # changed content is written
+        self.assertNotEqual(files[0].stat().st_mtime_ns, 10**18)
+
+    def test_write_shim_replace_is_atomic_and_retries(self):
+        """Mutation caught: writing in place; giving up on the first PermissionError."""
+        real, calls = os.replace, []
+
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) <= 2:
+                raise PermissionError("held by cmd.exe")
+            return real(src, dst)
+
+        with mock.patch.object(P.os, "replace", flaky), mock.patch.object(P.time, "sleep"):
+            bin_dir = P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        self.assertGreaterEqual(len(calls), 3)
+        self.assertEqual((bin_dir / "artel").read_text(encoding="utf-8"),
+                         P.shim_files(sys.executable, str(REPO_ROOT))["artel"])
+        self.assertEqual([p.name for p in bin_dir.iterdir() if p.name.endswith(".tmp")], [])
+
+    def test_write_shim_gives_up_after_five_permission_errors(self):
+        with mock.patch.object(P.os, "replace", side_effect=PermissionError("x")) as rep, \
+                mock.patch.object(P.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                P.write_shim(self.tmp / "bin", sys.executable, str(REPO_ROOT))
+        self.assertEqual(rep.call_count, 5)
+        self.assertEqual([p.name for p in (self.tmp / "bin").iterdir()], [])   # no partial or temp file left
 
     def test_wrapper_passes_arguments_verbatim(self):
         argv = P.write_wrapper(self.tmp / "wrap", py_cmd("import json, sys; print(json.dumps(sys.argv[1:]))"))
@@ -376,12 +548,6 @@ class ShimTest(unittest.TestCase):
         script.write_text("import sys; sys.exit(7)\n", encoding="utf-8", newline="\n")
         argv = P.write_wrapper(folder / "wrap", [sys.executable, str(script)])
         self.assertEqual(subprocess.run(argv).returncode, 7)
-
-    def test_written_shim_runs_artel(self):
-        bin_dir = P.write_shim(self.tmp / "bin", sys.executable)
-        out = subprocess.run(P.shim_invocation(bin_dir) + ["--version"], capture_output=True,
-                             encoding="utf-8", env=subprocess_env(), cwd=REPO_ROOT)
-        self.assertIn("0.1.0", out.stdout + out.stderr)
 
 
 class OsPairTest(unittest.TestCase):
