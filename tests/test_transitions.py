@@ -134,10 +134,10 @@ class RowTests(unittest.TestCase):
 
     def test_R17_writer_fail_resets_and_sticks_as_writing(self):
         fields = {"fix_kind": "verify", "round": 2, "verify_fixes": 1, "attempts": 0, "fix_base": "abc",
-                  "accepted": True}
+                  "accepted": True, "review_closure": True}
         t = tr("fixing", "stage_failed", task=fields)
         self.check(t, "R17", "open", attempts=1, round=0, verify_fixes=0, fix_kind=None, fix_base=None,
-                   accepted=False)
+                   accepted=False, review_closure=False)
         t = tr("fixing", "stage_failed", task=dict(fields, attempts=1))
         self.check(t, "R17", "stuck", stuck_from="writing")
         self.assertEqual(t.effects, ("reset_branch",))
@@ -434,6 +434,24 @@ class MetaTests(unittest.TestCase):
     def test_counted_failures_below_the_cap_carry_a_cause(self):
         t = tr("vetting", "stage_failed", task={"attempts": 0})
         self.assertEqual(t.cause, "attempts 1 < max_attempts 2")
+
+    def test_closure_review_does_not_leak_through_a_failed_rewrite(self):
+        """Mutation caught: R17 not clearing review_closure (a fresh review would run as a closure, PD-4)."""
+        task = make_task(state="fixing", fix_kind="conflict", round=2)
+        t = T.decide(task, "ready", LIM)                                     # R16: closure review
+        self.assertEqual((t.rid, t.updates["review_closure"]), ("R16", True))
+        task = dataclasses.replace(task, state="reviewing", fix_kind=None, review_closure=True)
+        t = T.decide(task, "ask", LIM, stage="review")                       # reviewer asks
+        task = dataclasses.replace(task, state="blocked", asked_by="review", cause="ask")
+        t = T.decide(task, "rework", LIM, has_branch=True, tip="t")          # R29a -> fixing
+        self.assertEqual(t.rid, "R29a")
+        task = dataclasses.replace(task, state="fixing", fix_kind="review", asked_by=None, cause=None)
+        t = T.decide(task, "stage_failed", LIM)                              # R17: branch reset
+        self.assertEqual((t.rid, t.to_state), ("R17", "open"))
+        task = dataclasses.replace(task, state="writing", **{k: v for k, v in t.updates.items()
+                                                              if k != "stuck_from"})
+        t = T.decide(task, "ready", LIM)                                     # R14a: the next review
+        self.assertFalse(task.review_closure)
 
     def test_decide_is_pure(self):
         task = make_task(state="verifying", verify_fixes=0)
