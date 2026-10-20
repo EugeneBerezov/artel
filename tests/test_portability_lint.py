@@ -16,6 +16,7 @@ PLATFORM = "artel/platform.py"
 SIGNAL_NAME_EXEMPT = {"tests/test_platform.py", "tests/helpers.py"}
 POSIX_TOOLS_EXEMPT = {"tests/test_platform.py", "tests/test_procs.py"}
 SKIP_ALLOWED = {"tests/test_platform.py"}
+OS_SWITCH_EXEMPT = {"tests/test_platform.py"}   # rule 4: OS skips live here
 
 
 def _dotted(node: ast.AST) -> tuple[str, str] | None:
@@ -60,7 +61,8 @@ def lint_source(source: str, filename: str, *, is_test: bool) -> list[str]:
                         add(node, f"import of {top} outside artel/platform.py")
             if isinstance(node, ast.Attribute) and _dotted(node) in OS_ONLY_ATTRS:
                 owner, attr = _dotted(node)
-                if not (attr == "name" and filename in SIGNAL_NAME_EXEMPT):
+                if not (attr == "name" and filename in SIGNAL_NAME_EXEMPT) \
+                        and not (attr in ("name", "platform") and filename in OS_SWITCH_EXEMPT):
                     add(node, f"{owner}.{attr} outside artel/platform.py")
             if isinstance(node, ast.Call):
                 for kw in node.keywords:
@@ -150,6 +152,8 @@ class LintRulesTest(unittest.TestCase):
         self.assertTrue(lint_source("import sys\nx = sys.platform\n", "artel/cli.py", is_test=False))
         self.assertFalse(lint_source("import os\nx = os.name\n", "artel/platform.py", is_test=False))
         self.assertFalse(lint_source("import os\nx = os.name\n", "tests/helpers.py", is_test=True))
+        self.assertFalse(lint_source("import sys\nx = sys.platform\n", "tests/test_platform.py", is_test=True))
+        self.assertTrue(lint_source("import sys\nx = sys.platform\n", "tests/test_board.py", is_test=True))
 
     def test_tmp_literal_and_tempfile_without_dir(self):
         self.assertTrue(lint_source("x = '/tmp/foo'\n", "artel/a.py", is_test=False))
