@@ -99,7 +99,8 @@ branch is kept and the stage runs again later, with no counter. Every transition
 | writing, fixing (`fix_kind=review`) | `ready` with new commits | reviewing | `round += 1` |
 | fixing (`fix_kind=verify`) | `ready` with new commits | reviewing | verify-fix check of the fix only (§4); no round added |
 | fixing (`fix_kind=conflict`) | `ready` with the merge committed | reviewing | closure check of the resolution; no round added |
-| writing, fixing | `ready` without new commits, `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `round = 0`, `verify_fixes = 0`; `stuck` if `attempts ≥ max_attempts` |
+| fixing (`fix_kind=verify`) | `ready` without new commits | blocked (`asked_by=verify`, `cause=ask`) | branch and `attempts` kept; ASK `fixer made no change: <summary>`; slot freed |
+| writing, fixing | `ready` without new commits (not a verify fix), `fail`, invalid result, timeout | open | `attempts += 1`; branch reset; `round = 0`, `verify_fixes = 0`; `stuck` if `attempts ≥ max_attempts` |
 | any stage | `ask` | blocked (`asked_by=<stage>`, `cause=ask`) | branch kept, slot freed |
 | any stage | `setup` fails before the agent starts | same state | no counter; `running` cleared; board paused (`setup_failed`), notify — an environment fault never costs committed work |
 | any agent stage | `agent_unavailable` (§5 step 6) | same state | requeue: no counter, branch kept; board paused (`agent_unavailable`), notify |
@@ -132,8 +133,10 @@ Defaults: `max_attempts = 2`, `review_rounds = 2`, `max_verify_fixes = 2`,
 
 **Counters.** `attempts` counts consecutive failed runs of the stage the task
 is in: `fail`, invalid result, timeout, internal error, and `ready` without
-new commits. Every other row that leaves a stage state on a classified
-outcome other than `ask` sets `attempts = 0`. `ask`, a setup failure, a
+new commits outside a verify fix. Every other row that leaves a stage state
+on a classified outcome other than `ask` sets `attempts = 0`. `ask`, a verify
+fix's `ready` without new commits (the fixer says the red is not the
+change's fault; a human decides), a setup failure, a
 requeue (including `agent_unavailable`) and human commands other than
 `rework` from `stuck` leave it unchanged. So `max_attempts` bounds
 consecutive failures of one stage.
@@ -145,7 +148,10 @@ moves the task (`answer`, `rework`, `approve`, `accept`) sets
 the cap bounds unattended loops such as write → verify red → fix → reset,
 which the attempts reset would otherwise allow.
 `flaky` describes one verify job: a green rerun sets it; it is cleared when
-the task's next verify starts and by `accept`.
+the task's next verify starts and by `accept`. It records only what was
+observed — red, then green on the same tree — and does not say the test is
+at fault: the change itself may have introduced the race or the order
+dependence, which is why a `flaky` task waits for a human.
 
 **`review_rounds = 0`** behaves like 1: every `ready` is reviewed, and
 blocking findings go straight to the human. Reviews cannot be disabled;

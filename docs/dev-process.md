@@ -15,7 +15,7 @@ peer is busy with a task, the controller takes the review
 (`claim --session main --review-only`) instead of letting the dependents
 wait.
 
-## The loop (DeLM-style)
+## The loop
 
 Two persistent sessions, `s1` and `s2`, implement the plan in parallel and
 check each other. A third, the owner's main session (`main`), is the
