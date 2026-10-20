@@ -368,6 +368,7 @@ class HardeningTest(SlotsCase):
         (user / "wip.txt").write_text("precious", encoding="utf-8")
         admin = git(user, "rev-parse", "--path-format=absolute", "--git-dir")
         slot = slots.slot_path(self.repo, self.cfg, 1)
+        (slot / ".git").unlink()   # Git for Windows marks it hidden: opening it with 'w' is denied, so replace it
         (slot / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8", newline="\n")
         with self.assertRaises(slots.SlotGuardError):
             slots.leave_slot(self.repo, self.board, self.cfg, 1)
@@ -421,7 +422,7 @@ class HardeningTest(SlotsCase):
     def test_recreated_slot_forgets_its_setup_hash(self):
         import shutil
         counter = self.tmp / "c.txt"
-        code = f"open({json.dumps(str(counter))}, 'a').write('x')"
+        code = f"open({json.dumps(str(counter))}, 'a', encoding='utf-8').write('x')"
         [n] = self.slot(1, **{"commands.setup": py_cmd(code)})
         path = slots.slot_path(self.repo, self.cfg, n)
         self.assertEqual(slots.run_setup_if_needed(self.repo, self.board, self.cfg, n, path, task_id=None), "ok")
@@ -549,7 +550,7 @@ class BranchTest(SlotsCase):
 class SetupTest(SlotsCase):
     def counter_cmd(self, extra=""):
         self.counter = self.tmp / "counter.txt"
-        return py_cmd(f"open({json.dumps(str(self.counter))}, 'a').write('x')\n{extra}")
+        return py_cmd(f"open({json.dumps(str(self.counter))}, 'a', encoding='utf-8').write('x')\n{extra}")
 
     def runs(self):
         return self.counter.read_text(encoding="utf-8") if self.counter.exists() else ""
@@ -606,7 +607,7 @@ class SetupTest(SlotsCase):
         script = self.tmp / "lock.py"
         script.write_text(
             "import subprocess, sys\n"
-            f"open({json.dumps(str(marker))}, 'a').write('locked\\n')\n"
+            f"open({json.dumps(str(marker))}, 'a', encoding='utf-8').write('locked\\n')\n"
             "sys.exit(subprocess.run(sys.argv[1:]).returncode)\n", encoding="utf-8", newline="\n")
         [n] = self.slot(1, **{"commands.setup": self.counter_cmd(), "commands.heavy_lock": [sys.executable, str(script)]})
         self.assertEqual(self.run_setup(n), "ok")
@@ -677,7 +678,7 @@ class SetupTest(SlotsCase):
 
     def test_setup_env_is_passed(self):
         out = self.tmp / "env.txt"
-        code = f"import os\nopen({json.dumps(str(out))}, 'w').write(os.environ.get('ARTEL_PROBE', ''))\n"
+        code = f"import os\nopen({json.dumps(str(out))}, 'w', encoding='utf-8').write(os.environ.get('ARTEL_PROBE', ''))\n"
         [n] = self.slot(1, **{"commands.setup": py_cmd(code)})
         env = dict(os.environ, ARTEL_PROBE="42")
         self.assertEqual(self.run_setup(n, env=env), "ok")
