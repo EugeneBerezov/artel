@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from artel import board as B, config as C, integrate, platform as P, slots, transitions as T
+from artel import board as B, config as C, integrate, pauses, platform as P, slots, transitions as T
 from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 from tests.helpers import RepoTestCase, git, py_cmd
@@ -522,8 +522,8 @@ class BaseTest(IntegrateCase):
         bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
         self.assertEqual(bu.kind, "conflict")
         self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "paused")
-        self.assertEqual(self.board.get_meta("pause_reason"), "base_conflict")
-        self.assertIn("c.txt", self.board.get_meta("pause_detail"))
+        self.assertIn("base_conflict", pauses.active(self.board))
+        self.assertIn("c.txt", pauses.active(self.board)["base_conflict"].detail)
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
         self.slot_clean()
 
@@ -535,7 +535,7 @@ class BaseTest(IntegrateCase):
         bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
         self.assertEqual(bu.kind, "red")
         self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "paused")
-        self.assertTrue(self.board.get_meta("pause_detail").startswith("red:"))
+        self.assertTrue(pauses.active(self.board)["base_conflict"].detail.startswith("red:"))
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
 
     def test_base_update_held_when_integration_is_checked_out(self):
@@ -581,7 +581,7 @@ class BaseTest(IntegrateCase):
         self.assertEqual(bu.kind, "timeout")
         self.assertIn("verify_timeout", bu.detail)
         self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "paused")
-        self.assertTrue(self.board.get_meta("pause_detail").startswith("timeout:"))
+        self.assertTrue(pauses.active(self.board)["base_conflict"].detail.startswith("timeout:"))
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
 
     def test_base_with_empty_verify_merges(self):
@@ -602,7 +602,7 @@ class BaseTest(IntegrateCase):
         bu = integrate.base_update(self.repo, self.board, self.cfg, 1, stop_event=stop)
         self.assertEqual(bu.kind, "stopped")
         self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "noop")
-        self.assertIsNone(self.board.get_meta("pause_reason"))
+        self.assertEqual(pauses.active(self.board), {})
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
 
     def test_last_base_is_the_merged_tip_not_the_current_one(self):

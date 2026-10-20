@@ -23,6 +23,11 @@ jobs:
       - run: git --version
       - name: Unit tests (missing encoding= is an error)
         run: python -X warn_default_encoding -W error::EncodingWarning -m unittest discover -s tests -t . -v
+      - name: Unit tests under ARTEL_CHILD (a dogfood runner's verify sets it; PD-75)
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        env:
+          ARTEL_CHILD: "1"
+        run: python -m unittest discover -s tests -t . -q
       - name: Build and smoke-test artel.pyz
         run: |
           python tools/build_pyz.py --out dist/artel.pyz

@@ -7,7 +7,7 @@ import time
 import unittest
 from pathlib import Path
 
-from artel import board as B, config as C, config_schema as S, platform, slots, transitions
+from artel import board as B, config as C, config_schema as S, pauses, platform, slots, transitions
 from artel.gitutil import INTEGRATION, Repo
 from artel.runner import Runner
 from tests.helpers import RepoTestCase, git, subprocess_env
@@ -130,7 +130,7 @@ class E2ECase(RepoTestCase):
     def describe_board(self) -> str:
         rows = [f"#{t.id} {t.state} attempts={t.attempts} round={t.round} running={t.running} fix_kind={t.fix_kind}"
                 for t in self.board.list_tasks()]
-        meta = {k: self.board.get_meta(k) for k in ("pause_reason", "pause_detail")}
+        meta = {kind: pause.detail for kind, pause in pauses.active(self.board).items()}
         entries = self.board.conn.execute("SELECT kind, task_id, text FROM entries ORDER BY id DESC LIMIT 12").fetchall()
         return "\n".join(rows + [str(meta)] + [f"  {e[0]} #{e[1]}: {e[2]}" for e in reversed(entries)])
 
