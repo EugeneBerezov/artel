@@ -77,9 +77,11 @@ def run_git(*args: str) -> None:
 
 
 def run_note(kind: str, text: str, basis: str) -> None:
-    artel = shutil.which("artel")
-    argv = [artel] if artel else [sys.executable, "-m", "artel"]
-    subprocess.run([*argv, "note", kind, text, "--basis", basis], check=True, capture_output=True,
+    artel = shutil.which("artel")   # the PATH shim the runner puts first (spec §5); no silent fallback
+    if artel is None:
+        print("fake_agent: no `artel` shim on PATH", file=sys.stderr)
+        raise SystemExit(2)
+    subprocess.run([artel, "note", kind, text, "--basis", basis], check=True, capture_output=True,
                    encoding="utf-8", errors="replace")
 
 
@@ -112,7 +114,8 @@ def main() -> int:
         elif name == "note":
             run_note(*arg)
         elif name == "assistant":
-            usage = {k: usage.get(k, 0) + v for k, v in arg.items()} if usage else dict(arg)   # the final usage sums calls (Q6)
+            usage = ({k: (usage or {}).get(k, 0) + arg.get(k, 0) for k in {*(usage or {}), *arg}}
+                     if usage else dict(arg))   # the final usage sums calls (Q6), every key
             emit(A.sample_assistant_line("working", arg))
         elif name == "rate_limit":
             status, resets_at, limit_type, utilization = arg
