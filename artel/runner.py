@@ -33,6 +33,7 @@ class Job:
     result: object = None     # (StagePlan, StageRun) | VerifyResult | BaseUpdate
     error: str | None = None  # traceback tail if the job raised
     busy: Path | None = None  # SlotBusy.where if the branch turned out to be checked out elsewhere (PD-8)
+    version: int | None = None  # the task's version when the job was started: unchanged = nothing applied yet
 
 
 def _tail(text: str, limit: int = 1200) -> str:
@@ -155,6 +156,8 @@ class Runner:
                     board.close()
                 self._wake.set()
 
+        if task_id is not None:
+            job.version = self.board.get_task(task_id).version
         job.thread = threading.Thread(target=body, name=f"artel-{kind}-{task_id}", daemon=True)
         self.jobs.append(job)
         job.thread.start()
@@ -234,6 +237,9 @@ class Runner:
             return
         try:
             task = board.get_task(job.task_id)
+            if task.version != job.version:   # a transition was already applied: charging again would double-charge
+                self._record_finish_failure(job.task_id, tail)
+                return
             stage = stages.STATE_TO_STAGE.get(task.state, task.state)
             tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, tail)
             self.notify(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,

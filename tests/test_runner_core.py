@@ -523,6 +523,138 @@ class RunnerHardeningTest(E2ECase):
         self.assertEqual([e for e in journal.task_entries(self.board, tid) if e.kind == "FAIL"], [])
         self.assertEqual(kinds(self), ["done"])                    # no error event
 
+    def test_a_failure_after_the_transition_does_not_charge_a_second_attempt(self):
+        # catches: _finish_failed charging the task's NEW state (the write already moved it to reviewing)
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        real = slots.apply_git_effects
+        calls = []
+
+        def once(*a, **kw):
+            calls.append(1)
+            if len(calls) == 1:
+                raise RuntimeError("effects broke")
+            return real(*a, **kw)
+
+        with mock.patch.object(slots, "apply_git_effects", once):
+            r = self.make_runner(max_agents=1)
+            try:
+                self.drive(r, lambda: len(calls) >= 1 and self.board.get_task(tid).state != "writing")
+            finally:
+                r.shutdown()
+        task = self.board.get_task(tid)
+        self.assertEqual((task.state, task.attempts, task.running), ("reviewing", 0, False))
+        self.assertNotIn("error", kinds(self))
+        (fail,) = [e for e in journal.task_entries(self.board, tid) if e.kind == "FAIL"]
+        self.assertIn("effects broke", fail.text)
+
+    def test_a_notify_failure_does_not_double_charge_an_internal_error(self):
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        real = stages.run_stage
+
+        def broken(*a, **kw):
+            raise RuntimeError("worker broke")
+
+        r = self.make_runner(max_agents=1)
+        r.notify = mock.Mock(side_effect=RuntimeError("notifier down"))
+        try:
+            with mock.patch.object(stages, "run_stage", broken):
+                self.drive(r, lambda: self.board.get_task(tid).attempts >= 1)
+                for _ in range(2):
+                    r.tick()
+                self.assertEqual(self.board.get_task(tid).attempts, 1)   # not 2: the transition was applied once
+        finally:
+            r.shutdown()
+
+    def test_an_internal_error_at_the_cap_sticks_and_notifies(self):
+        self.write_toml({"max_attempts": 1})
+        tid = self.add_task("Add hello")
+        with mock.patch.object(stages, "run_stage", side_effect=RuntimeError("worker broke")):
+            r = self.make_runner(max_agents=1)
+            try:
+                self.drive(r, lambda: self.board.get_task(tid).state == "stuck")
+            finally:
+                r.shutdown()
+        self.assertEqual(kinds(self), ["error", "stuck"])
+
+    def test_a_failure_applying_the_base_result_pauses_without_a_task(self):
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("int-only.txt", "i\n", "integration commit")
+        git(self.repo_path, "checkout", "-q", "main")
+        self.commit_file("base-news.txt", "news\n", "base moved on")
+        tid = self.add_task("Add hello")
+        with mock.patch.object(integrate, "finish_base_update", side_effect=RuntimeError("cannot apply base")):
+            r = self.make_runner(max_agents=1)
+            try:
+                self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+            finally:
+                r.shutdown()
+        self.assertIn("paused", kinds(self))
+        self.assertEqual(self.board.get_task(tid).attempts, 0)
+
+    def test_the_pause_gate_stops_new_jobs(self):
+        # catches: no pause gate (the stopping gate has its own test)
+        tid = self.add_task("Add hello")
+        self.board.set_meta("pause_reason", "manual")
+        r = self.make_runner(max_agents=2)
+        try:
+            for _ in range(3):
+                r.tick()
+            self.assertEqual(r.jobs, [])
+            self.assertEqual(self.board.get_task(tid).state, "open")
+            self.board.del_meta("pause_reason")
+            r.tick()
+            self.assertEqual(len(r.jobs), 1)
+        finally:
+            r.shutdown()
+
+    def test_only_one_verify_runs_at_a_time(self):
+        # catches verify_busy=False: pick.select allows one verifying task per call, the runner must pass the truth
+        self.write_toml({"commands.verify": py_cmd("import time; time.sleep(2)")})
+        first = self.add_task("first", area=["a"])
+        second = self.add_task("second", area=["b"])
+        for tid in (first, second):
+            git(self.repo_path, "branch", f"artel/{tid}", INTEGRATION)
+            task = self.board.get_task(tid)
+            self.board.update_task(tid, expect_state="open", expect_version=task.version, state="verifying",
+                                   round=1)
+        r = self.make_runner(max_agents=2)
+        try:
+            for _ in range(5):
+                r.tick()
+                self.assertLessEqual(sum(1 for j in r.jobs if j.kind == "verify"), 1)
+                r.wait(0.1)
+            self.assertEqual(sum(1 for j in r.jobs if j.kind == "verify"), 1)
+        finally:
+            r.shutdown()
+
+    def test_the_base_job_waits_for_a_running_verify(self):
+        # catches M03: a base update started while a verify job still runs
+        self.write_toml({"commands.verify": py_cmd("import time; time.sleep(3)")})
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        spawned = []
+        real = Runner._spawn
+
+        def counting(self_, kind, task_id, slot, work):
+            spawned.append((kind, any(j.kind == "verify" for j in self_.jobs)))
+            return real(self_, kind, task_id, slot, work)
+
+        with mock.patch.object(Runner, "_spawn", counting):
+            r = self.make_runner(max_agents=2)
+            try:
+                self.drive(r, lambda: any(j.kind == "verify" for j in r.jobs))
+                self.commit_file("base-news.txt", "news\n", "base moved during the verify")
+                for _ in range(5):
+                    r.tick()
+                    r.wait(0.1)
+                self.assertNotIn("base", [k for k, _ in spawned])   # waits while the verify runs
+                self.drive(r, lambda: self.board.get_task(tid).state == "done", timeout=90)
+            finally:
+                r.shutdown()
+        self.assertIn(("base", False), spawned)   # started once no verify was running
+
     def test_answered_flag_is_cleared_when_the_stage_starts(self):
         self.scenario({"write": WRITE, "review": PASS})
         tid = self.add_task("Add hello")
