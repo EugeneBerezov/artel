@@ -191,7 +191,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 | W3 | 6 Journal + pick · **7 Transitions** · 8 Procs · **9 Agent adapter** |
 | W4 | **10 Slots** · 11 Templates + agent commands · 12 Prompts · 29 T7 test hardening |
 | W5 | **13 Stages** · **14 Verify + integrate** |
-| W6 | **15 Runner core + happy-path e2e (vertical slice; reopened)** · 30 Owner defaults + revision settings → **34 Agent shim isolation** |
+| W6 | **15 Runner core + happy-path e2e (vertical slice; reopened)** · 30 Owner defaults + revision settings → **34 Agent shim isolation** · 42 T4 test port |
 | W7 | 16 Live slice check (controller) · 17 Notifier · 18 Requests + pause set → **31 Transitions follow-up** |
 | W8 | **22 Runner operations: pause wiring, disk, stop, reconcile** · **32 Protected paths** · **33 Counters and rows** |
 | W9 | **35 Limits, quota windows, probes** · **36 Verify rerun and flaky** |
@@ -253,7 +253,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 8. `CLAUDE.md` split (the s1/s2 loop moves to `docs/dev-process.md`; artel's agents must not read "integrate", "push" or `dev/board.py` instructions). Done 2026-10-20.
 There is no `artel status` in phase 1 (Task 19 is phase 2); the controller reads the board as its owner, `sudo -u artel-dog sqlite3 -readonly /home/artel-dog/artel-dogfood/.git/artel/board.db` (a WAL board needs write access to its `-shm` file), with: `select id, state, attempts, resets, stage_runs, flaky, running, round from tasks order by id;` · `select key, value from meta where key in ('pauses', 'failure_streak', 'unavailable_streak', 'usage_windows', 'probe_times', 'runner_pid', 'integration_tip', 'base_verify', 'shadow_queue');` · `select id, command, task_id, error from requests where applied_at is null;` · `select id, kind, task_id, substr(text, 1, 120) from entries order by id desc limit 20;`. Phase-2 tasks then enter that artel as `artel add` tasks (title = plan heading; body = "implement docs/plan.md 'Task N: <heading>'"; `--area` = its Files; dependencies = its `**Depends on:**` plus the shared-file order below — areas prevent overlap, not order; `--strong` for RISKY). The controller merges finished work from the clone's `artel/integration` into `main` after its own review and CI (step 7), and marks the task `done` on this board.
 
-**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/__init__.py` (1 → 18), `.github/workflows/ci.yml` (2 → 28 → 18), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15 → 18, then read-only), `artel/config_schema.py` (5 → 30 → 27; Task 30 adds every setting the revised spec needs — later tasks must not add settings without a plan change; Task 27 only touches `defaults_markdown()` columns), `artel/config.py` (5 → 30), `artel/cmd_config.py` (5 → 11), `artel/cmd_agent.py` (11 → 30 → 34), `tests/test_cmd_agent.py` (11 → 30 → 34), `artel/platform.py` (3 → 34), `tests/test_platform.py` (3 → 34), `artel/slots.py` and `tests/test_slots.py` (10 → 30 → 39), `artel/procs.py` and `tests/test_procs.py` (8 → 39), `artel/agent_claude.py` (9 → 35 → 39), `tests/test_agent_claude.py` (9 → 35 → 39), `tests/test_runner_ops.py` (22 → 41), `artel/events.py` (15 only), `artel/pauses.py` (18 → 22 → 35 → 37), `tests/test_pauses.py` (18 → 22 → 35 → 37), `artel/runner.py` (15 → 18 → 22 → 35 → 37 → 40 → 26 → 41), `artel/stages.py` (13 → 15 → 31 → 32 → 37 → 38 → 39 → 21 → 26), `tests/test_stages.py` (13 → 31 → 32 → 37 → 38 → 39), `artel/prompts.py` (12 → 31 → 39 → 21), `artel/transitions.py` (7 → 29 → 31 → 33), `tests/test_transitions.py` (7 → 29 → 31 → 33), `artel/templates.py` and `artel/builtin_templates/*.md` (11 → 31 → 39), `artel/integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `tests/test_integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `artel/board.py` (4 → 31 → 33), `tests/test_board.py` (4 → 31 → 33), `artel/pick.py` (6 → 37), `artel/journal.py` (6 → 40), `artel/requests.py` (18 → 41), `tests/test_runner_core.py` (15 → 18 → 31), `tests/fake_agent.py` (9 → 35 → 37 → 39 → 26), `tests/test_runner_e2e.py` (24 → 21), `artel/cmd_human.py` (19 → 26 → 41). The wave table and the `**Depends on:**` lines respect this.
+**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/__init__.py` (1 → 18), `.github/workflows/ci.yml` (2 → 28 → 18), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15 → 18, then read-only), `artel/config_schema.py` (5 → 30 → 27; Task 30 adds every setting the revised spec needs — later tasks must not add settings without a plan change; Task 27 only touches `defaults_markdown()` columns), `artel/config.py` (5 → 30), `artel/cmd_config.py` (5 → 11), `artel/cmd_agent.py` (11 → 30 → 34), `tests/test_cmd_agent.py` (11 → 30 → 34), `artel/platform.py` (3 → 34), `tests/test_platform.py` (3 → 34), `artel/slots.py` and `tests/test_slots.py` (10 → 30 → 39), `artel/procs.py` and `tests/test_procs.py` (8 → 39), `artel/agent_claude.py` (9 → 35 → 39), `tests/test_agent_claude.py` (9 → 35 → 39), `tests/test_runner_ops.py` (22 → 41), `artel/events.py` (15 only), `artel/pauses.py` (18 → 22 → 35 → 37), `tests/test_pauses.py` (18 → 22 → 35 → 37), `artel/runner.py` (15 → 18 → 22 → 35 → 37 → 40 → 26 → 41), `artel/stages.py` (13 → 15 → 31 → 32 → 37 → 38 → 39 → 21 → 26), `tests/test_stages.py` (13 → 31 → 32 → 37 → 38 → 39), `artel/prompts.py` (12 → 31 → 39 → 21), `artel/transitions.py` (7 → 29 → 31 → 33), `tests/test_transitions.py` (7 → 29 → 31 → 33), `artel/templates.py` and `artel/builtin_templates/*.md` (11 → 31 → 39), `artel/integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `tests/test_integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `artel/board.py` (4 → 31 → 33), `tests/test_board.py` (4 → 42 → 31 → 33), `artel/pick.py` (6 → 37), `artel/journal.py` (6 → 40), `artel/requests.py` (18 → 41), `tests/test_runner_core.py` (15 → 18 → 31), `tests/fake_agent.py` (9 → 35 → 37 → 39 → 26), `tests/test_runner_e2e.py` (24 → 21), `artel/cmd_human.py` (19 → 26 → 41). The wave table and the `**Depends on:**` lines respect this.
 
 ---
 
@@ -3123,7 +3123,7 @@ Content requirements per section (§11): (1) three sentences + "when not to use 
 
 ### Task 31: Transitions follow-up — attempts reset on success, branchless rework limit, verify-fix review — **RISKY (strong-model review)**
 
-**Depends on:** Task 15, 18, 30
+**Depends on:** Task 15, 18, 30, 42
 
 **Spec:** §3.1 (rows "writing, fixing ready", "fixing (`fix_kind=verify`) ready", "stuck (no branch: vet or attack before code)", counters), §4 (closure checks; template per stage), §10 (VERDICTs name the setting), PD-4, PD-28, PD-29, PD-35, PD-48, PD-49, PD-50. Source: owner decisions 2026-10-20 (checkpoint #1 verify-fix review, #4, #5).
 
@@ -3637,6 +3637,25 @@ def gates(repo, board, cfg, task, result: VerifyResult) -> list[Hit]
 **Acceptance:** no verify fixer runs while `artel/integration` is red on its own, and one flaky base run never stops the board; `resume` always re-checks the base; a shadow verify never delays a task verify; every finished task has a fates VERDICT; agent stages are checked against the shared repository with the runner's knowledge of concurrent jobs; CI green on all six jobs.
 
 ---
+
+### Task 42: T4 test port — board schema shape and `all_runs` string guard
+
+**Depends on:** Task 4
+
+**Spec:** §3 (board), §13 (tests must be able to fail).
+
+**Context for the writer:** Global Constraints + this task + `<git-common-dir>/artel-dev/reviews/T4-2.md` (minor 2: the schema is not tested) + branch `dev/T4c` (commit 35b893c, s1's superseded T4 fix: its two tests below were never merged; the retry fix itself is already in `main` as f2d4bc7 — do not port it). Controller-added 2026-10-20.
+
+**Files:**
+- Modify: `tests/test_board.py` only. No production code changes; if a test fails on `main`, stop and write a SPEC-GAP note.
+
+**Interfaces:** none.
+
+- [ ] **Step 1:** Port `test_all_runs_rejects_string_stages` from `git show dev/T4c:tests/test_board.py` (the guard is in `main`'s `Board.all_runs`, untested) — catches deleting the `isinstance(stages, str)` check.
+- [ ] **Step 2:** Port `test_schema_tables_columns_and_indexes` adapted to the current schema, as a **subset** check so later tasks that add columns (31, 33, 37, 40) do not have to edit it: every table, column, `NOT NULL` / `DEFAULT` and index that exists in `main` today must exist (read with `PRAGMA table_info` / `PRAGMA index_list`), extra ones are allowed — catches dropping `entries` or its index, or `NOT NULL DEFAULT 0` on `risky` (T4-2 minor 2).
+- [ ] **Step 3:** Whole suite green (with the CI encoding env, docs/dev-process.md); integrate as usual. Then the controller deletes branch `dev/T4c`.
+
+**Acceptance:** both tests fail under the named mutation (state it in the commit body); no other file changed.
 
 ### Task 41: `artel workers N` — change the worker count of a running runner
 
