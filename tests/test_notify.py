@@ -277,6 +277,16 @@ class DispatcherTest(NotifyBase):
         self.assertEqual((data["kind"], data["task_id"], data["title"], data["text"]),
                          ("blocked", 4, "Réseau ✓ тест", "вопрос?"))
 
+    def test_command_notifier_stdin_is_ascii(self):
+        """Mutation caught: raw UTF-8 on stdin (a child reading it with cp1252 on Windows fails on byte 0x81,
+        e.g. in Cyrillic text)."""
+        out = self.tmp / "raw.bin"
+        cmd = [sys.executable, "-c", "import sys; open(sys.argv[1], 'wb').write(sys.stdin.buffer.read())", str(out)]
+        self.assertTrue(notify.CommandNotifier(cmd, "auto").send_event(Event("blocked", 4, "Réseau ✓ тест", "blocked")))
+        raw = out.read_bytes()
+        raw.decode("ascii")   # raises on any non-ASCII byte
+        self.assertEqual(json.loads(raw)["title"], "Réseau ✓ тест")
+
     def test_command_notifier_gets_the_text_in_the_environment(self):
         """Mutation caught: ARTEL_NOTIFY_TEXT (promised by the notify.command explain) missing."""
         out = self.tmp / "env.txt"
@@ -285,6 +295,42 @@ class DispatcherTest(NotifyBase):
                str(out)]
         self.assertTrue(notify.CommandNotifier(cmd, "auto").send_event(Event("stuck", 2, "t", "stuck", "why")))
         self.assertEqual(out.read_text(encoding="utf-8"), "artel: #2 stuck — t\nwhy")
+
+    def test_command_notifier_does_not_pass_the_bot_token(self):
+        """Mutation caught: the whole environment (bot token included) handed to a user-supplied command."""
+        out = self.tmp / "env-keys.json"
+        cmd = [sys.executable, "-c",
+               "import json, os, sys; json.dump(sorted(os.environ), open(sys.argv[1], 'w', encoding='utf-8'))",
+               str(out)]
+        env = {"ARTEL_TELEGRAM_TOKEN": TOKEN, "TELEGRAM_BOT_TOKEN": TOKEN, "MY_BOT": TOKEN, "KEEP_ME": "1"}
+        with mock.patch.dict(os.environ, env):
+            self.assertTrue(notify.CommandNotifier(cmd, "auto", ["MY_BOT"]).send_event(Event("stuck", 1)))
+        keys = {k.upper() for k in json.loads(out.read_text(encoding="utf-8"))}
+        self.assertTrue({"KEEP_ME", "ARTEL_NOTIFY_TEXT"} <= keys)
+        self.assertFalse({"ARTEL_TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN", "MY_BOT"} & keys)
+
+    def test_from_config_drops_the_configured_token_env_name(self):
+        """Mutation caught: from_config not passing notify.telegram_token_env to the command notifier."""
+        cfg = self.toml(telegram_token_env="MY_OWN_TOKEN", command=[sys.executable, "-c", "pass"])
+        d = notify.Dispatcher.from_config(cfg, self.env)
+        self.assertIn("MY_OWN_TOKEN", d.command.drop_env)
+
+    def test_command_timeout_counts_as_failure(self):
+        """Mutation caught: `and not timed_out` dropped (a killed command reported as sent)."""
+        cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
+        with mock.patch.object(notify, "COMMAND_TIMEOUT", 0.5):
+            self.assertFalse(notify.CommandNotifier(cmd, "auto").send_event(Event("stuck", 1)))
+
+    def test_telegram_payload_is_exactly_chat_id_and_text(self):
+        """Mutation caught: parse_mode (Markdown injection from titles) or other fields added to sendMessage."""
+        self.assertTrue(notify.TelegramNotifier(
+            notify.TelegramCredentials(TOKEN, CHAT, "test"), self.server.api_base).send("hello"))
+        self.assertEqual(self.server.bodies[-1], {"chat_id": CHAT, "text": "hello"})
+
+    def test_long_event_text_is_clipped_below_the_telegram_limit(self):
+        """Mutation caught: TEXT_LIMIT raised above Telegram's 4096 characters."""
+        text = notify.format_event(Event("blocked", 1, "t", "blocked", "x" * 9000))
+        self.assertLessEqual(len(text), 4096)
 
     def test_command_notifier_failure_is_false_not_an_exception(self):
         """Mutation caught: a failing or missing command raising out of the runner."""

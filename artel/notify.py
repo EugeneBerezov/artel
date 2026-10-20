@@ -12,7 +12,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -175,17 +175,28 @@ class TelegramNotifier:
         return self._call("sendMessage", {"chat_id": self.creds.chat, "text": text}) is not None
 
 
+def _ascii_json(e: Event) -> str:
+    """The event as JSON with every non-ASCII character escaped: ASCII is valid UTF-8 and survives a child that
+    decodes stdin with the Windows locale code page (cp1252 cannot decode every UTF-8 byte)."""
+    return json.dumps(json.loads(e.to_json()), ensure_ascii=True)
+
+
+_SECRET_ENV = ("ARTEL_TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN")   # never handed to a user-supplied command
+
+
 class CommandNotifier:
-    def __init__(self, command, shell: str):
+    def __init__(self, command, shell: str, drop_env: Sequence[str] = ()):
         self.command = command
         self.shell = shell
+        self.drop_env = {name.upper() for name in (*_SECRET_ENV, *drop_env)}   # Windows names are case-insensitive
 
     def send_event(self, e: Event) -> bool:
         """The event as JSON (UTF-8) on stdin; the formatted text also in ARTEL_NOTIFY_TEXT."""
         try:
             argv = procs.command_argv(self.command, self.shell)
-            env = dict(os.environ, ARTEL_NOTIFY_TEXT=format_event(e))
-            result = procs.run_tree(argv, cwd=Path.cwd(), env=env, stdin_text=e.to_json(),
+            env = {k: v for k, v in os.environ.items() if k.upper() not in self.drop_env}
+            env["ARTEL_NOTIFY_TEXT"] = format_event(e)
+            result = procs.run_tree(argv, cwd=Path.cwd(), env=env, stdin_text=_ascii_json(e),
                                     timeout=COMMAND_TIMEOUT, kill_grace=5.0)
         except (ArtelError, OSError):
             return False
@@ -207,7 +218,7 @@ class Dispatcher:
                 telegram = TelegramNotifier(creds, cfg["notify.telegram_api_base"])
         command = None
         if cfg["notify.command"]:
-            command = CommandNotifier(cfg["notify.command"], cfg["shell"])
+            command = CommandNotifier(cfg["notify.command"], cfg["shell"], [cfg["notify.telegram_token_env"]])
         return cls(cfg["notify.on"], telegram, command)
 
     def emit(self, e: Event) -> None:
