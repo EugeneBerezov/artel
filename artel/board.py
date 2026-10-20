@@ -205,9 +205,11 @@ def open_board(path: Path, *, busy_timeout_ms: int = 5000, factory=sqlite3.Conne
                 board = Board(conn, _choose_journal_mode(conn))
                 board._init_schema()
                 break
-            except BoardBusy:
-                if time.monotonic() >= deadline:
+            except (BoardBusy, sqlite3.OperationalError) as e:
+                if isinstance(e, sqlite3.OperationalError) and "locked" not in str(e):
                     raise
+                if time.monotonic() >= deadline:
+                    raise BoardBusy(str(e)) from e
                 time.sleep(0.01)
     except BaseException:
         conn.close()   # a leaked handle keeps the db and -wal/-shm files open (Windows cleanup)
