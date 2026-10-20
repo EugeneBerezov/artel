@@ -197,8 +197,18 @@ def open_board(path: Path, *, busy_timeout_ms: int = 5000, factory=sqlite3.Conne
     try:
         conn.row_factory = sqlite3.Row
         conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-        board = Board(conn, _choose_journal_mode(conn))
-        board._init_schema()
+        # The journal-mode switch and the first schema creation can return SQLITE_BUSY without consulting
+        # the busy handler (it would deadlock), so concurrent first opens retry until the same deadline.
+        deadline = time.monotonic() + busy_timeout_ms / 1000
+        while True:
+            try:
+                board = Board(conn, _choose_journal_mode(conn))
+                board._init_schema()
+                break
+            except BoardBusy:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.01)
     except BaseException:
         conn.close()   # a leaked handle keeps the db and -wal/-shm files open (Windows cleanup)
         raise
@@ -461,6 +471,8 @@ class Board:
         return [_run_from_row(r) for r in rows]
 
     def all_runs(self, *, stages: Iterable[str] | None = None) -> list[Run]:
+        if isinstance(stages, str):
+            raise ValueError("stages must be an iterable of stage names, not a string")
         rows = self.conn.execute("SELECT * FROM runs ORDER BY id").fetchall()
         wanted = None if stages is None else set(stages)
         return [r for r in map(_run_from_row, rows) if wanted is None or r.stage in wanted]

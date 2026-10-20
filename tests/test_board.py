@@ -344,6 +344,8 @@ class BoardTest(unittest.TestCase):
                          (100, 900, 7, 1234, 0.25, "sess"))
         self.assertEqual((r.timed_out, r.killed, r.exit_code), (True, True, None))
         self.assertEqual(len(self.board.all_runs()), 2)
+        with self.assertRaises(ValueError):   # catches: iterating the characters of a str
+            self.board.all_runs(stages="write")
 
     def test_requests_pending_and_finish(self):
         tid = self.new_task()
@@ -460,7 +462,7 @@ class BoardTest(unittest.TestCase):
     def test_concurrent_first_open_creates_one_schema(self):
         # catches: dropping IF NOT EXISTS / INSERT OR IGNORE from schema creation
         path = Path(self._tmp.name) / "race" / "board.db"
-        barrier = threading.Barrier(4)
+        barrier = threading.Barrier(8)
         results = []
 
         def opener():
@@ -472,12 +474,32 @@ class BoardTest(unittest.TestCase):
             except Exception as e:   # noqa: BLE001 - asserted below
                 results.append(e)
 
-        threads = [threading.Thread(target=opener) for _ in range(4)]
+        threads = [threading.Thread(target=opener) for _ in range(8)]
         for t in threads:
             t.start()
         for t in threads:
             t.join()
-        self.assertEqual(results, ["1"] * 4)
+        self.assertEqual(results, ["1"] * 8)
+
+    def test_first_open_retries_busy_until_deadline(self):
+        # catches: mapping the first SQLITE_BUSY of the journal-mode switch straight to BoardBusy
+        real = B._choose_journal_mode
+        calls = []
+
+        def flaky(conn):
+            calls.append(1)
+            if len(calls) < 3:
+                raise B.BoardBusy("database is locked")
+            return real(conn)
+
+        B._choose_journal_mode = flaky
+        self.addCleanup(setattr, B, "_choose_journal_mode", real)
+        board = B.open_board(self.path.parent / "retry.db", busy_timeout_ms=2000)
+        self.addCleanup(board.close)
+        self.assertEqual(len(calls), 3)
+        B._choose_journal_mode = lambda conn: (_ for _ in ()).throw(B.BoardBusy("database is locked"))
+        with self.assertRaises(B.BoardBusy):   # catches: retrying forever
+            B.open_board(self.path.parent / "never.db", busy_timeout_ms=100)
 
     def test_reopen_does_not_take_the_write_lock(self):
         # catches: _init_schema starting BEGIN IMMEDIATE on every open (read-only commands would hit BoardBusy)
