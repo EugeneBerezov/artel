@@ -7,6 +7,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 from typing import Callable, Mapping, Sequence
@@ -90,6 +91,17 @@ if IS_WINDOWS:
     _k32.GetExitCodeProcess.restype = wintypes.BOOL
     _k32.GetProcessTimes.argtypes = [wintypes.HANDLE] + [ctypes.POINTER(wintypes.FILETIME)] * 4
     _k32.GetProcessTimes.restype = wintypes.BOOL
+
+    _k32.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+                                               wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+    _k32.QueryInformationJobObject.restype = wintypes.BOOL
+    _JobObjectBasicAccountingInformation = 1
+
+    class _JobAccounting(ctypes.Structure):
+        _fields_ = [("TotalUserTime", ctypes.c_int64), ("TotalKernelTime", ctypes.c_int64),
+                    ("ThisPeriodTotalUserTime", ctypes.c_int64), ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+                    ("TotalPageFaultCount", wintypes.DWORD), ("TotalProcesses", wintypes.DWORD),
+                    ("ActiveProcesses", wintypes.DWORD), ("TotalTerminatedProcesses", wintypes.DWORD)]
 
     _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     _PROCESS_SET_QUOTA = 0x0100
@@ -194,6 +206,12 @@ def hard_kill(pid: int, group: int) -> None:
 
 def tree_alive(pid: int, group: int) -> bool:
     if IS_WINDOWS:
+        job = _JOBS.get(pid)
+        if job:
+            info = _JobAccounting()
+            if _k32.QueryInformationJobObject(job, _JobObjectBasicAccountingInformation,
+                                              ctypes.byref(info), ctypes.sizeof(info), None):
+                return info.ActiveProcesses > 0
         return pid_alive(pid)
     if group <= 1:
         return False
@@ -224,16 +242,20 @@ def pid_alive(pid: int) -> bool:
         return True
     except OSError:
         return False
-    return _not_zombie(pid)
+    return not _is_zombie(pid)
 
 
-def _not_zombie(pid: int) -> bool:
-    """An exited-but-unreaped child still answers kill(pid, 0); treat it as gone where we can tell."""
-    try:
-        text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return True
-    return text.rpartition(")")[2].split()[0] != "Z"
+def _is_zombie(pid: int) -> bool:
+    """An exited-but-unreaped child still answers kill(pid, 0); treat it as gone."""
+    if sys.platform.startswith("linux"):
+        try:
+            text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return False
+        return text.rpartition(")")[2].split()[0] == "Z"
+    out = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                         encoding="utf-8", errors="replace", env={**os.environ, "LC_ALL": "C"})
+    return out.stdout.strip().startswith("Z")
 
 
 def process_fingerprint(pid: int) -> str | None:
@@ -250,16 +272,17 @@ def process_fingerprint(pid: int) -> str | None:
             return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
         finally:
             _k32.CloseHandle(handle)
-    stat = Path(f"/proc/{pid}/stat")
     if sys.platform.startswith("linux"):
         try:
-            text = stat.read_text(encoding="utf-8", errors="replace")
+            text = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8", errors="replace")
         except OSError:
             return None
         fields = text.rpartition(")")[2].split()   # fields[0] is field 3 (state)
         if fields[0] == "Z":
             return None
         return fields[19]                           # field 22: starttime
+    if _is_zombie(pid):
+        return None
     out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True,
                          encoding="utf-8", errors="replace", env={**os.environ, "LC_ALL": "C"})
     value = out.stdout.strip()
@@ -268,17 +291,25 @@ def process_fingerprint(pid: int) -> str | None:
 
 def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None = None) -> bool:
     current = process_fingerprint(pid)
+    if current is not None and fingerprint is not None and current != fingerprint:
+        return False   # pid reused: never signal it
     if current is None:
-        return False
-    if fingerprint is not None and current != fingerprint:
-        return False
+        # Leader gone (exited, reaped or zombie). Its children may live on holding the agent's pipes.
+        # POSIX: a pgid cannot be reused while the group has members, so the group is still ours.
+        # Windows: the job object outlives the leader.
+        if IS_WINDOWS:
+            alive = tree_alive(pid, group)
+            _close_job(pid, terminate=alive)   # always release the handle
+            return alive
+        if not tree_alive(pid, group):
+            return False
     soft_terminate(pid, group)
     deadline = time.monotonic() + grace
     while time.monotonic() < deadline:
         if not tree_alive(pid, group):
             break
-        if not IS_WINDOWS and not _not_zombie(pid):
-            break   # leader exited but is unreaped (the caller's own child): killpg(0) would never fail
+        if not IS_WINDOWS and _is_zombie(pid):
+            break   # unreaped leader (the caller's own child): killpg(0) would keep succeeding
         time.sleep(0.05)
     # Finish with a hard kill: it sweeps stragglers that ignored the soft stop (POSIX group, Windows job)
     # and releases the job handle; it is harmless when nothing is left.
@@ -288,9 +319,15 @@ def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None =
 
 
 def install_stop_handlers(callback: Callable[[], None]) -> None:
+    """The signal handler only hands off: `callback` runs on a helper thread, never in signal context
+    (it may print or take locks). It must be thread-safe, e.g. set an Event."""
     names = ("SIGINT", "SIGBREAK") if IS_WINDOWS else ("SIGINT", "SIGTERM")
+
+    def handler(signum, frame):
+        threading.Thread(target=callback, daemon=True).start()
+
     for name in names:
-        signal.signal(getattr(signal, name), lambda signum, frame: callback())
+        signal.signal(getattr(signal, name), handler)
 
 
 def which(name: str) -> str | None:
@@ -336,10 +373,16 @@ def shell_argv(shell: str, command: str, *, windows: bool = IS_WINDOWS) -> list[
     if shell == "auto":
         return [find_git_bash(), "-c", command] if windows else ["sh", "-c", command]
     if shell in ("sh", "bash"):
+        if windows:   # System32\bash.exe and the WindowsApps alias are WSL launchers
+            return [find_git_bash(), "-c", command]
         return [which(shell) or shell, "-c", command]
     if shell == "pwsh":
         return ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command]
     if shell == "cmd":
+        if windows and '"' in command:
+            # list2cmdline escapes quotes as \", which cmd.exe does not understand; no portable fix.
+            raise ArtelError("a command run through cmd cannot contain double quotes; "
+                             "use the list form or shell = \"pwsh\"")
         return ["cmd", "/d", "/s", "/c", command]
     raise ArtelError(f"unknown shell {shell!r} (expected auto, sh, bash, pwsh or cmd)")
 
@@ -351,10 +394,23 @@ def prefix_argv(shell: str, prefix: str, command_argv: Sequence[str], *,
     return [*shell_argv(shell, prefix + ' "$@"', windows=windows), "artel-heavy", *command_argv]
 
 
+def _bat_text(text: str) -> str:
+    return text.replace("%", "%%")   # cmd expands %VAR% even inside quotes
+
+
+def _write_batch(path: Path, content: str) -> None:
+    # cmd.exe reads batch files in the OEM code page, not UTF-8 (a non-ASCII profile path would break).
+    try:
+        data = content.encode("oem" if IS_WINDOWS else "utf-8")
+    except UnicodeEncodeError:
+        raise ArtelError(f"{path.name}: path not representable in the console code page")
+    path.write_bytes(data)
+
+
 def shim_files(python: str, *, windows: bool = IS_WINDOWS) -> dict[str, str]:
     files = {"artel": f'#!/bin/sh\nexec "{python}" -m artel "$@"\n'}
     if windows:
-        files["artel.cmd"] = f'@"{python}" -m artel %*\r\n'
+        files["artel.cmd"] = f'@"{_bat_text(python)}" -m artel %*\r\n'
     return files
 
 
@@ -362,8 +418,11 @@ def write_shim(bin_dir: Path, python: str) -> Path:
     bin_dir = Path(bin_dir)
     bin_dir.mkdir(parents=True, exist_ok=True)
     for name, content in shim_files(python).items():
-        with open(bin_dir / name, "w", encoding="utf-8", newline="") as fh:
-            fh.write(content)
+        if name.endswith(".cmd"):
+            _write_batch(bin_dir / name, content)
+        else:
+            with open(bin_dir / name, "w", encoding="utf-8", newline="") as fh:
+                fh.write(content)
     if not IS_WINDOWS:
         (bin_dir / "artel").chmod(0o755)
     return bin_dir
@@ -377,13 +436,12 @@ def write_wrapper(stem: Path, argv: Sequence[str]) -> list[str]:
     stem = Path(stem)
     if IS_WINDOWS:
         path = stem.with_name(stem.name + ".cmd")
-        body = "@" + " ".join(f'"{a}"' for a in argv) + " %*\r\n"
+        _write_batch(path, "@" + " ".join(f'"{_bat_text(a)}"' for a in argv) + " %*\r\n")
     else:
         path = stem
-        body = "exec " + " ".join(shlex.quote(a) for a in argv) + ' "$@"\n'
-    with open(path, "w", encoding="utf-8", newline="") as fh:
-        fh.write(body if IS_WINDOWS else "#!/bin/sh\n" + body)
-    if not IS_WINDOWS:
+        body = "#!/bin/sh\nexec " + " ".join(shlex.quote(a) for a in argv) + ' "$@"\n'
+        with open(path, "w", encoding="utf-8", newline="") as fh:
+            fh.write(body)
         path.chmod(0o755)
     return [str(path)]
 
@@ -396,7 +454,7 @@ def long_paths_warning(repo_git: Callable[..., str], *, windows: bool = IS_WINDO
     if not windows:
         return None
     try:
-        value = repo_git("config", "core.longpaths").strip()   # git exits 1 when the key is unset
+        value = repo_git("config", "--type=bool", "core.longpaths").strip()   # git exits 1 when the key is unset
     except ArtelError:
         value = ""
     if value == "true":
