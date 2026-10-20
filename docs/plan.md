@@ -3426,6 +3426,8 @@ def agent_env(repo, *, task_id, stage, round, base_env) -> dict[str, str]
 
 
 **Also (T44 SPEC-GAP 2026-10-20):** the `artel/agent_claude.py` module docstring still says `--setting-sources` is absent from the defaults; correct it to "in `profiles.common` since Task 44" (no test).
+
+**Also (T44 review minors, reviews/T44-1.md):** (a) `artel/config.py` `_list_from`: the comma form of a string-list setting drops empty items, so `ARTEL_PROFILES_PROBE="...,--tools,,--disallowedTools,..."` makes `--tools` swallow the next flag — for a `profiles.*` key an empty item in the comma form is a config error naming the key and pointing to the TOML array form (`["--tools", ""]`); other list settings keep dropping blank items, so a trailing comma stays harmless (`tests/test_config.py`: `test_comma_profile_empty_item_rejected`, `test_comma_list_trailing_comma_still_ok`); (b) close two surviving mutations: `test_toml_array_keeps_empty_string` (`_toml_array` on `["--tools", ""]` via an env value and via `config set` keeps the empty element — catches filtering `""`) and `test_build_argv_keeps_empty_token` (`build_argv` keeps `--tools ""` as two elements); (c) the probe gets the `--setting-sources` pair of `profiles.common` only when `profiles.probe` has no `--setting-sources` of its own (`test_probe_setting_sources_not_duplicated`).
 **Files:**
 - Create: `artel/probe.py`, `tests/test_probe.py`, `tests/test_runner_limits.py`
 - Modify: `artel/runner.py` (`on_rate_limit`, the limit/quota/agent_unavailable part of `update_pauses`, the probe job), `artel/pauses.py` (probe bookkeeping: `probe_times`, `record_probe`), `tests/test_pauses.py`

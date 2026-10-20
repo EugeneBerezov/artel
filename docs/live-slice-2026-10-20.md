@@ -87,7 +87,7 @@ Every run prints one stderr line from the CLI's schema validator:
 ## Mismatches → fix tasks before Task 22
 
 1. **Task 44** — tool allowlists: `profiles.writer`/`reviewer` gain `--tools Bash,Edit,Write,Read,Glob,Grep`,
-   `profiles.attacker` `--tools Bash,Read,Glob,Grep`, `profiles.probe` `--tools ""` (replacing its
+   `profiles.attacker` `--tools Bash,Read,Glob,Grep`, `profiles.probe` `--tools ""` (in addition to its
    `--disallowedTools` list). Removes cross-session messaging, cron/remote triggers, sub-agents, web access
    from unattended agents.
 2. Not a fix: the schema union-type stderr warning (cosmetic; noted for Task 39 when it next touches
