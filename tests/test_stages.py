@@ -394,8 +394,10 @@ class WriteTest(StagesCase):
         self.assertEqual((task.state, task.attempts, task.running), ("writing", 1, False))
         self.assertIn("notify_internal_error", tr.effects)
         (fail,) = self.entries(tid, "FAIL")
-        self.assertTrue(fail.text.startswith("internal error: Traceback"))
+        self.assertTrue(fail.text.startswith("internal error: …"))   # the head was cut, the end (which names the error) is kept
+        self.assertTrue(fail.text.endswith("x" * 100))
         self.assertLessEqual(len(fail.text.encode("utf-8")), journal.TEXT_LIMIT)
+        self.assertEqual(stages._clip_tail("internal error: ", "ValueError: boom"), "internal error: ValueError: boom")
         self.assertEqual(fail.author, "runner")
 
     def test_internal_error_sticks_at_the_cap(self):
