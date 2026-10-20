@@ -7,5 +7,5 @@ for key, value in {
     "GIT_COMMITTER_NAME": "Test", "GIT_COMMITTER_EMAIL": "test@example.invalid",
 }.items():
     os.environ[key] = value
-for key in ("ARTEL_TASK", "ARTEL_STAGE", "ARTEL_ROUND"):
+for key in ("ARTEL_TASK", "ARTEL_STAGE", "ARTEL_ROUND", "ARTEL_CHILD"):
     os.environ.pop(key, None)

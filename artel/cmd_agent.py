@@ -47,6 +47,10 @@ def clean_area(raw: str) -> str:
 
 
 def run_add(args) -> int:
+    if _task_from_env() is None and os.environ.get("ARTEL_CHILD"):   # PD-65: no "human" task from a child of artel
+        print("artel add is a human command; refused inside a process started by artel (ARTEL_CHILD is set)",
+              file=sys.stderr)
+        return 2
     repo = Repo.discover(Path.cwd())
     if not args.title.strip():
         raise UsageError("a task needs a title")
@@ -124,7 +128,8 @@ def run_heavy(args) -> int:
 
 
 def ensure_shim(repo: Repo) -> Path:
-    return platform.write_shim(repo.artel_dir / "bin", sys.executable)
+    root = Path(artel.__file__).resolve().parent.parent   # a checkout, or the .pyz when artel runs from a zipapp
+    return platform.write_shim(repo.artel_dir / "bin", sys.executable, str(root), zipapp=root.is_file())
 
 
 def agent_env(repo: Repo, *, task_id: int, stage: str, round: int, base_env: Mapping[str, str]) -> dict[str, str]:
@@ -134,9 +139,8 @@ def agent_env(repo: Repo, *, task_id: int, stage: str, round: int, base_env: Map
         return next((k for k in env if k.upper() == name), name)
 
     bin_dir = ensure_shim(repo)
-    env.update(ARTEL_TASK=str(task_id), ARTEL_STAGE=stage, ARTEL_ROUND=str(round), PYTHONIOENCODING="utf-8")
-    path_key, pp_key = key("PATH"), key("PYTHONPATH")
+    env.update(ARTEL_TASK=str(task_id), ARTEL_STAGE=stage, ARTEL_ROUND=str(round), ARTEL_CHILD="1",
+               PYTHONIOENCODING="utf-8", NoDefaultCurrentDirectoryInExePath="1")   # cmd.exe: not a slot's artel.cmd
+    path_key = key("PATH")
     env[path_key] = os.pathsep.join(p for p in (str(bin_dir), env.get(path_key, "")) if p)   # no empty entry
-    package_root = str(Path(artel.__file__).resolve().parent.parent)   # the shim works from a checkout too
-    env[pp_key] = os.pathsep.join(p for p in (package_root, env.get(pp_key, "")) if p)
     return env

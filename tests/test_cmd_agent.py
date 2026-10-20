@@ -237,12 +237,68 @@ class CmdAgentTest(RepoTestCase):
         self.assertEqual(env["PYTHONIOENCODING"], "utf-8")
         shim_dir = str(self.repo.artel_dir / "bin")
         self.assertEqual(env["PATH"], shim_dir + os.pathsep + base["PATH"])
-        package_root = str(Path(artel.__file__).resolve().parent.parent)
-        self.assertEqual(env["PYTHONPATH"].split(os.pathsep), [package_root, "/pp"])
         self.assertEqual(base["PATH"], os.pathsep.join(["/base/bin", "/usr/bin"]))   # the input is not mutated
         bare = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={})
-        self.assertEqual(bare["PYTHONPATH"], package_root)
         self.assertEqual(bare["PATH"], str(self.repo.artel_dir / "bin"))   # no trailing empty (cwd) entry
+
+    def test_agent_env_leaves_pythonpath_unchanged(self):
+        """Mutation caught: the old package_root injection (a slot's tests would import the runner's code)."""
+        env = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={"PYTHONPATH": "/pp"})
+        self.assertEqual(env["PYTHONPATH"], "/pp")
+        bare = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={})
+        self.assertNotIn("PYTHONPATH", bare)
+
+    def test_agent_env_disables_cwd_lookup_for_cmd(self):
+        """Mutation caught: the variable missing (cmd.exe would run a slot's artel.cmd before the PATH shim)."""
+        env = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={})
+        self.assertEqual(env["NoDefaultCurrentDirectoryInExePath"], "1")
+
+    def test_agent_env_sets_artel_child(self):
+        """Mutation caught: the marker missing (a child could add a "human" task)."""
+        env = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={})
+        self.assertEqual(env["ARTEL_CHILD"], "1")
+
+    def test_add_refused_under_artel_child_without_task(self):
+        """Mutation caught: the old fallback to add_human."""
+        os.environ["ARTEL_CHILD"] = "1"
+        code, out, err = self.run_cmd(CA.run_add, "add", "sneaky")
+        self.assertEqual((code, out), (2, ""))
+        self.assertEqual(err.strip(), "artel add is a human command; refused inside a process started by artel "
+                                      "(ARTEL_CHILD is set)")
+        self.assertEqual(self.board().list_tasks(), [])
+
+    def test_add_under_artel_child_with_task_is_agent_add(self):
+        os.environ.update(ARTEL_CHILD="1", ARTEL_TASK="7")
+        code, out, _ = self.run_cmd(CA.run_add, "add", "idea")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.board().get_task(1).created_by, "agent:7")
+
+    def test_heavy_child_sees_original_environment(self):
+        """Mutation caught: clearing the environment to imitate isolation (`env -i` in the shim line, or
+        os.environ.clear() in its code): heavy children need the agent's PYTHONPATH and the rest."""
+        out = self.tmp / "env.json"
+        code_text = (f"import json, os; open({str(out)!r}, 'w', encoding='utf-8')"
+                     ".write(json.dumps([os.environ.get('PYTHONPATH'), os.environ.get('KEEP_ME')]))")
+        self.configure(commands={"project_tools": [f"Bash({sys.executable} *)"]})
+        shim = P.shim_invocation(CA.ensure_shim(self.repo))
+        env = dict(os.environ, PYTHONPATH="/agent/pp", KEEP_ME="yes")
+        res = subprocess.run(shim + ["heavy", "--", sys.executable, "-c", code_text], cwd=self.repo_path, env=env,
+                             capture_output=True, encoding="utf-8", errors="replace")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        self.assertEqual(json.loads(out.read_text(encoding="utf-8")), ["/agent/pp", "yes"])
+
+    def test_ensure_shim_detects_source_root_and_zipapp(self):
+        """Mutation caught: a .pyz run baked as a source root (or the reverse)."""
+        with mock.patch.object(CA.platform, "write_shim") as ws:
+            CA.ensure_shim(self.repo)
+            args, kw = ws.call_args
+            self.assertEqual((args[2], kw["zipapp"]), (str(REPO_ROOT), False))
+            pyz = self.tmp / "artel.pyz"
+            pyz.write_bytes(b"PK")
+            with mock.patch.object(artel, "__file__", str(pyz / "artel" / "__init__.py")):
+                CA.ensure_shim(self.repo)
+            args, kw = ws.call_args
+            self.assertEqual((args[2], kw["zipapp"]), (str(pyz), True))
 
     def test_agent_env_respects_case_of_path_key(self):
         env = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={"Path": "C:\\x"})
