@@ -47,7 +47,11 @@ given in the first message (`You are s1`). Loop:
    section, the cited spec sections and `git diff main...HEAD`; it must not
    edit. Fix blocker/major findings; second round is a closure check only.
    Still open after round 2 → SPEC-GAP note and ask the owner.
-6. Commit on `dev/T<id>`, then
+6. Commit on `dev/T<id>`. **Right before integrating**: `tail` again and re-read
+   `reviews/T<id>-*.md` — the controller may have added findings or a plan
+   change (PLAN entry) while you worked; close them first. Run the suite with
+   `PYTHONWARNDEFAULTENCODING=1 PYTHONWARNINGS=error::EncodingWarning` (CI sets
+   them for child processes). Then
    `python3 dev/board.py integrate <id> --branch dev/T<id> --session <S>` — merges into
    `main`, runs the suite, pushes (standing permission: `main` only, never
    force). The task is now `review(...)`: dependents stay blocked until the
