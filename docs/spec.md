@@ -668,14 +668,17 @@ common:  claude -p --model {model} --output-format stream-json --verbose
          --disable-slash-commands --strict-mcp-config
          --exclude-dynamic-system-prompt-sections
          --append-system-prompt-file {unattended_notice}
+         --setting-sources project,local
          (prompt on stdin: the variadic --allowedTools/--disallowedTools
           flags swallow a positional prompt)
 writer:  --permission-mode acceptEdits
+         --tools "Bash,Edit,Write,Read,Glob,Grep"
          --allowedTools "Bash(artel note *) Bash(artel add *) Bash(artel heavy *)
                          Bash(git add *) Bash(git commit *) Bash(git status *)
                          Bash(git diff *)" {project_tools}
 reviewer (review, closure, verify-fix and resolution checks; probes, §4):
          --permission-mode acceptEdits
+         --tools "Bash,Edit,Write,Read,Glob,Grep"
          --allowedTools "Bash(artel note *) Bash(artel heavy *) Bash(git diff *)
                          Bash(git log *) Bash(git show *) Bash(git status *)"
                          {project_tools} {project_read_tools}
@@ -684,6 +687,7 @@ reviewer (review, closure, verify-fix and resolution checks; probes, §4):
           runner checks the repository after the run, §4)
 attacker (vet, attack; read-only):
          --permission-mode default
+         --tools "Bash,Read,Glob,Grep"
          --disallowedTools "Edit Write NotebookEdit Bash(git * --output*)"
          --allowedTools "Bash(artel note *) Bash(git diff *) Bash(git log *)
                          Bash(git show *) Bash(git status *)" {project_read_tools}
@@ -691,6 +695,7 @@ attacker (vet, attack; read-only):
 probe:   claude -p --model {model} --output-format stream-json --verbose
          --permission-prompts none --disable-slash-commands
          --strict-mcp-config --permission-mode default --max-turns 1
+         --tools ""
          --disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep
                             WebFetch WebSearch Task TodoWrite"
          (no `common`: no schema, no notice; cwd an empty directory;
@@ -713,10 +718,14 @@ project lists its check commands. artel never defaults to
 `bypassPermissions`. Allowing a command that runs project scripts
 (`npm run *`) lets an agent run code it edited — the README must say so.
 `--bare` is not usable with subscription (OAuth) logins.
-Whether agents run with `--setting-sources project,local` (keeping the
-user's own hooks, skills and `CLAUDE.md` out of agent stages) is decided by
-the live slice check (§15); until then it is a user knob in the command
-settings.
+Agents run with `--setting-sources project,local`: the live slice check
+(§15, `docs/live-slice-2026-10-20.md`) showed that it keeps the user's own
+skills, slash commands, MCP servers and hooks out of agent stages while auth
+and tools work. `--tools` names each profile's tools: without it an agent
+also gets messaging, scheduling, remote-trigger, sub-agent and web tools and
+could message the user's interactive Claude Code sessions on the same
+machine. A list setting replaces its default, so a project that needs
+another tool restates the whole list.
 
 ## 7. Notifications
 
