@@ -1,8 +1,8 @@
 """The runner: one process, one lock, a tick loop on the main thread and one worker thread per job (spec §5).
 
 Single writer (§3.1): workers run stages, verify and the base job and store their results; only the main thread
-applies transitions. Limits, disk guard, signals, full reconcile and the notifier wiring belong to Task 22,
-request handling to Task 18, vetting to Task 21.
+applies transitions, and human requests at the start of every tick (`requests.apply_pending`, Task 18). Limits,
+disk guard, signals, full reconcile and the notifier wiring belong to Task 22, vetting to Task 21.
 """
 import json
 import os
@@ -14,8 +14,8 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import agent_claude, cmd_agent, config as config_mod, integrate, journal, pick, platform, procs, slots, stages
-from artel import transitions
+from artel import agent_claude, cmd_agent, config as config_mod, integrate, journal, pauses, pick, platform, procs
+from artel import requests, slots, stages, transitions
 from artel.board import Board, open_board
 from artel.errors import ArtelError
 from artel.events import Event, Notify, null_notify
@@ -35,6 +35,7 @@ class Job:
     error: str | None = None  # traceback tail if the job raised
     busy: Path | None = None  # SlotBusy.where if the branch turned out to be checked out elsewhere (PD-8)
     version: int | None = None  # the task's version when the job was started: unchanged = nothing applied yet
+    discarded: bool = False     # terminated for a request (PD-30): its result is never applied
 
 
 def _tail(text: str, limit: int = 1200) -> str:
@@ -69,7 +70,10 @@ class Runner:
             raise ArtelError(f"another artel runner holds {self.repo.lock_path}")
         try:
             self.board = open_board(self.repo.board_path)
+            self._clear_stale_stop()   # before runner_running() can see this runner: a new `artel stop` must count
+            self.board.set_meta("runner_fp", platform.process_fingerprint(os.getpid()) or "")
             self.board.set_meta("runner_pid", str(os.getpid()))
+            pauses.migrate_legacy(self.board, now=self.clock())
             cmd_agent.ensure_shim(self.repo)
             try:
                 agent_claude.agent_argv(self.cfg)
@@ -82,6 +86,13 @@ class Runner:
         except BaseException:
             self._release()
             raise
+
+    def _clear_stale_stop(self) -> None:
+        """PD-26 amended: a stop file or stop request left from before must not stop this runner at once."""
+        self.repo.stop_path.unlink(missing_ok=True)
+        for request in self.board.pending_requests():
+            if request.command == "stop":
+                self.board.finish_request(request.id, error="stale: no runner")
 
     def reconcile(self) -> None:
         """Core version: nothing survives a restart. Task 22 adds process-tree termination."""
@@ -96,6 +107,7 @@ class Runner:
         if self.board is not None:
             try:
                 self.board.del_meta("runner_pid")
+                self.board.del_meta("runner_fp")
             except Exception:   # noqa: BLE001 - releasing the lock matters more
                 pass
             self.board.close()
@@ -108,6 +120,27 @@ class Runner:
             for job in self.jobs:
                 job.stop.set()
         self._wake.set()
+
+    # requests.RunnerHooks --------------------------------------------------------------------------------------
+
+    def terminate(self, task_id: int) -> None:
+        """Stops the task's job and waits for it; `running` is cleared without a counter (PD-30). A job that does
+        not stop in time raises: the request fails and nothing is deleted under a live worker."""
+        for job in self.jobs:
+            if job.task_id == task_id and not job.discarded:
+                job.stop.set()
+                job.thread.join(self.cfg["kill_grace"] + procs.JOIN_DEADLINE)
+                if job.thread.is_alive():
+                    raise ArtelError(f"the job of task {task_id} did not stop; try again")
+                job.discarded = True
+        self.board.clear_running(task_id)
+
+    def stop(self, now: bool) -> None:
+        self.request_stop(now)
+
+    def resumed(self, kinds: list[str]) -> None:
+        for kind in kinds:
+            self._emit(Event("resumed", text=kind))
 
     def shutdown(self) -> None:
         if self._closed:
@@ -208,14 +241,38 @@ class Runner:
 
     def tick(self) -> None:
         self._wake.clear()   # before collecting: a job that ends from here on sets it again, no lost wakeup
+        self._guarded("applying requests", self._apply_requests)
+        self._guarded("reading the stop file", self._read_stop_file)
         if self._guarded("collecting results", self._collect):
             return
         self._guarded("integrating", self._integrate_verified)
-        if self.board.get_meta("pause_reason") or self.stopping:
+        if pauses.blocks_agents(self.board) or self.stopping:
             return
         if self._guarded("the base check", self._base_moved):
             return
         self._guarded("picking work", self._pick_and_start)
+
+    def _apply_requests(self) -> None:
+        before = set(pauses.active(self.board))
+        requests.apply_pending(self.repo, self.board, self.cfg, self)
+        for kind, pause in pauses.active(self.board).items():   # `artel pause`: every pause notifies (§3.1)
+            if kind not in before:
+                self._emit(Event("paused", text=pause.detail))
+
+    def _read_stop_file(self) -> None:
+        """PD-26: `artel stop` also writes the stop file; whichever the runner sees first stops it."""
+        path = self.repo.stop_path
+        if not path.exists():
+            return
+        try:
+            mode = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            mode = "soft"
+        self.request_stop(now=mode == "now")
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:   # Windows: `artel stop` may still hold it open; stopping twice is harmless
+            pass
 
     def _emit(self, event: Event) -> None:
         """A raising notifier must not undo or repeat the bookkeeping around it (no second FAIL, no second charge)."""
@@ -280,6 +337,10 @@ class Runner:
 
     def _finish(self, job: Job) -> None:
         board = self.board
+        if job.discarded:                             # PD-30: terminated for a request, nothing to apply
+            if job.task_id is not None:
+                board.clear_running(job.task_id)
+            return
         if job.kind == "base":
             board.del_meta("base_running")
             if job.error is not None:
@@ -289,7 +350,7 @@ class Runner:
                 return
             outcome = integrate.finish_base_update(self.repo, board, self.cfg, job.result)
             if outcome == "paused":
-                self._emit(Event("paused", text=board.get_meta("pause_detail")))
+                self._emit(Event("paused", text=pauses.active(board)["base_conflict"].causes[-1].detail))
             return
         if job.busy is not None:                      # PD-8: skipped, nothing applied, no attempt
             board.clear_running(job.task_id)
@@ -318,8 +379,7 @@ class Runner:
         board = self.board
         journal.append(board, "FAIL", stages._clip_tail("internal error in the base job: ", error), author="runner")
         detail = stages._clip_tail("internal error: ", error)
-        board.set_meta("pause_reason", "base_conflict")                        # PD-34
-        board.set_meta("pause_detail", detail)
+        pauses.add(board, "base_conflict", detail, now=self.clock())           # PD-34
         self._emit(Event("paused", text=detail))
 
     def _after_transition(self, task_id: int, tr, detail: str) -> None:
@@ -329,8 +389,7 @@ class Runner:
         task = board.get_task(task_id)
         if "pause_setup_failed" in tr.effects:
             text = journal.truncate_utf8(f"setup failed for task {task_id}: {detail}", journal.TEXT_LIMIT)
-            board.set_meta("pause_reason", "setup_failed")
-            board.set_meta("pause_detail", text)
+            pauses.add(board, "setup_failed", text, now=self.clock())
             self._emit(Event("paused", task_id, task.title, task.state, text))
         if tr.to_state == "awaiting_accept":
             self._emit(Event("awaiting_accept", task_id, task.title, tr.to_state, tr.cause or None))

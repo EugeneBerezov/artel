@@ -9,7 +9,7 @@ import time
 import unittest
 from unittest import mock
 
-from artel import events, integrate, journal, platform, procs, slots, stages
+from artel import events, integrate, journal, pauses, platform, procs, slots, stages
 from artel import runner as runner_module
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION
@@ -178,8 +178,8 @@ class RunnerCoreTest(E2ECase):
         r = self.runner(max_agents=2)
         r.start()
         try:
-            self.drive(r, lambda: self.board.get_meta("pause_reason") == "setup_failed")
-            self.assertTrue(self.board.get_meta("pause_detail"))   # M17
+            self.drive(r, lambda: "setup_failed" in pauses.active(self.board))
+            self.assertTrue(pauses.active(self.board)["setup_failed"].detail)   # M17
             second = self.add_task("second", area=["other"])   # disjoint: only the pause gate can keep it open
             for _ in range(5):   # nothing new is picked while paused
                 r.tick()
@@ -240,10 +240,10 @@ class RunnerCoreTest(E2ECase):
             r = self.runner(max_agents=1)
             r.start()
             try:
-                self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+                self.drive(r, lambda: "base_conflict" in pauses.active(self.board))
             finally:
                 r.shutdown()
-        self.assertTrue(self.board.get_meta("pause_detail").startswith("internal error:"))
+        self.assertTrue(pauses.active(self.board)["base_conflict"].detail.startswith("internal error:"))
         row = self.board.conn.execute("SELECT task_id, kind, text FROM entries WHERE kind = 'FAIL'").fetchone()
         self.assertIsNone(row["task_id"])
         self.assertIn("base broke", row["text"])
@@ -462,11 +462,11 @@ class RunnerHardeningTest(E2ECase):
         tid = self.add_task("Add hello")
         r = self.make_runner(max_agents=1)
         try:
-            self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+            self.drive(r, lambda: "base_conflict" in pauses.active(self.board))
         finally:
             r.shutdown()
         self.assertIn("paused", kinds(self))
-        self.assertIn("conflict", self.board.get_meta("pause_detail"))
+        self.assertIn("conflict", pauses.active(self.board)["base_conflict"].detail)
         self.assertEqual(self.board.get_task(tid).attempts, 0)
 
     def test_a_failure_while_finishing_a_job_is_charged_as_an_internal_error(self):
@@ -606,7 +606,7 @@ class RunnerHardeningTest(E2ECase):
         with mock.patch.object(integrate, "finish_base_update", side_effect=RuntimeError("cannot apply base")):
             r = self.make_runner(max_agents=1)
             try:
-                self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+                self.drive(r, lambda: "base_conflict" in pauses.active(self.board))
             finally:
                 r.shutdown()
         self.assertIn("paused", kinds(self))
@@ -615,14 +615,14 @@ class RunnerHardeningTest(E2ECase):
     def test_the_pause_gate_stops_new_jobs(self):
         # catches: no pause gate (the stopping gate has its own test)
         tid = self.add_task("Add hello")
-        self.board.set_meta("pause_reason", "manual")
+        pauses.add(self.board, "manual", "artel pause", now=0.0)
         r = self.make_runner(max_agents=2)
         try:
             for _ in range(3):
                 r.tick()
             self.assertEqual(r.jobs, [])
             self.assertEqual(self.board.get_task(tid).state, "open")
-            self.board.del_meta("pause_reason")
+            pauses.remove(self.board, "manual")
             r.tick()
             self.assertEqual(len(r.jobs), 1)
         finally:
@@ -862,7 +862,7 @@ class RunnerReopenTest(E2ECase):
             r.start()
             r.notify = mock.Mock(side_effect=RuntimeError("notifier down"))
             try:
-                self.drive(r, lambda: self.board.get_meta("pause_reason") == "base_conflict")
+                self.drive(r, lambda: "base_conflict" in pauses.active(self.board))
                 for _ in range(3):
                     r.tick()
                     r.wait(0.05)

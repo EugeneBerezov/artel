@@ -3,11 +3,12 @@
 `artel/integration` is only ever moved here, by `git update-ref` with the old value as a guard; nothing in
 this module pushes or checks that branch out.
 """
+import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import journal, procs, slots, transitions
+from artel import journal, pauses, procs, slots, transitions
 from artel.board import Task
 from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
@@ -293,8 +294,7 @@ def finish_base_update(repo: Repo, board, cfg, bu: BaseUpdate) -> str:
         return "applied"
     if bu.kind in ("conflict", "red", "timeout"):
         detail = journal.truncate_utf8(f"{bu.kind}: {bu.detail}", journal.TEXT_LIMIT)
-        board.set_meta("pause_reason", "base_conflict")
-        board.set_meta("pause_detail", detail)
+        pauses.add(board, "base_conflict", detail, now=time.time())
         journal.append(board, "FAIL", journal.truncate_utf8(f"base {cfg['base']} into {INTEGRATION}: {detail}",
                                                             journal.TEXT_LIMIT), author=_RUNNER,
                        basis=journal.truncate_utf8(_rel(repo, bu.log_path) if bu.log_path else "", 200))
