@@ -70,7 +70,9 @@ class CmdAgentTest(RepoTestCase):
             self.run_cmd(CA.run_add, "add", "x", "--after", "99")
         with self.assertRaises(UsageError):
             self.run_cmd(CA.run_add, "add", "x", "--review", "0")
-        self.assertEqual(self.board().list_tasks(), [])
+        with self.assertRaises(UsageError):
+            self.run_cmd(CA.run_add, "add", "x", "--after", "1", "--after", "99")   # one id valid, one not
+        self.assertEqual(self.board().list_tasks(), [])   # catches validating after the insert
 
     # --- note --------------------------------------------------------------------------------------------
 
@@ -81,6 +83,12 @@ class CmdAgentTest(RepoTestCase):
         os.environ["ARTEL_TASK"] = "7"   # the stage is missing too
         with self.assertRaises(ArtelError):
             self.run_cmd(CA.run_note, "note", "FACT", "x")
+
+    def test_note_with_unknown_task_is_a_clean_error(self):
+        os.environ.update(ARTEL_TASK="42", ARTEL_STAGE="write")
+        with self.assertRaises(ArtelError) as cm:
+            self.run_cmd(CA.run_note, "note", "FACT", "x")
+        self.assertIn("not a task on this board", str(cm.exception))
 
     def test_note_appends_with_stage_and_round(self):
         self.board().insert_task(title="t", state="writing", created_by="human")
@@ -134,6 +142,12 @@ class CmdAgentTest(RepoTestCase):
         self.assertIn("commands.project_tools", str(cm.exception))
         with self.assertRaises(UsageError):
             self.run_cmd(CA.run_heavy, "heavy", "--")   # nothing to run
+        marker = self.tmp / "ran.txt"
+        self.configure(commands={"project_tools": ["Bash(npm test *)"],
+                                 "heavy_lock": [sys.executable, "-c", f"open({str(marker)!r}, 'w').close()"]})
+        with self.assertRaises(UsageError):   # catches checking the pattern after the lock/command started
+            self.run_cmd(CA.run_heavy, "heavy", "--", sys.executable, "-c", "pass")
+        self.assertFalse(marker.exists())
 
     def test_heavy_runs_under_prefix_and_returns_code(self):
         marker = self.tmp / "locked.txt"
@@ -155,6 +169,9 @@ class CmdAgentTest(RepoTestCase):
         self.assertTrue(match(["Bash(make *)", "Read(x)"], ["make", "all"]))
         self.assertTrue(match([r"Bash(C:\Tools\py\python.exe *)"], [r"C:\Tools\py\python.exe", "-m", "pytest"]))
         self.assertFalse(match([], ["make"]))
+        # catches fnmatch.fnmatch (case-insensitive and / == \ on Windows)
+        self.assertFalse(match([r"Bash(C:\Tools\*)"], [r"c:\tools\x"]))
+        self.assertFalse(match(["Bash(make *)"], ["MAKE", "all"]))
 
     # --- shim and env --------------------------------------------------------------------------------------
 
@@ -178,6 +195,7 @@ class CmdAgentTest(RepoTestCase):
         self.assertEqual(base["PATH"], os.pathsep.join(["/base/bin", "/usr/bin"]))   # the input is not mutated
         bare = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={})
         self.assertEqual(bare["PYTHONPATH"], package_root)
+        self.assertEqual(bare["PATH"], str(self.repo.artel_dir / "bin"))   # no trailing empty (cwd) entry
 
     def test_agent_env_respects_case_of_path_key(self):
         env = CA.agent_env(self.repo, task_id=1, stage="fix", round=1, base_env={"Path": "C:\\x"})

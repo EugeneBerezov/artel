@@ -51,7 +51,7 @@ def notice_path(repo: Repo, cfg: Config) -> Path:
     target = repo.artel_dir / NOTICE_NAME
     text = builtin_text(NOTICE_NAME)
     # part of the cached prompt prefix (spike Q6): rewrite only when the content differs
-    if not target.is_file() or _normalize(target.read_text(encoding="utf-8")) != text:
+    if not target.is_file() or target.read_bytes() != text.encode("utf-8"):   # byte-exact, CRLF included
         _write(target, text)
     return target
 

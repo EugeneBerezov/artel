@@ -55,6 +55,11 @@ def run_note(args) -> int:
     repo = Repo.discover(Path.cwd())
     board = open_board(repo.board_path)
     try:
+        board.get_task(task_id)   # a stale ARTEL_TASK is an error, not a foreign-key traceback
+    except UnknownTask:
+        board.close()
+        raise ArtelError(f"artel note: ARTEL_TASK {task_id} is not a task on this board") from None
+    try:
         journal.append(board, args.kind, args.text, author=f"agent:{stage}", task_id=task_id, stage=stage,
                        round=int(round_text) if round_text and round_text.isdigit() else None,
                        basis=args.basis or "")
@@ -84,7 +89,10 @@ def run_heavy(args) -> int:
     if not tool_pattern_matches(cfg["commands.project_tools"], cmd):
         raise UsageError(f"artel heavy: {' '.join(cmd)!r} matches no Bash(...) pattern in commands.project_tools")
     argv = procs.heavy_argv(cmd, cfg["commands.heavy_lock"], cfg["shell"])
-    return subprocess.run(platform.command_line(argv)).returncode
+    try:
+        return subprocess.run(platform.command_line(argv)).returncode
+    except OSError as exc:
+        raise ArtelError(f"artel heavy: cannot run {argv[0]}: {exc}") from exc
 
 
 def ensure_shim(repo: Repo) -> Path:
@@ -100,7 +108,7 @@ def agent_env(repo: Repo, *, task_id: int, stage: str, round: int, base_env: Map
     bin_dir = ensure_shim(repo)
     env.update(ARTEL_TASK=str(task_id), ARTEL_STAGE=stage, ARTEL_ROUND=str(round), PYTHONIOENCODING="utf-8")
     path_key, pp_key = key("PATH"), key("PYTHONPATH")
-    env[path_key] = str(bin_dir) + os.pathsep + env.get(path_key, "")
+    env[path_key] = os.pathsep.join(p for p in (str(bin_dir), env.get(path_key, "")) if p)   # no empty entry
     package_root = str(Path(artel.__file__).resolve().parent.parent)   # the shim works from a checkout too
     env[pp_key] = os.pathsep.join(p for p in (package_root, env.get(pp_key, "")) if p)
     return env

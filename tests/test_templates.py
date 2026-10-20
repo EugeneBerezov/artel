@@ -153,3 +153,25 @@ class TemplatesTest(RepoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PackagingTest(unittest.TestCase):
+    def test_pyproject_ships_the_templates(self):
+        """Mutation caught: dropping artel.builtin_templates from the package list or the *.md package data."""
+        import tomllib
+        root = Path(__file__).resolve().parents[1]
+        data = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+        self.assertIn("artel.builtin_templates", data["tool"]["setuptools"]["packages"])
+        self.assertIn("builtin_templates/*.md", data["tool"]["setuptools"]["package-data"]["artel"])
+        self.assertTrue((root / "artel" / "builtin_templates" / "__init__.py").is_file())
+
+    def test_notice_with_crlf_copy_is_rewritten(self):
+        """Mutation caught: comparing the cached notice after newline normalization (prefix bytes differ)."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            from tests.helpers import make_repo
+            repo = Repo.discover(make_repo(Path(tmp)))
+            cfg = C.load_config(repo, env={})
+            path = T.notice_path(repo, cfg)
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
+            T.notice_path(repo, cfg)
+            self.assertNotIn(b"\r", path.read_bytes())
