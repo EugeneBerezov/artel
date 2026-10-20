@@ -50,6 +50,46 @@ class HardeningTest(StagesCase):
         self.assertFalse(run.merge_committed)   # a commit, but not the merge of integration
         self.assertEqual(self.task(tid).state, "open")
 
+    def test_conflict_fix_committed_before_a_requeue_keeps_the_work(self):
+        # catches: judging the merge against where THIS run started (a retry would delete the whole branch)
+        tid = self.conflict_task()
+        self.scenario({f"{tid}:fix": [{"write": ["shared.txt", "merged\n"]}, {"commit": "resolve"},
+                                     {"result_error": 429}]})
+        plan, run, tr = self.go(tid)
+        self.assertIsNone(tr)   # requeued: the limit hit came without a valid result
+        self.assertTrue(run.merge_committed)
+        self.scenario({f"{tid}:fix": [{"result": READY}]})   # the retry: the merge is already in the branch
+        plan, run, tr = self.go(tid)
+        self.assertEqual(plan.conflict_paths, ())
+        self.assertTrue(run.merge_committed)
+        self.assertEqual(self.task(tid).state, "reviewing")
+        self.assertTrue(self.repo.branch_exists(f"artel/{tid}"))
+
+    def test_conflict_fix_with_a_follow_up_commit_after_the_merge_is_ready(self):
+        tid = self.conflict_task()
+        self.scenario({f"{tid}:fix": [{"write": ["shared.txt", "merged\n"]}, {"commit": "resolve"},
+                                     {"write": ["notes.txt", "n\n"]}, {"commit": "follow-up"}, {"result": READY}]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.merge_committed)
+        self.assertEqual(self.task(tid).state, "reviewing")
+
+    def test_second_conflict_cycle_needs_a_new_merge(self):
+        # an old merge commit on the branch must not satisfy a later conflict fix
+        tid = self.conflict_task()
+        self.scenario({f"{tid}:fix": [{"write": ["shared.txt", "merged\n"]}, {"commit": "resolve"}, {"result": READY}]})
+        self.go(tid)
+        self.assertEqual(self.task(tid).state, "reviewing")
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("shared.txt", "theirs again\n", "integration edits it again")
+        git(self.repo_path, "checkout", "-q", "main")
+        task = self.task(tid)
+        self.board.update_task(tid, expect_state="reviewing", expect_version=task.version, state="fixing",
+                               fix_kind="conflict", fix_base=None)
+        self.scenario({f"{tid}:fix": [{"result": READY}]})   # claims ready without committing the new merge
+        plan, run, tr = self.go(tid)
+        self.assertEqual(plan.conflict_paths, ("shared.txt",))
+        self.assertFalse(run.merge_committed)
+
     def test_conflict_fix_that_merges_nothing_is_not_ready(self):
         tid = self.conflict_task()
         self.scenario({f"{tid}:fix": [{"result": READY}]})
@@ -203,8 +243,9 @@ class HardeningTest(StagesCase):
         self.scenario({f"{tid}:fix": [{"result": {"outcome": "fail", "summary": "x"}}]})
         plan, run, tr = self.go(tid)
         self.assertIn("review issue", plan.prompt)
-        findings_format = [line for line in plan.prompt.splitlines() if "] attack issue" in line or "[major] attack" in line]
-        self.assertEqual(findings_format, [])   # not offered to the fixer as a finding to fix
+        block = plan.prompt.split('<untrusted-notes source="findings">')[1].split("</untrusted-notes>")[0]
+        self.assertIn("review issue", block)
+        self.assertNotIn("attack issue", block)   # not offered to the fixer as a finding to fix
 
     def test_closure_template_lists_the_open_findings_in_its_own_format(self):
         tid = self.task_in("reviewing", round=2, with_commit=True)

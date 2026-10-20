@@ -159,12 +159,22 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
                      log_path=log_path, run_id=run.id, head_before=head, conflict_paths=conflict_paths)
 
 
-def _commit_facts(repo, path: Path, task: Task, plan: StagePlan) -> tuple[bool, bool]:
+def _merge_target(repo, path: Path, task: Task, plan: StagePlan) -> str | None:
+    """What a conflict fix has to merge: the commit start_conflict_merge left in MERGE_HEAD, or — when the branch
+    already contains integration ("Already up to date": a retry after the merge was committed) — its tip."""
+    if not (plan.stage == "fix" and task.fix_kind == "conflict"):
+        return None
+    found = slots._git(repo, "rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=path, check=False)
+    return found.stdout.strip() if found.returncode == 0 else repo.rev(INTEGRATION)
+
+
+def _commit_facts(repo, path: Path, task: Task, plan: StagePlan, merge_target: str | None) -> tuple[bool, bool]:
     """(new_commits, merge_committed), measured on the TASK BRANCH (not on a HEAD the agent may have moved)
-    and read before the slot is left (PD-35)."""
+    and read before the slot is left (PD-35). The merge is committed when the commit that was to be merged is
+    an ancestor of the branch tip: this survives integration moving on while the fixer works, a follow-up
+    commit after the merge, and a retry after the merge was already committed."""
     branch = task_branch(task.id)
     tip = repo.rev(branch) or ""
-    conflict = plan.stage == "fix" and task.fix_kind == "conflict"
     if plan.stage == "write":
         count = slots._git(repo, "rev-list", "--count", f"{INTEGRATION}..{branch}", cwd=path, check=False)
         new = count.returncode == 0 and int(count.stdout.strip() or 0) > 0
@@ -173,14 +183,9 @@ def _commit_facts(repo, path: Path, task: Task, plan: StagePlan) -> tuple[bool, 
     else:
         new = False
     merged = False
-    if conflict and tip:
-        # the commit that merged integration into the branch: two parents, the first is where the fix started,
-        # the second was an integration tip (integration only moves forward, so it is still an ancestor of it
-        # now even when other tasks merged while the fixer worked)
-        parents = slots._git(repo, "rev-list", "--parents", "-n", "1", tip, cwd=path).stdout.split()
-        if len(parents) >= 3 and parents[1] == plan.head_before:
-            merged = slots._git(repo, "merge-base", "--is-ancestor", parents[2], INTEGRATION, cwd=path,
-                                check=False).returncode == 0
+    if merge_target and tip:
+        merged = slots._git(repo, "merge-base", "--is-ancestor", merge_target, tip, cwd=path,
+                            check=False).returncode == 0
         new = tip != plan.head_before
     return new, merged
 
@@ -195,7 +200,8 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
     try:
         task = board.get_task(plan.task_id)
         path = slots.slot_path(repo, cfg, slot_n)
-        if not (plan.stage == "fix" and task.fix_kind == "conflict"):            # PD-43: markers break setup
+        merge_target = _merge_target(repo, path, task, plan)
+        if merge_target is None:                                                    # PD-43: markers break setup
             setup = slots.run_setup_if_needed(repo, board, cfg, slot_n, path, task_id=plan.task_id,
                                               on_start=on_start, stop_event=stop_event, env=plan.base_env)
         if setup in ("failed", "timeout", "stopped"):
@@ -224,7 +230,7 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                 reason = "the agent reported an error"
             else:
                 reason = "the agent returned no structured output"
-            new_commits, merge_committed = _commit_facts(repo, path, task, plan)
+            new_commits, merge_committed = _commit_facts(repo, path, task, plan, merge_target)
             outcome = ("stopped" if stopped else "timeout" if timed_out else
                        result["outcome"] if result else "rate_limited" if parser.limit_hit() else "invalid")
     finally:
@@ -379,7 +385,7 @@ def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun)
 
 def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Transition:
     task = board.get_task(task_id)
-    stage = STATE_TO_STAGE.get(task.state)
+    stage = STATE_TO_STAGE.get(task.state, task.state)   # verifying has no agent stage; its state names the job
     try:
         journal.append(board, "FAIL", _clip("internal error: " + error_tail), author="runner", task_id=task_id,
                        stage=stage)
@@ -388,7 +394,6 @@ def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Tr
                                tip=repo.rev(task_branch(task_id)))
     finally:
         board.clear_running(task_id)
-    if stage is not None:
-        _cause_verdict(board, tr, StagePlan(task_id, stage, task.round, "", "", "", "", [], {}, {}, Path(), 0, "", ()),
-                       dict(task_id=task_id, stage=stage, round=task.round))
+    _cause_verdict(board, tr, StagePlan(task_id, stage, task.round, "", "", "", "", [], {}, {}, Path(), 0, "", ()),
+                   dict(task_id=task_id, stage=stage, round=task.round))
     return tr
