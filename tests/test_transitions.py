@@ -20,11 +20,17 @@ def tr(state, event, limits=LIM, **kw):
     return T.decide(make_task(state=state, **task_fields), event, limits, **kw)
 
 
+CLEAR = {"asked_by": None, "cause": None, "answered": True}   # the `clear_ask` update
+
+
 class RowTests(unittest.TestCase):
-    def check(self, t, rid, to, **updates):
+    def check(self, t, rid, to, *, effects=(), text="", **updates):
+        """Exact: the whole updates dict, the whole effects tuple and the cause text (a stray reset_branch,
+        answered=1 or a dropped cause fails)."""
         self.assertEqual((t.rid, t.to_state), (rid, to))
-        for key, value in updates.items():
-            self.assertEqual(t.updates[key], value, key)
+        self.assertEqual(t.updates, updates)
+        self.assertEqual(t.effects, effects)
+        self.assertEqual(t.cause, text)   # `cause` is also a task column, so the verdict text is `text`
 
     def test_R01_add_human_goes_open(self):
         t = T.decide(None, "add_human", None)
@@ -40,41 +46,39 @@ class RowTests(unittest.TestCase):
     def test_R04a_vet_ok_opens_when_autoapprove_non_risky_or_all(self):
         for auto in ("non_risky", "all"):
             with self.subTest(auto=auto):
-                t = tr("vetting", "vet_ok", lim(autoapprove=auto))
-                self.check(t, "R04a", "open")
-                self.assertEqual(t.cause, f"autoapprove={auto}")
+                self.check(tr("vetting", "vet_ok", lim(autoapprove=auto)), "R04a", "open",
+                           text=f"autoapprove={auto}")
 
     def test_R04b_vet_ok_awaits_approval_when_autoapprove_none(self):
-        self.check(tr("vetting", "vet_ok", lim(autoapprove="none")), "R04b", "awaiting_approval")
+        self.check(tr("vetting", "vet_ok", lim(autoapprove="none")), "R04b", "awaiting_approval",
+                   text="autoapprove=none")
 
     def test_R04c_risky_vet_goes_to_attack_then_approval(self):
         for auto in ("none", "non_risky"):
             with self.subTest(auto=auto):
                 self.check(tr("vetting", "vet_risky", lim(autoapprove=auto)), "R04c", "attacking",
-                           then="awaiting_approval", risky=True)
+                           then="awaiting_approval", risky=True, text=f"autoapprove={auto}")
 
     def test_R04d_risky_vet_with_autoapprove_all_opens_after_attack(self):
         self.check(tr("vetting", "vet_risky", lim(autoapprove="all")), "R04d", "attacking",
-                   then="open", risky=True)
+                   then="open", risky=True, text="autoapprove=all")
 
     def test_R05_vet_inadequate_rejects_by_vet(self):
         self.check(tr("vetting", "vet_inadequate"), "R05", "rejected", rejected_by="vet")
 
     def test_R06_vet_fail_counts_and_sticks_at_cap(self):
-        self.check(tr("vetting", "stage_failed", task={"attempts": 0}), "R06", "vetting", attempts=1)
-        t = tr("vetting", "stage_failed", task={"attempts": 1})
-        self.check(t, "R06", "stuck", attempts=2, stuck_from="vetting")
-        self.assertEqual(t.cause, "attempts 2 >= max_attempts 2")
+        self.check(tr("vetting", "stage_failed", task={"attempts": 0}), "R06", "vetting", attempts=1,
+                   text="attempts 1 < max_attempts 2")
+        self.check(tr("vetting", "stage_failed", task={"attempts": 1}), "R06", "stuck", attempts=2,
+                   stuck_from="vetting", text="attempts 2 >= max_attempts 2")
 
     def test_R07a_attack_clear_awaits_approval_when_vet_asked_for_it(self):
-        t = tr("attacking", "attack_clear", task={"then": "awaiting_approval"})
-        self.check(t, "R07a", "awaiting_approval", then=None)
-        self.assertEqual(t.effects, ("append_findings",))
+        self.check(tr("attacking", "attack_clear", task={"then": "awaiting_approval"}), "R07a",
+                   "awaiting_approval", then=None, effects=("append_findings",))
 
     def test_R07b_attack_clear_opens_when_vet_said_open(self):
-        t = tr("attacking", "attack_clear", task={"then": "open"})
-        self.check(t, "R07b", "open", then=None)
-        self.assertEqual(t.effects, ("append_findings",))
+        self.check(tr("attacking", "attack_clear", task={"then": "open"}), "R07b", "open", then=None,
+                   effects=("append_findings",))
 
     def test_R08_approve_from_proposed_awaiting_and_vet_rejected(self):
         for state, extra in (("proposed", {}), ("awaiting_approval", {}), ("rejected", {"rejected_by": "vet"})):
@@ -89,9 +93,8 @@ class RowTests(unittest.TestCase):
         self.assertEqual(set(T.LIVE), set(spec_sources))   # catches dropping stuck/awaiting_accept from LIVE
         for state in spec_sources:
             with self.subTest(state=state):
-                t = tr(state, "reject")
-                self.check(t, "R09", "rejected", rejected_by="human")
-                self.assertEqual(t.effects, ("terminate_running", "delete_branch"))
+                self.check(tr(state, "reject"), "R09", "rejected", rejected_by="human",
+                           effects=("terminate_running", "delete_branch"))
         with self.assertRaises(T.TransitionError):
             tr("done", "reject")
 
@@ -102,9 +105,8 @@ class RowTests(unittest.TestCase):
         self.check(tr("open", "pick", task={"attack": False}), "R10b", "writing")
 
     def test_R11_attack_clear_without_then_goes_writing(self):
-        t = tr("attacking", "attack_clear", task={"then": None})
-        self.check(t, "R11", "writing")
-        self.assertEqual(t.effects, ("append_findings",))
+        self.check(tr("attacking", "attack_clear", task={"then": None}), "R11", "writing",
+                   effects=("append_findings",))
 
     def test_R12_attack_blocker_blocks_with_a_question(self):
         self.check(tr("attacking", "attack_blocker"), "R12", "blocked", asked_by="attack", cause="ask")
@@ -112,8 +114,10 @@ class RowTests(unittest.TestCase):
     def test_R13_attack_and_review_fail_count_then_stick(self):
         for state in ("attacking", "reviewing"):
             with self.subTest(state=state):
-                self.check(tr(state, "stage_failed", task={"attempts": 0}), "R13", state, attempts=1)
-                self.check(tr(state, "stage_failed", task={"attempts": 1}), "R13", "stuck", stuck_from=state)
+                self.check(tr(state, "stage_failed", task={"attempts": 0}), "R13", state, attempts=1,
+                           text="attempts 1 < max_attempts 2")
+                self.check(tr(state, "stage_failed", task={"attempts": 1}), "R13", "stuck", attempts=2,
+                           stuck_from=state, text="attempts 2 >= max_attempts 2")
 
     def test_R14a_writer_ready_goes_reviewing_round_one(self):
         self.check(tr("writing", "ready", task={"round": 0}), "R14a", "reviewing", round=1)
@@ -123,25 +127,23 @@ class RowTests(unittest.TestCase):
                    round=2, fix_kind=None)
 
     def test_R15_verify_fix_ready_goes_verifying_without_round(self):
-        t = tr("fixing", "ready", task={"fix_kind": "verify", "round": 2})
-        self.check(t, "R15", "verifying", fix_kind=None)
-        self.assertNotIn("round", t.updates)
+        self.check(tr("fixing", "ready", task={"fix_kind": "verify", "round": 2}), "R15", "verifying",
+                   fix_kind=None)
 
     def test_R16_conflict_fix_ready_reviews_with_closure_template(self):
-        t = tr("fixing", "ready", task={"fix_kind": "conflict", "round": 2})
-        self.check(t, "R16", "reviewing", fix_kind=None, review_closure=True)
-        self.assertNotIn("round", t.updates)
+        self.check(tr("fixing", "ready", task={"fix_kind": "conflict", "round": 2}), "R16", "reviewing",
+                   fix_kind=None, review_closure=True)
 
     def test_R17_writer_fail_resets_and_sticks_as_writing(self):
         fields = {"fix_kind": "verify", "round": 2, "verify_fixes": 1, "attempts": 0, "fix_base": "abc",
                   "accepted": True, "review_closure": True}
-        t = tr("fixing", "stage_failed", task=fields)
-        self.check(t, "R17", "open", attempts=1, round=0, verify_fixes=0, fix_kind=None, fix_base=None,
-                   accepted=False, review_closure=False)
-        t = tr("fixing", "stage_failed", task=dict(fields, attempts=1))
-        self.check(t, "R17", "stuck", stuck_from="writing")
-        self.assertEqual(t.effects, ("reset_branch",))
-        self.check(tr("writing", "stage_failed", task={"attempts": 1}), "R17", "stuck", stuck_from="writing")
+        reset = dict(round=0, verify_fixes=0, fix_kind=None, fix_base=None, accepted=False, review_closure=False)
+        self.check(tr("fixing", "stage_failed", task=fields), "R17", "open", attempts=1, **reset,
+                   effects=("reset_branch",), text="attempts 1 < max_attempts 2")
+        for state in ("fixing", "writing"):
+            self.check(tr(state, "stage_failed", task=dict(fields, attempts=1)), "R17", "stuck", attempts=2,
+                       stuck_from="writing", **reset, effects=("reset_branch",),
+                       text="attempts 2 >= max_attempts 2")
 
     def test_R18_ask_from_each_stage_state(self):
         for state, stage in (("vetting", "vet"), ("attacking", "attack"), ("writing", "write"),
@@ -156,141 +158,136 @@ class RowTests(unittest.TestCase):
     def test_R19_setup_failed_changes_nothing_but_pauses(self):
         for state in ("vetting", "attacking", "writing", "reviewing", "fixing", "verifying"):
             with self.subTest(state=state):
-                t = tr(state, "setup_failed")
-                self.check(t, "R19", state)
-                self.assertEqual(t.updates, {})
-                self.assertEqual(t.effects, ("pause_setup_failed",))
+                self.check(tr(state, "setup_failed"), "R19", state, effects=("pause_setup_failed",))
 
     def test_R20_internal_error_counts_and_sticks(self):
-        t = tr("verifying", "internal_error", task={"attempts": 0})
-        self.check(t, "R20", "verifying", attempts=1)
-        self.assertEqual(t.effects, ("notify_internal_error",))
-        self.check(tr("writing", "internal_error", task={"attempts": 1}), "R20", "stuck", stuck_from="writing")
-        for state in ("reviewing", "verifying", "vetting"):   # catches R20 borrowing R17's stuck_from=writing
-            self.check(tr(state, "internal_error", task={"attempts": 1}), "R20", "stuck", stuck_from=state)
+        self.check(tr("verifying", "internal_error", task={"attempts": 0}), "R20", "verifying", attempts=1,
+                   effects=("notify_internal_error",), text="attempts 1 < max_attempts 2")
+        for state in T.JOB_STATES:   # every source state sticks from itself (R17's "writing" is not borrowed)
+            with self.subTest(state=state):
+                self.check(tr(state, "internal_error", task={"attempts": 1}), "R20", "stuck", attempts=2,
+                           stuck_from=state, effects=("notify_internal_error",),
+                           text="attempts 2 >= max_attempts 2")
+        self.assertEqual(set(T.JOB_STATES), {"vetting", "attacking", "writing", "reviewing", "fixing", "verifying"})
 
     def test_R21_review_clear_goes_verifying(self):
         self.check(tr("reviewing", "review_clear", task={"review_closure": True}), "R21", "verifying",
                    review_closure=False)
 
     def test_R22a_blocking_review_below_cap_goes_fixing(self):
-        t = tr("reviewing", "review_blocking", task={"round": 1}, tip="deadbeef")
-        self.check(t, "R22a", "fixing", fix_kind="review", review_closure=False, fix_base="deadbeef")
-        self.assertEqual(t.cause, "round 1 < review_rounds 2")
+        self.check(tr("reviewing", "review_blocking", task={"round": 1}, tip="deadbeef"), "R22a", "fixing",
+                   fix_kind="review", review_closure=False, fix_base="deadbeef",
+                   text="round 1 < review_rounds 2")
         with self.assertRaises(T.TransitionError):
             tr("reviewing", "review_blocking", task={"round": 1})   # no tip
         self.check(tr("reviewing", "review_blocking", lim(review_rounds=3), task={"round": 2}, tip="x"),
-                   "R22a", "fixing")
-        self.check(T.decide(make_task(state="reviewing", round=2, extra_review_rounds=1, review_rounds=None),
-                            "review_blocking", T.Limits.for_task(make_task(extra_review_rounds=1),
-                                                                 max_attempts=2, review_rounds=2,
-                                                                 max_verify_fixes=2, merge="auto",
-                                                                 autoapprove="non_risky"), tip="x"),
-                   "R22a", "fixing")
+                   "R22a", "fixing", fix_kind="review", review_closure=False, fix_base="x",
+                   text="round 2 < review_rounds 3")
+        effective = T.Limits.for_task(make_task(extra_review_rounds=1), max_attempts=2, review_rounds=2,
+                                      max_verify_fixes=2, merge="auto", autoapprove="non_risky")
+        self.check(T.decide(make_task(state="reviewing", round=2, extra_review_rounds=1), "review_blocking",
+                            effective, tip="x"), "R22a", "fixing", fix_kind="review", review_closure=False,
+                   fix_base="x", text="round 2 < review_rounds 3")
 
     def test_R22b_blocking_review_at_cap_asks_the_human(self):
-        t = tr("reviewing", "review_blocking", task={"round": 2})
-        self.check(t, "R22b", "blocked", asked_by="review", cause="cap", review_closure=False)
-        self.assertEqual(t.cause, "round 2 >= review_rounds 2")
-        self.assertEqual(t.effects, ("ask_open_findings",))
+        self.check(tr("reviewing", "review_blocking", task={"round": 2}), "R22b", "blocked", asked_by="review",
+                   cause="cap", review_closure=False, effects=("ask_open_findings",),
+                   text="round 2 >= review_rounds 2")
 
     def test_R23_answer_after_attack_keeps_then(self):
-        t = tr("blocked", "answer", task={"asked_by": "attack", "cause": "ask", "then": "open"})
-        self.check(t, "R23", "attacking", asked_by=None, cause=None, answered=True)
-        self.assertNotIn("then", t.updates)
-        self.assertEqual(t.effects, ("append_answer",))
+        self.check(tr("blocked", "answer", task={"asked_by": "attack", "cause": "ask", "then": "open"}),
+                   "R23", "attacking", effects=("append_answer",), **CLEAR)
 
     def test_R24_answer_resumes_write_or_fix(self):
-        self.check(tr("blocked", "answer", task={"asked_by": "write", "cause": "ask"}), "R24", "writing")
-        t = tr("blocked", "answer", task={"asked_by": "fix", "cause": "ask", "fix_kind": "verify"})
-        self.check(t, "R24", "fixing")
-        self.assertNotIn("fix_kind", t.updates)
+        self.check(tr("blocked", "answer", task={"asked_by": "write", "cause": "ask"}), "R24", "writing",
+                   effects=("append_answer",), **CLEAR)
+        self.check(tr("blocked", "answer", task={"asked_by": "fix", "cause": "ask", "fix_kind": "verify"}),
+                   "R24", "fixing", effects=("append_answer",), **CLEAR)   # fix_kind is kept
 
     def test_R25_answer_to_reviewer_question_returns_to_review(self):
-        t = tr("blocked", "answer", task={"asked_by": "review", "cause": "ask", "round": 1})
-        self.check(t, "R25", "reviewing")
-        self.assertNotIn("extra_review_rounds", t.updates)
+        self.check(tr("blocked", "answer", task={"asked_by": "review", "cause": "ask", "round": 1}), "R25",
+                   "reviewing", effects=("append_answer",), **CLEAR)
 
     def test_R26_answer_at_review_cap_grants_an_extra_round(self):
-        t = tr("blocked", "answer", task={"asked_by": "review", "cause": "cap", "extra_review_rounds": 1},
-               tip="t1")
-        self.check(t, "R26", "fixing", fix_kind="review", extra_review_rounds=2, fix_base="t1")
+        self.check(tr("blocked", "answer", task={"asked_by": "review", "cause": "cap", "extra_review_rounds": 1},
+                      tip="t1"), "R26", "fixing", fix_kind="review", extra_review_rounds=2, fix_base="t1",
+                   effects=("append_answer",), **CLEAR)
 
     def test_R27_answer_after_vet_question_returns_to_vetting(self):
-        self.check(tr("blocked", "answer", task={"asked_by": "vet", "cause": "ask"}), "R27", "vetting")
+        self.check(tr("blocked", "answer", task={"asked_by": "vet", "cause": "ask"}), "R27", "vetting",
+                   effects=("append_answer",), **CLEAR)
 
     def test_R28_answer_after_verify_cap_grants_an_extra_fix(self):
-        t = tr("blocked", "answer", task={"asked_by": "verify", "cause": "cap", "extra_verify_fixes": 0},
-               tip="t2")
-        self.check(t, "R28", "fixing", fix_kind="verify", extra_verify_fixes=1, fix_base="t2")
+        self.check(tr("blocked", "answer", task={"asked_by": "verify", "cause": "cap", "extra_verify_fixes": 0},
+                      tip="t2"), "R28", "fixing", fix_kind="verify", extra_verify_fixes=1, fix_base="t2",
+                   effects=("append_answer",), **CLEAR)
 
     def test_R29a_rework_blocked_with_branch(self):
-        t = tr("blocked", "rework", task={"asked_by": "review", "cause": "cap"}, has_branch=True, tip="t3")
-        self.check(t, "R29a", "fixing", fix_kind="review", extra_review_rounds=1, fix_base="t3")
+        self.check(tr("blocked", "rework", task={"asked_by": "review", "cause": "cap"}, has_branch=True, tip="t3"),
+                   "R29a", "fixing", fix_kind="review", extra_review_rounds=1, fix_base="t3",
+                   effects=("append_answer",), **CLEAR)
         with self.assertRaises(T.TransitionError):
             tr("blocked", "rework", task={"asked_by": "review", "cause": "cap"}, tip="t3")   # has_branch missing
 
     def test_R29b_rework_stuck_with_branch_resets_attempts(self):
-        t = tr("stuck", "rework", task={"attempts": 2, "stuck_from": "reviewing", "accepted": True},
-               has_branch=True, tip="t4")
-        self.check(t, "R29b", "fixing", attempts=0, stuck_from=None, answered=True, accepted=False,
-                   fix_kind="review", extra_review_rounds=1, fix_base="t4")
+        self.check(tr("stuck", "rework", task={"attempts": 2, "stuck_from": "reviewing", "accepted": True},
+                      has_branch=True, tip="t4"), "R29b", "fixing", fix_kind="review", extra_review_rounds=1,
+                   attempts=0, stuck_from=None, answered=True, fix_base="t4", accepted=False,
+                   effects=("append_answer",))
 
     def test_R30_rework_stuck_without_branch_returns_to_the_stuck_stage(self):
         for stage in ("vetting", "attacking", "writing"):
             with self.subTest(stage=stage):
-                t = tr("stuck", "rework", task={"attempts": 2, "stuck_from": stage}, has_branch=False)
-                self.check(t, "R30", stage, attempts=0, stuck_from=None, answered=True)
+                self.check(tr("stuck", "rework", task={"attempts": 2, "stuck_from": stage}, has_branch=False),
+                           "R30", stage, attempts=0, stuck_from=None, answered=True,
+                           effects=("append_answer",))
         with self.assertRaises(T.TransitionError):
             tr("stuck", "rework", task={"stuck_from": "writing"})
 
     def test_R31a_verify_green_verifies_when_merge_auto_or_accepted(self):
-        self.check(tr("verifying", "verify_green"), "R31a", "verified")
-        t = tr("verifying", "verify_green", lim(merge="ask"), task={"accepted": True})
-        self.check(t, "R31a", "verified")
-        self.check(tr("verifying", "verify_green", task={"merge": None}), "R31a", "verified")
+        self.check(tr("verifying", "verify_green"), "R31a", "verified", text="merge=auto")
+        self.check(tr("verifying", "verify_green", lim(merge="ask"), task={"accepted": True}), "R31a",
+                   "verified", text="merge=ask, accepted")
+        self.check(tr("verifying", "verify_green", task={"merge": None, "accepted": True}), "R31a", "verified",
+                   text="merge=auto")   # accepted under merge=auto is not "ask, accepted"
 
     def test_R31b_verify_green_awaits_accept_when_merge_ask(self):
-        t = tr("verifying", "verify_green", lim(merge="ask"))
-        self.check(t, "R31b", "awaiting_accept")
-        self.assertEqual(t.cause, "merge=ask")
+        self.check(tr("verifying", "verify_green", lim(merge="ask")), "R31b", "awaiting_accept",
+                   text="merge=ask")
         eff = T.Limits.for_task(make_task(merge="ask"), max_attempts=2, review_rounds=2, max_verify_fixes=2,
                                 merge="auto", autoapprove="non_risky")
-        self.check(tr("verifying", "verify_green", eff), "R31b", "awaiting_accept")
+        self.check(tr("verifying", "verify_green", eff), "R31b", "awaiting_accept", text="merge=ask")
 
     def test_R32_conflict_below_cap_goes_to_conflict_fix(self):
-        t = tr("verifying", "verify_conflict", task={"verify_fixes": 1, "accepted": True})
-        self.check(t, "R32", "fixing", fix_kind="conflict", verify_fixes=2, accepted=False)
-        self.assertNotIn("fix_base", t.updates)
-        self.assertEqual(t.cause, "verify_fixes 1 < max_verify_fixes 2")
+        self.check(tr("verifying", "verify_conflict", task={"verify_fixes": 1, "accepted": True}), "R32",
+                   "fixing", fix_kind="conflict", verify_fixes=2, accepted=False,
+                   text="verify_fixes 1 < max_verify_fixes 2")
 
     def test_R33_red_below_cap_goes_to_verify_fix(self):
-        t = tr("verifying", "verify_red", task={"verify_fixes": 0, "accepted": True}, tip="t5")
-        self.check(t, "R33", "fixing", fix_kind="verify", verify_fixes=1, accepted=False, fix_base="t5")
+        self.check(tr("verifying", "verify_red", task={"verify_fixes": 0, "accepted": True}, tip="t5"), "R33",
+                   "fixing", fix_kind="verify", verify_fixes=1, accepted=False, fix_base="t5",
+                   text="verify_fixes 0 < max_verify_fixes 2")
 
     def test_R34a_red_at_cap_blocks_with_a_question(self):
-        t = tr("verifying", "verify_red", task={"verify_fixes": 2})
-        self.check(t, "R34a", "blocked", asked_by="verify", cause="cap", accepted=False)
-        self.assertEqual(t.cause, "verify_fixes 2 >= max_verify_fixes 2")
+        t = tr("verifying", "verify_red", task={"verify_fixes": 2, "accepted": True})
+        self.assertEqual((t.rid, t.to_state, t.updates, t.effects, t.cause),
+                         ("R34a", "blocked", {"asked_by": "verify", "cause": "cap", "accepted": False}, (),
+                          "verify_fixes 2 >= max_verify_fixes 2"))
 
     def test_R34b_conflict_at_cap_blocks_with_a_question(self):
-        self.check(tr("verifying", "verify_conflict", task={"verify_fixes": 2, "accepted": True}), "R34b",
-                   "blocked", asked_by="verify", cause="cap", accepted=False)
-        self.check(tr("verifying", "verify_conflict", task={"verify_fixes": 2, "extra_verify_fixes": 0}),
-                   "R34b", "blocked")
+        t = tr("verifying", "verify_conflict", task={"verify_fixes": 2, "accepted": True})
+        self.assertEqual((t.rid, t.to_state, t.updates, t.effects, t.cause),
+                         ("R34b", "blocked", {"asked_by": "verify", "cause": "cap", "accepted": False}, (),
+                          "verify_fixes 2 >= max_verify_fixes 2"))
 
     def test_R35_accept_sets_the_flag(self):
         self.check(tr("awaiting_accept", "accept"), "R35", "verified", accepted=True)
 
     def test_R36_fast_forward_done_deletes_branch(self):
-        t = tr("verified", "ff_ok")
-        self.check(t, "R36", "done")
-        self.assertEqual(t.effects, ("delete_branch",))
+        self.check(tr("verified", "ff_ok"), "R36", "done", effects=("delete_branch",))
 
     def test_R37_ff_impossible_reverifies_without_updates(self):
-        t = tr("verified", "ff_impossible")
-        self.check(t, "R37", "verifying")
-        self.assertEqual(t.updates, {})
+        self.check(tr("verified", "ff_impossible"), "R37", "verifying")
 
 
 class MetaTests(unittest.TestCase):
@@ -386,6 +383,24 @@ class MetaTests(unittest.TestCase):
         plain = T.Limits.for_task(make_task(), max_attempts=3, review_rounds=2, max_verify_fixes=2,
                                   merge="auto", autoapprove="none")
         self.assertEqual((plain.review_rounds, plain.max_verify_fixes, plain.merge), (2, 2, "auto"))
+
+    def test_limits_review_rounds_zero_is_zero_not_the_default(self):
+        """Mutation caught: `task.review_rounds or default` (--review 0 would fall back to the default)."""
+        zero = T.Limits.for_task(make_task(review_rounds=0), max_attempts=2, review_rounds=2, max_verify_fixes=2,
+                                 merge="auto", autoapprove="none")
+        self.assertEqual(zero.review_rounds, 0)
+        extra = T.Limits.for_task(make_task(review_rounds=0, extra_review_rounds=2), max_attempts=2,
+                                  review_rounds=2, max_verify_fixes=2, merge="auto", autoapprove="none")
+        self.assertEqual(extra.review_rounds, 2)
+
+    def test_create_agent_task_without_created_by_is_a_transition_error(self):
+        """Mutation caught: a raw TypeError from insert_task for add_agent without created_by."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as d:
+            b = B.open_board(Path(d) / "b.db")
+            self.addCleanup(b.close)
+            with self.assertRaises(T.TransitionError):
+                T.create(b, "add_agent", title="x")
+            self.assertEqual(b.list_tasks(), [])
 
     def test_limits_from_cfg(self):
         cfg = {"max_attempts": 5, "review_rounds": 3, "max_verify_fixes": 1, "merge": "ask",

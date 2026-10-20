@@ -33,7 +33,8 @@ class Limits:
                  merge: str, autoapprove: str) -> "Limits":
         return Limits(
             max_attempts=max_attempts,
-            review_rounds=(task.review_rounds or review_rounds) + task.extra_review_rounds,
+            review_rounds=(review_rounds if task.review_rounds is None else task.review_rounds)
+            + task.extra_review_rounds,
             max_verify_fixes=max_verify_fixes + task.extra_verify_fixes,
             merge=task.merge or merge,
             autoapprove=autoapprove)
@@ -277,7 +278,8 @@ def _cause(row: Row, c: _Ctx, stuck: bool, attempts: int | None) -> str:
     if row.cause == "autoapprove":
         return f"autoapprove={c.limits.autoapprove}"
     if row.cause == "merge":
-        return f"merge={c.limits.merge}"
+        return f"merge={c.limits.merge}, accepted" if row.rid == "R31a" and t.accepted and c.limits.merge == "ask" \
+            else f"merge={c.limits.merge}"
     if row.cause == "review_rounds":
         op = "<" if t.round < c.limits.review_rounds else ">="
         return f"round {t.round} {op} review_rounds {c.limits.review_rounds}"
@@ -346,6 +348,8 @@ def create(board: Board, event: str, **task_fields: Any) -> int:
     tr = decide(None, event, None)
     if event == "add_human":
         task_fields.setdefault("created_by", "human")
+    elif "created_by" not in task_fields:
+        raise TransitionError(f"{event} needs created_by (agent:<task id>)")
     return board.insert_task(state=tr.to_state, **task_fields)
 
 
