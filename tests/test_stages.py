@@ -67,10 +67,10 @@ class StagesCase(RepoTestCase):
         slots.leave_slot(self.repo, self.board, self.cfg, 1)
         return sha
 
-    def go(self, tid, *, stop=None):
+    def go(self, tid, *, stop=None, on_start=noop):
         task = self.board.get_task(tid)
         plan = stages.plan_stage(self.repo, self.board, self.cfg, task, 1, base_env=self.base_env)
-        run = stages.run_stage(self.repo, self.board, self.cfg, plan, 1, on_start=noop,
+        run = stages.run_stage(self.repo, self.board, self.cfg, plan, 1, on_start=on_start,
                                on_rate_limit=self.limits.append, stop_event=stop or threading.Event())
         tr = stages.finish_stage(self.repo, self.board, self.cfg, tid, plan, run)
         return plan, run, tr
@@ -217,7 +217,7 @@ class WriteTest(StagesCase):
         task = self.task(tid)
         self.assertEqual((task.state, task.round, task.attempts, task.running), ("reviewing", 1, 0, False))
         self.assertEqual(tr.event, "ready")
-        (verdict,) = self.entries(tid, "VERDICT")
+        verdict = self.entries(tid, "VERDICT")[0]
         self.assertTrue(verdict.text.startswith("READY write r0 model=sonnet (models.write)"))
         self.assert_slot_left()
         self.assertEqual(git(self.repo_path, "show", f"artel/{tid}:out.txt"), "content")
@@ -230,7 +230,7 @@ class WriteTest(StagesCase):
         task = self.task(tid)
         self.assertEqual((task.state, task.attempts), ("open", 1))   # R17: back to the queue, branch reset
         self.assertFalse(self.repo.branch_exists(f"artel/{tid}"))
-        (verdict,) = self.entries(tid, "VERDICT")
+        verdict = self.entries(tid, "VERDICT")[0]
         self.assertIn("FAIL write", verdict.text)
         self.assertIn("ready without new commits", verdict.text)
         self.assert_slot_left()
@@ -492,7 +492,7 @@ class ReviewTest(StagesCase):
         self.scenario({f"{tid}:review": [{"result": {"outcome": "pass", "summary": "looks fine"}}]})
         self.go(tid)
         self.assertEqual(self.task(tid).state, "verifying")
-        (verdict,) = self.entries(tid, "VERDICT")
+        verdict = self.entries(tid, "VERDICT")[0]
         self.assertTrue(verdict.text.startswith("PASS review r1 model=sonnet (models.review)"))
         self.assertIn("looks fine", verdict.text)
         self.assert_slot_left()

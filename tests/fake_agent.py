@@ -3,7 +3,7 @@
 Used as agent_command = [sys.executable, "<repo>/tests/fake_agent.py"]. Reads the prompt on stdin,
 ARTEL_TASK / ARTEL_STAGE / ARTEL_ROUND from the environment and $ARTEL_FAKE_DIR/scenario.json.
 Scenario keys, first match wins: "<task>:<stage>#<n>", "<task>:<stage>", "<stage>", "*".
-Actions: write, read, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit.
+Actions: write, read, git, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit.
 """
 import json
 import os
@@ -113,6 +113,8 @@ def main() -> int:
         elif name == "read":   # copy a file of the cwd aside, to show a test what the agent saw
             rel, out_name = arg
             (fake_dir / out_name).write_text(Path(rel).read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
+        elif name == "git":   # an arbitrary git command in the cwd (e.g. ["merge", "--abort"])
+            run_git(*arg)
         elif name == "commit":
             run_git("add", "-A")
             run_git("commit", "-q", "-m", arg)

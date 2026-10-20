@@ -122,9 +122,9 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
         head = slots.prepare_detached(repo, board, cfg, slot_n)
     else:
         head = slots.prepare_slot(repo, board, cfg, slot_n, task.id)
+    try:   # from here on any failure must leave the slot (a half-started conflict merge included)
         if stage == "fix" and task.fix_kind == "conflict":
             conflict_paths = tuple(slots.start_conflict_merge(repo, board, cfg, slot_n))
-    try:
         history = journal.task_entries(board, task.id)
         open_review = journal.open_findings(board, task.id, stages=("review",))
         template = prompts.template_name(stage, task)
@@ -159,40 +159,42 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
                      log_path=log_path, run_id=run.id, head_before=head, conflict_paths=conflict_paths)
 
 
-def _head(repo, path: Path) -> str:
-    return slots._git(repo, "rev-parse", "HEAD", cwd=path).stdout.strip()
-
-
 def _commit_facts(repo, path: Path, task: Task, plan: StagePlan) -> tuple[bool, bool]:
-    """(new_commits, merge_committed) of the slot, read before it is left (PD-35)."""
-    head = _head(repo, path)
+    """(new_commits, merge_committed), measured on the TASK BRANCH (not on a HEAD the agent may have moved)
+    and read before the slot is left (PD-35)."""
+    branch = task_branch(task.id)
+    tip = repo.rev(branch) or ""
     conflict = plan.stage == "fix" and task.fix_kind == "conflict"
     if plan.stage == "write":
-        count = slots._git(repo, "rev-list", "--count", f"{INTEGRATION}..HEAD", cwd=path).stdout.strip()
-        new = int(count or 0) > 0
+        count = slots._git(repo, "rev-list", "--count", f"{INTEGRATION}..{branch}", cwd=path, check=False)
+        new = count.returncode == 0 and int(count.stdout.strip() or 0) > 0
     elif plan.stage == "fix":
-        new = head != (task.fix_base or plan.head_before)
+        new = bool(tip) and tip != (task.fix_base or plan.head_before)
     else:
         new = False
     merged = False
-    if conflict:
-        ancestor = slots._git(repo, "merge-base", "--is-ancestor", INTEGRATION, "HEAD", cwd=path, check=False)
-        parents = slots._git(repo, "rev-list", "--parents", "-n", "1", "HEAD", cwd=path).stdout.split()
-        merged = ancestor.returncode == 0 and len(parents) >= 3
-        new = head != plan.head_before
+    if conflict and tip:
+        # the commit that merged integration into the branch: two parents, the first is where the fix started,
+        # the second was an integration tip (integration only moves forward, so it is still an ancestor of it
+        # now even when other tasks merged while the fixer worked)
+        parents = slots._git(repo, "rev-list", "--parents", "-n", "1", tip, cwd=path).stdout.split()
+        if len(parents) >= 3 and parents[1] == plan.head_before:
+            merged = slots._git(repo, "merge-base", "--is-ancestor", parents[2], INTEGRATION, cwd=path,
+                                check=False).returncode == 0
+        new = tip != plan.head_before
     return new, merged
 
 
 def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnStart,
               on_rate_limit: Callable[[RateLimit], None], stop_event: threading.Event) -> StageRun:
-    task = board.get_task(plan.task_id)
-    path = slots.slot_path(repo, cfg, slot_n)
     parser = StreamParser()
     setup = "skipped"
     outcome, exit_code, timed_out, stopped = "error", None, False, False
     result, reason = None, None
     new_commits = merge_committed = False
     try:
+        task = board.get_task(plan.task_id)
+        path = slots.slot_path(repo, cfg, slot_n)
         if not (plan.stage == "fix" and task.fix_kind == "conflict"):            # PD-43: markers break setup
             setup = slots.run_setup_if_needed(repo, board, cfg, slot_n, path, task_id=plan.task_id,
                                               on_start=on_start, stop_event=stop_event, env=plan.base_env)
@@ -286,16 +288,17 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     author = f"agent:{plan.stage}"
     common = dict(task_id=task.id, stage=plan.stage, round=plan.round)
     result = run.result
-    if result is not None and plan.stage == "review":
+    judged = result is not None and result["outcome"] in ("pass", "findings")   # not for fail / ask results
+    if judged and plan.stage == "review":
         open_ids = {e.id for e in journal.open_findings(board, task.id)}
         for finding_id in dict.fromkeys(result["closed"]):
             if finding_id in open_ids:
                 journal.close_finding(board, finding_id, task_id=task.id, round=plan.round,
                                       basis=f"review r{plan.round}", author=author)
             else:                                                                    # PD-42
-                journal.append(board, "FAIL", f"closed #{finding_id} ignored: not an open finding of #{task.id}",
+                journal.append(board, "FAIL", _clip(f"closed #{finding_id} ignored: not an open finding of #{task.id}"),
                                author="runner", **common)
-    if result is not None and plan.stage in ("attack", "review"):
+    if judged and plan.stage in ("attack", "review"):
         for finding in result["findings"]:
             severity = _effective_severity(task, plan.stage, finding["severity"])
             text = finding["text"]
@@ -341,33 +344,51 @@ def _ask_open_findings(board, task_id: int, common: dict) -> None:
                    author="runner", **common)
 
 
+def _cause_verdict(board, tr: Transition, plan: StagePlan, common: dict) -> None:
+    if not tr.cause:
+        return
+    if tr.to_state in ("blocked", "stuck") or tr.event in ("stage_failed", "internal_error"):
+        word = tr.to_state.upper() if tr.to_state in ("blocked", "stuck") else "RETRY"
+        journal.append(board, "VERDICT", _clip(f"{word} {plan.stage} r{plan.round}: {tr.cause}"),
+                       author="runner", **common)                                    # names the setting
+
+
 def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun) -> Transition | None:
     task = board.get_task(task_id)
+    if STATE_TO_STAGE.get(task.state) != plan.stage:   # e.g. rejected while the job ran (PD-30): nothing to apply
+        board.clear_running(task_id)
+        return None
     event = classify(task, plan.stage, run, board)
     if event == "requeue":
         board.clear_running(task_id)
         return None
-    record_stage(board, task, plan, run, event)
-    tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
-                           has_branch=repo.branch_exists(task_branch(task_id)),
-                           tip=repo.rev(task_branch(task_id)))
-    board.clear_running(task_id)
+    try:
+        record_stage(board, task, plan, run, event)
+        tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
+                               has_branch=repo.branch_exists(task_branch(task_id)),
+                               tip=repo.rev(task_branch(task_id)))
+    finally:
+        board.clear_running(task_id)
     common = dict(task_id=task_id, stage=plan.stage, round=plan.round)
     if "ask_open_findings" in tr.effects:
         _ask_open_findings(board, task_id, common)
-    if tr.to_state in ("blocked", "stuck") and tr.cause:
-        journal.append(board, "VERDICT", _clip(f"{tr.to_state.upper()} {plan.stage} r{plan.round}: {tr.cause}"),
-                       author="runner", **common)                                    # names the setting
+    _cause_verdict(board, tr, plan, common)
     slots.apply_git_effects(repo, board, cfg, task_id, tr.effects)
     return tr
 
 
 def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Transition:
     task = board.get_task(task_id)
-    journal.append(board, "FAIL", _clip("internal error: " + error_tail), author="runner", task_id=task_id,
-                   stage=STATE_TO_STAGE.get(task.state))
-    tr = transitions.apply(board, task_id, "internal_error", Limits.from_cfg(task, cfg),
-                           has_branch=repo.branch_exists(task_branch(task_id)),
-                           tip=repo.rev(task_branch(task_id)))
-    board.clear_running(task_id)
+    stage = STATE_TO_STAGE.get(task.state)
+    try:
+        journal.append(board, "FAIL", _clip("internal error: " + error_tail), author="runner", task_id=task_id,
+                       stage=stage)
+        tr = transitions.apply(board, task_id, "internal_error", Limits.from_cfg(task, cfg),
+                               has_branch=repo.branch_exists(task_branch(task_id)),
+                               tip=repo.rev(task_branch(task_id)))
+    finally:
+        board.clear_running(task_id)
+    if stage is not None:
+        _cause_verdict(board, tr, StagePlan(task_id, stage, task.round, "", "", "", "", [], {}, {}, Path(), 0, "", ()),
+                       dict(task_id=task_id, stage=stage, round=task.round))
     return tr
