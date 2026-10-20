@@ -447,7 +447,7 @@ def _cmd_script(command: str) -> str:
     command, restore it and exit with the command's exit code. Lines before `chcp` are ASCII."""
     lines = [
         "@echo off",
-        "setlocal",
+        "setlocal DisableDelayedExpansion",   # a `!` in a path must stay a `!`
         "for /f \"tokens=2 delims=:.\" %%a in ('chcp') do set \"ARTEL_CP=%%a\"",
         "chcp 65001 >nul",
         command,
@@ -458,9 +458,11 @@ def _cmd_script(command: str) -> str:
     return "".join(line + "\r\n" for line in lines)
 
 
-# ROOT goes first only when it is not already on sys.path (a pip-installed artel: site-packages must not
-# shadow the stdlib)
-SHIM_CODE = ("import sys; p = sys.argv.pop(1); p in sys.path or sys.path.insert(0, p); "
+# ROOT goes first only when it is not already on sys.path, compared as normcase(realpath) because the runner's
+# spelling (resolve(), `C:/x` from Git Bash) may differ from sys.path's (a pip install: site-packages must not
+# shadow the stdlib). No `"` and no `%` in the code.
+SHIM_CODE = ("import os, sys; p = sys.argv.pop(1); n = lambda x: os.path.normcase(os.path.realpath(x)); "
+             "any(n(x) == n(p) for x in sys.path) or sys.path.insert(0, p); "
              "from artel.cli import main; raise SystemExit(main())")
 
 
@@ -519,7 +521,7 @@ def write_shim(bin_dir: Path, python: str, root: str, *, zipapp: bool = False) -
                     if not IS_WINDOWS and name == "artel":
                         target.chmod(0o755)   # a lost exec bit is repaired without touching the content
                     continue
-        except OSError:
+        except (OSError, ValueError):   # unreadable or not UTF-8: rewrite it
             pass
         fd, tmp_name = tempfile.mkstemp(dir=bin_dir, prefix=name + ".", suffix=".tmp")
         tmp = Path(tmp_name)

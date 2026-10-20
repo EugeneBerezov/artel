@@ -383,19 +383,56 @@ class ShimTest(unittest.TestCase):
         self.assertIn("exec //h/s/python.exe", unc)
         self.assertIn(" //h/s/src ", unc)
 
+    def root_goes_first(self, root: str, on_path: str | None) -> bool:
+        """Runs SHIM_CODE (without the artel import) with ROOT's other spelling already on sys.path."""
+        code = P.SHIM_CODE.replace("from artel.cli import main; raise SystemExit(main())", "print(sys.path[0] == p)")
+        extra = f"sys.path.append({on_path!r}); " if on_path else ""
+        prog = f"import sys; {extra}sys.argv = ['-c', {root!r}]; exec({code!r})"
+        res = subprocess.run([sys.executable, "-I", "-c", prog], capture_output=True, encoding="utf-8")
+        self.assertEqual(res.returncode, 0, res.stderr)
+        return res.stdout.strip() == "True"
+
     def test_shim_code_adds_root_only_when_not_on_sys_path(self):
         """Mutation caught: an unconditional insert(0) (site-packages ahead of the stdlib for a pip install)."""
-        code = P.SHIM_CODE.replace("from artel.cli import main; raise SystemExit(main())", "print(sys.path[:2])")
-        probe = lambda root, extra: subprocess.run(  # noqa: E731
-            [sys.executable, "-I", "-c", code, root], capture_output=True, encoding="utf-8",
-            env={**os.environ, "PYTHONPATH": ""}).stdout
-        self.assertTrue(probe("/fresh/root", "").startswith("['/fresh/root'"))
-        prog = ("import sys, runpy; sys.path.append('/known'); sys.argv = ['-c', '/known']; "
-                f"exec({code!r}.replace('print(sys.path[:2])', 'print(sys.path.count(\"/known\"), sys.path[0] == \"/known\")'))")
-        out = subprocess.run([sys.executable, "-I", "-c", prog], capture_output=True, encoding="utf-8").stdout
-        self.assertEqual(out.strip(), "1 False")
+        real = self.tmp / "root"
+        real.mkdir()
+        self.assertTrue(self.root_goes_first(str(real), None))
+        self.assertFalse(self.root_goes_first(str(real), str(real)))
         self.assertNotIn('"', P.SHIM_CODE)
         self.assertNotIn("%", P.SHIM_CODE)
+
+    def test_shim_code_root_compare_is_normalized(self):
+        """Mutation caught: comparing the raw strings (a trailing separator, a symlinked parent, or on Windows
+        `C:/x` against `C:\\x` / another case would put site-packages ahead of the stdlib)."""
+        real = self.tmp / "root"
+        real.mkdir()
+        self.assertFalse(self.root_goes_first(str(real), str(real) + os.sep))
+        self.assertFalse(self.root_goes_first(str(real), str(real / ".." / "root")))
+        if P.IS_WINDOWS:
+            self.assertFalse(self.root_goes_first(str(real).replace("\\", "/"), str(real).upper()))
+        link = self.tmp / "link"
+        P.link_dir(link, real)   # a symlink (a junction on Windows)
+        self.assertFalse(self.root_goes_first(str(real), str(link)))
+        # the odd spelling as ROOT, the canonical one on sys.path (Git Bash `C:/x`, a symlinked checkout path):
+        # catches normalizing only the sys.path entries
+        self.assertFalse(self.root_goes_first(str(link), str(real)))
+        self.assertFalse(self.root_goes_first(str(real) + os.sep, str(real)))
+
+    def test_write_shim_rewrites_undecodable_file(self):
+        """Mutation caught: the compare-read catching only OSError (UnicodeDecodeError on every stage)."""
+        bin_dir = self.tmp / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "artel").write_bytes(b"\xff\xfe\x00bad")
+        P.write_shim(bin_dir, sys.executable, str(REPO_ROOT))
+        self.assertEqual((bin_dir / "artel").read_text(encoding="utf-8"),
+                         P.shim_files(sys.executable, str(REPO_ROOT))["artel"])
+
+    def test_cmd_script_disables_delayed_expansion(self):
+        """Mutation caught: plain `setlocal` (a `!` in a path is eaten when delayed expansion is on by default)."""
+        cmd = P.shim_files("C:\\Py\\python.exe", "C:\\r!x", windows=True)["artel.cmd"]
+        self.assertIn("setlocal DisableDelayedExpansion\r\n", cmd)
+        self.assertLess(cmd.index("setlocal DisableDelayedExpansion"), cmd.index("-X utf8"))
+        self.assertNotIn("setlocal\r\n", cmd)
 
     def test_cmd_shim_root_ending_in_backslash(self):
         """Mutation caught: `"D:\\"` (a drive-root checkout): the backslash escapes the closing quote."""
