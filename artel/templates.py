@@ -6,7 +6,8 @@ from artel.config import Config, load_config
 from artel.errors import ArtelError
 from artel.gitutil import Repo
 
-TEMPLATE_NAMES = ("vet.md", "attack.md", "write.md", "review.md", "review-closure.md", "fix.md")
+TEMPLATE_NAMES = ("vet.md", "attack.md", "write.md", "review.md", "review-closure.md",
+                  "review-verify-fix.md", "fix.md")
 NOTICE_NAME = "unattended.md"
 PLACEHOLDERS = ("task_id", "title", "body", "area", "stage", "round", "branch", "diff_range",
                 "task_history", "findings", "closure_list", "verify_log", "context", "answer",

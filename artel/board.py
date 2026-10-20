@@ -60,7 +60,7 @@ class Task:
     then: str | None                # after a vet-triggered attack: "awaiting_approval" | "open" | None
     rejected_by: str | None         # "vet" | "human" | None
     stuck_from: str | None          # stage state the task got stuck in (PD-28)
-    review_closure: bool            # next review uses the closure template (PD-29)
+    review_closure: int             # next review's template: 0 none, 1 conflict closure (PD-29), 2 verify-fix review (PD-48)
     fix_base: str | None            # task-branch tip when the task last entered fixing (PD-35)
     accepted: bool                  # human accepted the verified commit (PD-36)
     risky: bool                     # vet found the task risky (PD-37)
@@ -124,7 +124,7 @@ class Request:
 
 
 _TASK_FIELDS = tuple(f.name for f in dataclasses.fields(Task))
-_TASK_BOOLS = frozenset({"attack", "strong", "review_closure", "accepted", "risky", "answered", "running"})
+_TASK_BOOLS = frozenset({"attack", "strong", "accepted", "risky", "answered", "running"})
 _NOT_UPDATABLE = frozenset({"id", "version", "created_at", "updated_at"})
 _RUNNING_COLUMNS = ("running_kind", "running_started_at", "running_pid", "running_group",
                     "running_fingerprint", "running_slot")

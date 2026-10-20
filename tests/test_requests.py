@@ -295,9 +295,20 @@ class ApplyTest(RequestsCase):
         answers = [e.text for e in journal.task_entries(self.board, without) if e.kind == "ANSWER"]
         self.assertEqual(answers, ["rework: try again"])
 
-    def test_accept_on_blocked_is_an_error_until_r35b(self):
-        # Task 31 replaces this with test_accept_blocked_verify_fix_reverifies
+    def test_accept_blocked_verify_ask_goes_to_verifying_with_an_answer(self):
+        """Task 31 (R35b) replaced test_accept_on_blocked_is_an_error_until_r35b. Mutation caught: no ANSWER entry,
+        or `accepted` set (accept would then bypass the merge gates, PD-62)."""
         tid, _ = self.blocked("verify")
+        self.enqueue("accept", tid)
+        (applied,) = self.apply()
+        self.assertIsNone(applied.error)
+        task = self.board.get_task(tid)
+        self.assertEqual((task.state, task.fix_kind, task.asked_by, task.accepted), ("verifying", None, None, False))
+        answers = [e.text for e in journal.task_entries(self.board, tid) if e.kind == "ANSWER"]
+        self.assertEqual(answers, ["accept: verify again as is"])
+
+    def test_accept_on_a_review_blocked_task_is_an_error(self):
+        tid, _ = self.blocked("review", cause="cap")
         self.enqueue("accept", tid)
         (applied,) = self.apply()
         self.assertIn("transition not allowed", applied.error)

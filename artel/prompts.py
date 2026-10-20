@@ -32,6 +32,8 @@ def format_entry(e: Entry) -> str:
 
 def template_name(stage: str, task: Task) -> str:
     if stage == "review":
+        if task.review_closure == 2:                                                              # PD-48
+            return "review-verify-fix.md"
         return "review-closure.md" if task.round >= 2 or task.review_closure else "review.md"   # PD-29
     if stage in ("vet", "attack", "write", "fix"):
         return f"{stage}.md"
