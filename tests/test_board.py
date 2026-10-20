@@ -481,6 +481,77 @@ class BoardTest(unittest.TestCase):
             t.join()
         self.assertEqual(results, ["1"] * 8)
 
+    # The schema as of Task 4/42, per table: column -> (NOT NULL, DEFAULT, PK position).
+    # A subset check: later tasks may add tables, columns, indexes and constraints without editing it.
+    _NOT_NULL_0 = (1, "0", 0)
+    _SCHEMA_SUBSET = {
+        "meta": {"key": (0, None, 1), "value": (1, None, 0)},
+        "tasks": {
+            "id": (0, None, 1), "title": (1, None, 0), "body": (1, "''", 0), "area": (1, "'[]'", 0),
+            "priority": _NOT_NULL_0, "state": (1, None, 0), "created_by": (1, None, 0),
+            "attack": _NOT_NULL_0, "strong": _NOT_NULL_0, "review_rounds": (0, None, 0),
+            "merge": (0, None, 0), "extra_review_rounds": _NOT_NULL_0, "extra_verify_fixes": _NOT_NULL_0,
+            "attempts": _NOT_NULL_0, "round": _NOT_NULL_0, "verify_fixes": _NOT_NULL_0,
+            "fix_kind": (0, None, 0), "asked_by": (0, None, 0), "cause": (0, None, 0), "then": (0, None, 0),
+            "rejected_by": (0, None, 0), "stuck_from": (0, None, 0), "review_closure": _NOT_NULL_0,
+            "fix_base": (0, None, 0), "accepted": _NOT_NULL_0, "risky": _NOT_NULL_0, "answered": _NOT_NULL_0,
+            "last_verify": (0, None, 0), "running": _NOT_NULL_0, "running_kind": (0, None, 0),
+            "running_started_at": (0, None, 0), "running_pid": (0, None, 0), "running_group": (0, None, 0),
+            "running_fingerprint": (0, None, 0), "running_slot": (0, None, 0), "version": _NOT_NULL_0,
+            "created_at": (1, None, 0), "updated_at": (1, None, 0),
+        },
+        "task_deps": {"task_id": (1, None, 1), "after_id": (1, None, 2)},
+        "entries": {
+            "id": (0, None, 1), "ts": (1, None, 0), "kind": (1, None, 0), "task_id": (0, None, 0),
+            "stage": (0, None, 0), "round": (0, None, 0), "text": (1, None, 0), "basis": (1, "''", 0),
+            "severity": (0, None, 0), "status": (0, None, 0), "ref": (0, None, 0), "author": (1, None, 0),
+        },
+        "runs": {
+            "id": (0, None, 1), "task_id": (1, None, 0), "stage": (1, None, 0), "n": (1, None, 0),
+            "round": (1, None, 0), "model": (0, None, 0), "model_reason": (0, None, 0), "slot": (0, None, 0),
+            "log_path": (1, None, 0), "started_at": (1, None, 0), "ended_at": (0, None, 0),
+            "outcome": (0, None, 0), "usage": (1, "'{}'", 0), "exit_code": (0, None, 0),
+            "timed_out": _NOT_NULL_0, "killed": _NOT_NULL_0, "first_context": (0, None, 0),
+            "last_context": (0, None, 0), "turns": (0, None, 0), "duration_ms": (0, None, 0),
+            "cost_usd": (0, None, 0), "session_id": (0, None, 0),
+        },
+        "slots": {"n": (0, None, 1), "path": (1, None, 0), "task_id": (0, None, 0), "setup_hash": (0, None, 0)},
+        "requests": {
+            "id": (0, None, 1), "ts": (1, None, 0), "command": (1, None, 0), "task_id": (0, None, 0),
+            "payload": (1, "'{}'", 0), "applied_at": (0, None, 0), "error": (0, None, 0),
+        },
+    }
+    # table -> index name -> (unique, columns)
+    _INDEX_SUBSET = {"entries": {"entries_task": (0, ["task_id", "id"])}}
+
+    def test_schema_tables_columns_and_indexes(self):
+        # catches: a dropped table/column/index, a lost NOT NULL or DEFAULT (e.g. on risky), a changed PK
+        conn = self.board.conn
+        tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+        self.assertLessEqual(set(self._SCHEMA_SUBSET), tables)
+        for table, expected in self._SCHEMA_SUBSET.items():
+            found = {r[1]: (r[3], r[4], r[5]) for r in conn.execute(f"PRAGMA table_info({table})")}
+            for column, (not_null, default, pk) in expected.items():
+                with self.subTest(table=table, column=column):
+                    self.assertIn(column, found)
+                    if not_null:
+                        self.assertEqual(found[column][0], 1, "NOT NULL")
+                    if default is not None:
+                        self.assertEqual(found[column][1], default, "DEFAULT")
+                    self.assertEqual(found[column][2], pk, "PK position")
+        for table, indexes in self._INDEX_SUBSET.items():
+            found = {r[1]: r[2] for r in conn.execute(f"PRAGMA index_list({table})")}
+            for name, (unique, columns) in indexes.items():
+                with self.subTest(index=name):
+                    self.assertIn(name, found)
+                    self.assertEqual(found[name], unique)
+                    self.assertEqual([r[2] for r in conn.execute(f"PRAGMA index_info({name})")], columns)
+
+    def test_all_runs_rejects_string_stages(self):
+        # catches: deleting the isinstance(stages, str) guard ("write" would match no stage, silently)
+        with self.assertRaises(ValueError):
+            self.board.all_runs(stages="write")
+
     def test_first_open_retries_busy_until_deadline(self):
         # catches: mapping the first SQLITE_BUSY of the journal-mode switch straight to BoardBusy
         real = B._choose_journal_mode
