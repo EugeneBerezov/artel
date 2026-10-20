@@ -1,9 +1,11 @@
+import os
 from pathlib import Path
 
 from artel import gitutil
 from artel.errors import ArtelError, GitError
 from tests.helpers import RepoTestCase, git
 import tempfile
+from unittest import mock
 
 
 class GitutilTest(RepoTestCase):
@@ -65,3 +67,53 @@ class GitutilTest(RepoTestCase):
     def test_task_branch_name(self):
         self.assertEqual(gitutil.task_branch(7), "artel/7")
         self.assertEqual(gitutil.INTEGRATION, "artel/integration")
+
+
+class GitutilMoreTest(RepoTestCase):
+    def repo(self):
+        return gitutil.Repo.discover(self.repo_path)
+
+    def test_paths_under_artel_dir(self):
+        """Mutation caught: any of the pinned artel paths pointing elsewhere."""
+        repo = self.repo()
+        base = repo.common_dir / "artel"
+        self.assertEqual(repo.artel_dir, base)
+        self.assertEqual(repo.lock_path, base / "runner.lock")
+        self.assertEqual(repo.logs_dir, base / "logs")
+        self.assertEqual(repo.board_path, base / "board.db")
+        self.assertEqual(repo.stop_path, base / "stop")
+        self.assertEqual(repo.tmp_dir, base / "tmp")
+
+    def test_git_passes_cwd_input_env(self):
+        """Mutation caught: Repo.git ignoring cwd=, input= or env=."""
+        repo = self.repo()
+        blob = repo.git("hash-object", "--stdin", input="x").stdout.strip()
+        self.assertEqual(blob, "c1b0730e0133447badcfd47fd144e254807b06e1")   # git's id of the bytes "x"
+        wt = self.tmp / "wt"
+        git(self.repo_path, "worktree", "add", "-q", "-b", "other", str(wt))
+        self.commit_file("w.txt", "w\n", "in worktree", cwd=wt)
+        self.assertEqual(repo.git("rev-parse", "HEAD", cwd=wt).stdout.strip(), git(wt, "rev-parse", "HEAD"))
+        self.assertNotEqual(git(wt, "rev-parse", "HEAD"), git(self.repo_path, "rev-parse", "HEAD"))
+        env = dict(os.environ, GIT_AUTHOR_NAME="Someone Else")
+        repo.git("commit", "--allow-empty", "-q", "-m", "e", env=env)
+        self.assertEqual(git(self.repo_path, "log", "-1", "--format=%an"), "Someone Else")
+
+    def test_rev_peels_to_commit(self):
+        """Mutation caught: rev() returning the tag or tree object instead of a commit / None."""
+        repo = self.repo()
+        head = git(self.repo_path, "rev-parse", "HEAD")
+        git(self.repo_path, "tag", "-a", "-m", "annotated", "v-test")
+        self.assertNotEqual(git(self.repo_path, "rev-parse", "v-test"), head)   # the tag object
+        self.assertEqual(repo.rev("v-test"), head)
+        self.assertIsNone(repo.rev(git(self.repo_path, "rev-parse", "HEAD^{tree}")))
+
+    def test_git_missing_raises_artel_error(self):
+        """Mutation caught: a missing git reported as 'not inside a git repository' / a leaked FileNotFoundError."""
+        repo = self.repo()
+        with mock.patch("subprocess.run", side_effect=FileNotFoundError("git")):
+            with self.assertRaises(ArtelError) as cm:
+                gitutil.Repo.discover(self.repo_path)
+            self.assertIn("git not found on PATH", str(cm.exception))
+            with self.assertRaises(ArtelError) as cm:
+                repo.git("status")
+            self.assertIn("git not found on PATH", str(cm.exception))
