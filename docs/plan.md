@@ -2422,7 +2422,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
 
 **Depends on:** Task 15
 
-**Spec:** §3.1 "Single writer" (human commands append to `requests`; the runner applies them on its next tick through the table; without a runner they wait; pauses are a set — revised spec §3.1 "Pauses": plain `resume` removes exactly the kinds whose Ends column names `resume` (`manual`, `base_conflict`, `failures`; `limit` and `agent_unavailable` only once their probes are exhausted), `resume --force` empties the set), §8 (answer, approve, reject, accept, rework, pause, resume, stop), §5 (`stop`, `stop --now`), §12 (stop file), PD-19, PD-26, PD-30.
+**Spec:** §3.1 "Single writer" (human commands append to `requests`; the runner applies them on its next tick through the table; without a runner they wait; pauses are a set — revised spec §3.1 "Pauses": plain `resume` removes exactly the kinds whose Ends column names `resume` (`manual`, `base_conflict`, `failures`; `limit`, `agent_unavailable` and a probed `quota` only once their probes are exhausted), `resume --force` empties the set), §8 (answer, approve, reject, accept, rework, pause, resume, stop), §5 (`stop`, `stop --now`), §12 (stop file), PD-19, PD-26, PD-30.
 
 **Context for the writer:** Global Constraints + PD-19, PD-26 (amended), PD-30, PD-35, PD-54, PD-58 (only `failure_streak`), PD-60 + this task.
 
@@ -2470,7 +2470,8 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
   ```python
   KINDS = ("manual", "base_conflict", "failures", "limit", "agent_unavailable", "quota", "disk", "setup_failed")
   HUMAN_KINDS = ("manual", "base_conflict", "failures")      # plain resume removes them (PD-60)
-  PROBED_KINDS = ("limit", "agent_unavailable")                # plain resume removes them once exhausted (PD-60)
+  PROBED_KINDS = ("limit", "agent_unavailable")                # always probed when no reset is known (PD-60)
+  # plain resume also removes ANY kind whose record has "exhausted": true (a probed `quota` included, spec §3.1)
   TOKEN_FREE_KINDS = ("limit", "quota", "agent_unavailable") # verify and integration continue under these only
   @dataclass(frozen=True)
   class Cause: detail: str; setting: str | None = None; until: float | None = None
@@ -3292,7 +3293,7 @@ def agent_env(repo, *, task_id, stage, round, base_env) -> dict[str, str]
       # (injected clock); with until None → when probe.due, start a Job(kind="probe", slot=-1) (at most one at a time);
       # its result: ok → unpause the kind; limit with resets_at → the cause's until set; unavailable or limit
       # without a time → nothing; then record_probe; no probes left → pauses.set_exhausted + a paused event saying
-      # `resume` (quota: `resume --force`) is needed
+      # plain `resume` is needed
   ```
   `Job.kind` gains `"probe"` (an additive value of Task 15's pinned field; `slot = -1` means no slot and `_free_slots` ignores it).
 
