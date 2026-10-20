@@ -76,6 +76,14 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(cm.exception.code, 2)
         self.assertTrue(keep.exists())
 
+    def test_build_refuses_staging_that_is_a_file(self):
+        """Mutation caught: a traceback (NotADirectoryError) instead of the exit-2 message."""
+        target = self.tmp / "stage"
+        target.write_text("file\n", encoding="utf-8", newline="\n")
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as cm:
+            build_pyz.build(self.tmp / "artel.pyz", target)
+        self.assertEqual(cm.exception.code, 2)
+
     def test_build_reuses_own_staging_and_empty_dirs(self):
         """Mutation caught: refusing a staging directory the build itself created."""
         pyz = self.build()

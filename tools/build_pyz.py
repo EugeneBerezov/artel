@@ -16,7 +16,7 @@ def build(out: Path, staging: Path) -> Path:
     if staging.exists():
         if (staging / MARKER).is_file():
             shutil.rmtree(staging)
-        elif any(staging.iterdir()):
+        elif not staging.is_dir() or any(staging.iterdir()):
             print(f"error: staging directory {staging} is not empty and is not an artel staging "
                   f"directory (no {MARKER}); refusing to delete it", file=sys.stderr)
             raise SystemExit(2)

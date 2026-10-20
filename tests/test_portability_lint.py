@@ -250,6 +250,10 @@ class LintRulesTest(unittest.TestCase):
         }
         for source, rule in flagged.items():
             self.assertEqual(self._rules(source + "\n"), [f"artel/x.py:1: {rule}"], source)
+        for name in sorted(OS_FROM_NAMES):   # each name on its own: none may hide behind another
+            self.assertEqual(len(self._rules(f"from os import {name}\n")), 1, name)
+        for name in sorted(SUBPROCESS_FUNCS):
+            self.assertEqual(len(self._rules(f"from subprocess import {name}\n")), 1, name)
         self.assertEqual(self._rules("from os import path\n"), [])
         self.assertEqual(self._rules("from subprocess import CalledProcessError\n"), [])
 

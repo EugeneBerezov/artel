@@ -153,6 +153,7 @@ class DispatchTest(unittest.TestCase):
 
     def test_output_survives_legacy_console_encoding(self):
         """Mutation caught: removing the stdout/stderr reconfigure loop in cli.main."""
+        # argparse echoes the bad command to stderr; without the reconfigure, cp1252 stderr cannot show it
         out = subprocess.run([sys.executable, "-m", "artel", "привет-✓"], cwd=REPO_ROOT,
                              env=subprocess_env(PYTHONIOENCODING="cp1252"), capture_output=True)
         stderr = out.stderr.decode("utf-8", errors="replace")
