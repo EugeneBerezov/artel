@@ -3376,11 +3376,14 @@ Content requirements per section (§11): (1) three sentences + "when not to use 
 # artel.platform
 def shim_files(python: str, root: str, *, zipapp: bool = False, windows: bool = IS_WINDOWS) -> dict[str, str]
     # sh (also what Git Bash runs on Windows — Claude Code's Bash tool uses it there):
-    #   exec <q(python)> -X utf8 -I -c 'import sys; sys.path.insert(0, sys.argv.pop(1)); from artel.cli import main; raise SystemExit(main())' <q(root)> "$@"
-    #   q = shlex.quote of the path with "/" separators (Windows paths converted for Git Bash: C:\x → /c/x;
-    #   a UNC path \\h\s → //h/s); ROOT is an argument, never spliced into the code string
+    #   exec <q(python)> -X utf8 -I -c 'import sys; r = sys.argv.pop(1); r in sys.path or sys.path.insert(0, r); from artel.cli import main; raise SystemExit(main())' <q(root)> "$@"
+    #   (ROOT already on sys.path — a site-packages install — is not moved in front of the stdlib; T34 gap, 2026-10-20)
+    #   q = shlex.quote of the path with "/" separators (Windows paths for Git Bash: C:\x → C:/x, not /c/x, so
+    #   MSYS_NO_PATHCONV=1 does not break them; a UNC path \\h\s → //h/s); ROOT is an argument, never spliced
+    #   into the code string
     # cmd: the same argv through _cmd_script (PD-33), python, the -c code string and ROOT each double-quoted
-    #   as their own argument (cmd-escaped: % → %%, and ^ before & | < > ^), then %* (round 2, N8)
+    #   as their own argument (cmd-escaped: % → %% only — inside double quotes ^ is literal and & | < > need
+    #   no escape), then %* (round 2, N8; T34 gap, 2026-10-20)
     # zipapp True: exec <q(python)> -X utf8 -I <q(root)> "$@"   (root = the .pyz path)
     # -X utf8 keeps UTF-8 I/O although -I ignores PYTHONIOENCODING / PYTHONUTF8
 def write_shim(bin_dir: Path, python: str, root: str, *, zipapp: bool = False) -> Path
@@ -3393,7 +3396,9 @@ def ensure_shim(repo: Repo) -> Path
     # zipapp=True and root = that .pyz
 def agent_env(repo, *, task_id, stage, round, base_env) -> dict[str, str]
     # unchanged except: PYTHONPATH is left exactly as in base_env (no package_root injection — spec §6:
-    # a slot's own tools and tests must import the slot's code, never the runner's)
+    # a slot's own tools and tests must import the slot's code, never the runner's); sets
+    # NoDefaultCurrentDirectoryInExePath="1" so cmd.exe does not run a slot's artel.cmd/.bat/.exe before PATH
+    # (T34 gap, 2026-10-20; test_agent_env_disables_cmd_cwd_lookup)
 ```
 
 - [ ] **Step 1: Write the failing tests**, each naming its mutation:
@@ -3540,7 +3545,7 @@ def gates(repo, board, cfg, task, result: VerifyResult) -> list[Hit]
 - Modify: `artel/stages.py` (`plan_stage`: profile per stage, closure-kind `diff_range`, `closure_list` and `verify_log` per template; `run_stage`: repository check, `extra_time` deadline; `classify`: `repo_changes`; `record_stage`: FAIL entry, `downgrade_prefix`), `tests/test_stages.py`
 - Modify: `artel/agent_claude.py` (`build_argv` accepts `attacker`), `tests/test_agent_claude.py`
 - Modify: `artel/procs.py` (`run_tree(deadline=…)`), `tests/test_procs.py`
-- Modify: `artel/slots.py` (setup outputs, hash invalidation in `leave_slot`), `tests/test_slots.py`
+- Modify: `artel/slots.py` (setup outputs, hash invalidation in `leave_slot`; T30 review minor, reviews/T30-1.md: `_exclude_slots_dir` normalizes the slots path (`os.path.normpath`) before `relative_to`, so `a/../b` cannot escape the `info/exclude` guard), `tests/test_slots.py`
 - Modify: `artel/prompts.py` (`template_name`: `review-conflict.md`), `tests/test_prompts.py`
 - Modify: `artel/templates.py` (`TEMPLATE_NAMES`), `artel/builtin_templates/review.md`, `review-closure.md`, `review-verify-fix.md`, `unattended.md`; Create: `artel/builtin_templates/review-conflict.md`; Modify: `tests/test_templates.py`
 - Modify: `tests/fake_agent.py` (actions for any stage: `{"write_file": <path>}`, `{"commit": <message>}`, `{"git": [args…]}` — the last runs git in the slot, so a test can move a foreign ref, add a hook or a stash)
@@ -3562,7 +3567,7 @@ def gates(repo, board, cfg, task, result: VerifyResult) -> list[Hit]
   `test_stages.py`: `test_review_uses_reviewer_profile_vet_attack_use_attacker`; `test_reviewer_probe_file_is_removed`; `test_reviewer_commit_fails_and_is_restored`; `test_writer_moving_integration_or_other_branch_fails` (fake writer `{"git": ["branch", "-f", "artel/7", "HEAD"]}` → `attempts += 1`, `artel/7` restored, FAIL entry — catches checking reviewers only); `test_closure_review_diff_is_fix_only`; `test_closure_list_filled_for_every_closure_template` (subTest per template: open finding ids appear in the prompt — catches the `review-closure.md`-only condition); `test_verify_fix_review_gets_verify_log`; `test_conflict_review_uses_conflict_template`; `test_downgrade_prefix_keeps_severity`; `test_stage_deadline_extended_by_extra_time` (a fake agent sleeping 3 s, `stage_timeout = 2s`, `extra_time` returns 2 → completes — catches a fixed timeout).
   `test_agent_claude.py`: `test_build_argv_attacker_profile` (no `ValueError`; `--permission-mode default`; `Bash(git * --output*)` disallowed).
   `test_procs.py`: `test_deadline_callable_is_reevaluated`.
-  `test_slots.py`: `test_leave_slot_clears_setup_hash_when_setup_output_is_removed` (setup creates `.cache-env/` not in `slot_keep` → hash cleared, setup runs again next stage — catches a slot without its environment); `test_kept_setup_output_keeps_hash` (`.venv` with the new default).
+  `test_slots.py`: `test_leave_slot_clears_setup_hash_when_setup_output_is_removed` (setup creates `.cache-env/` not in `slot_keep` → hash cleared, setup runs again next stage — catches a slot without its environment); `test_kept_setup_output_keeps_hash` (`.venv` with the new default); `test_slots_dir_with_dotdot_is_normalized` (`slots_dir = "x/../.artel/slots"` → the exclude line is `/.artel/slots/`; `"../outside"` → no exclude line — catches the unnormalized check).
   `test_templates.py`: `test_template_names_exact`; `test_unattended_notice_says_do_not_take_the_action`; `test_templates_use_only_placeholders`.
 - [ ] **Step 2: Run** the touched modules — FAIL. **Step 3: Implement.** **Step 4: Whole suite** three times (CI encoding env) — PASS.
 - [ ] **Step 5: Commit** — `T39: repository check around every agent stage, probing reviewers, fix-only closure diffs, conflict review, setup-output invalidation`
