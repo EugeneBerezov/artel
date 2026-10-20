@@ -184,8 +184,10 @@ def _commit_facts(repo, path: Path, task: Task, plan: StagePlan, merge_target: s
         new = False
     merged = False
     if merge_target and tip:
-        merged = slots._git(repo, "merge-base", "--is-ancestor", merge_target, tip, cwd=path,
-                            check=False).returncode == 0
+        # BOTH the commit that was to be merged AND the branch tip before the fix are ancestors of the tip: a
+        # follow-up commit is fine, `merge --abort; reset --hard artel/integration` (work dropped) is not
+        merged = all(slots._git(repo, "merge-base", "--is-ancestor", commit, tip, cwd=path,
+                                check=False).returncode == 0 for commit in (merge_target, plan.head_before))
         new = tip != plan.head_before
     return new, merged
 
@@ -353,6 +355,9 @@ def _ask_open_findings(board, task_id: int, common: dict) -> None:
 def _cause_verdict(board, tr: Transition, plan: StagePlan, common: dict) -> None:
     if not tr.cause:
         return
+    if tr.rid == "R22a":   # review_blocking below the cap -> fixing: name review_rounds (§10)
+        journal.append(board, "VERDICT", _clip(f"FIX {plan.stage} r{plan.round}: {tr.cause}"), author="runner", **common)
+        return
     if tr.to_state in ("blocked", "stuck") or tr.event in ("stage_failed", "internal_error"):
         word = tr.to_state.upper() if tr.to_state in ("blocked", "stuck") else "RETRY"
         journal.append(board, "VERDICT", _clip(f"{word} {plan.stage} r{plan.round}: {tr.cause}"),
@@ -369,10 +374,15 @@ def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun)
         board.clear_running(task_id)
         return None
     try:
-        record_stage(board, task, plan, run, event)
-        tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
-                               has_branch=repo.branch_exists(task_branch(task_id)),
-                               tip=repo.rev(task_branch(task_id)))
+        with board.tx():   # all or nothing: a failed apply must not leave findings that a retry would duplicate
+            record_stage(board, task, plan, run, event)
+            tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
+                                   has_branch=repo.branch_exists(task_branch(task_id)),
+                                   tip=repo.rev(task_branch(task_id)))
+            if "reset_branch" in tr.effects:   # PD-46: the code those findings were about is gone
+                for finding in journal.open_findings(board, task_id, stages=("review",)):
+                    journal.close_finding(board, finding.id, task_id=task_id, round=plan.round,
+                                          basis="superseded: branch reset (R17)", author="artel")
     finally:
         board.clear_running(task_id)
     common = dict(task_id=task_id, stage=plan.stage, round=plan.round)

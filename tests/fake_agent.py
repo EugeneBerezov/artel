@@ -115,6 +115,8 @@ def main() -> int:
             (fake_dir / out_name).write_text(Path(rel).read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
         elif name == "git":   # an arbitrary git command in the cwd (e.g. ["merge", "--abort"])
             run_git(*arg)
+        elif name == "git":   # raw git in the slot (e.g. a fixer that resets away its work)
+            run_git(*arg)
         elif name == "commit":
             run_git("add", "-A")
             run_git("commit", "-q", "-m", arg)

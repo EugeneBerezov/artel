@@ -5,8 +5,9 @@ import sys
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from artel import agent_claude, board as B, config as C, journal, slots, stages
+from artel import agent_claude, board as B, config as C, journal, slots, stages, transitions
 from artel.agent_claude import RateLimit
 from artel.gitutil import INTEGRATION, Repo
 from tests.factories import make_task
@@ -429,6 +430,62 @@ class FixTest(StagesCase):
         task = self.task(tid)
         self.assertEqual((task.state, task.attempts), ("open", 1))   # R17 also covers a failed fixer
         self.assertFalse(self.repo.branch_exists(f"artel/{tid}"))
+
+    def test_conflict_fix_that_resets_away_its_work_is_not_a_merge(self):
+        """Plan: BOTH the merged commit and the tip before the fix must be ancestors. Mutation caught: counting
+        `merge --abort; reset --hard artel/integration` (the branch then equals integration) as a merge."""
+        tid = self.conflict_task()
+        self.scenario({f"{tid}:fix": [{"git": ["merge", "--abort"]}, {"git": ["reset", "--hard", INTEGRATION]},
+                                     {"result": READY}]})
+        plan, run, tr = self.go(tid)
+        self.assertFalse(run.merge_committed)
+        self.assertEqual(self.task(tid).state, "open")
+
+    def test_conflict_fix_with_a_follow_up_commit_after_the_merge_counts(self):
+        tid = self.conflict_task()
+        self.scenario({f"{tid}:fix": [{"write": ["shared.txt", "merged\n"]}, {"commit": "resolve"},
+                                     {"write": ["extra.txt", "more\n"]}, {"commit": "follow-up"},
+                                     {"result": READY}]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.merge_committed)
+        self.assertEqual(self.task(tid).state, "reviewing")
+
+    def test_branch_reset_supersedes_open_review_findings_but_not_attack_ones(self):
+        """PD-46. Mutation caught: leaving review findings open after R17 (the fresh review inherits findings
+        about deleted code)."""
+        tid = self.task_in("fixing", fix_kind="review", with_commit=True)
+        base = git(self.repo_path, "rev-parse", f"artel/{tid}")
+        self.board.update_task(tid, expect_state="fixing", expect_version=self.task(tid).version, fix_base=base,
+                               round=1)
+        old = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
+                                  text="about the old code", basis="a.py:1", author="agent:review")
+        attack = journal.add_finding(self.board, task_id=tid, stage="attack", round=0, severity="minor",
+                                     text="about the task", basis="", author="agent:attack")
+        self.scenario({f"{tid}:fix": [{"result": READY}]})   # no commit: R17
+        _, _, tr = self.go(tid)
+        self.assertEqual(tr.rid, "R17")
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid, stages=("review",))], [])
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid, stages=("attack",))], [attack])
+        closes = [e for e in self.entries(tid, "FINDING") if e.status == "closed"]
+        self.assertEqual([(e.ref, e.author, e.basis) for e in closes],
+                         [(old, "artel", "superseded: branch reset (R17)")])
+
+    def test_apply_failure_leaves_no_recorded_findings(self):
+        """Mutation caught: record_stage and apply in separate transactions (a retry duplicates FINDINGs)."""
+        tid = self.task_in("reviewing", with_commit=True, round=1)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "t", "basis": "b"}]}}]})
+        with mock.patch.object(stages.transitions, "apply", side_effect=transitions.StaleTask("lost")):
+            with self.assertRaises(transitions.StaleTask):
+                self.go(tid)
+        self.assertEqual([e for e in self.entries(tid, "FINDING")], [])
+
+    def test_review_below_cap_names_review_rounds(self):
+        tid = self.task_in("reviewing", with_commit=True, round=1)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "t", "basis": "b"}]}}]})
+        self.go(tid)
+        self.assertIn("review_rounds", " ".join(e.text for e in self.entries(tid, "VERDICT")))
 
     def conflict_task(self):
         tid = self.task_in("fixing", fix_kind="conflict", with_commit=False)
