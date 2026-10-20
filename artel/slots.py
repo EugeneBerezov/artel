@@ -14,6 +14,9 @@ from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 
 _NO_BYTES = b"<missing>"
+# an inherited GIT_DIR & co. would redirect every slot command to another repository (e.g. artel run from a hook)
+_GIT_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_PREFIX", "GIT_NAMESPACE")
 
 
 class SlotGuardError(ArtelError):
@@ -40,6 +43,12 @@ def merge_identity_args(repo: Repo) -> list[str]:
     return ["-c", "user.name=artel", "-c", "user.email=artel@localhost"]
 
 
+def _git(repo: Repo, *args: str, cwd: Path, check: bool = True):
+    """Run git inside a slot with the repository-redirecting environment variables removed."""
+    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV}
+    return repo.git(*args, cwd=cwd, check=check, env=env)
+
+
 def _slots_root(repo: Repo, cfg) -> Path:
     return repo.root / cfg["slots_dir"]
 
@@ -52,18 +61,32 @@ def _inside(path: Path, parent: Path) -> bool:
     return path != parent and parent in path.parents
 
 
-def ensure_slots(repo: Repo, board, cfg, count: int) -> list[int]:
-    if _inside(_slots_root(repo, cfg).resolve(), repo.common_dir.resolve()):
+def _check_slots_dir(repo: Repo, cfg) -> None:
+    root = _slots_root(repo, cfg).resolve()
+    common = repo.common_dir.resolve()
+    if root == common or _inside(root, common) or ".git" in root.parts:
         raise ArtelError(f"slots_dir {cfg['slots_dir']!r} is inside .git: slots must live in the working tree")
+    main = repo.root.resolve()
+    if root == main or root in main.parents:
+        raise ArtelError(f"slots_dir {cfg['slots_dir']!r} must be a directory below the repository root")
+
+
+def ensure_slots(repo: Repo, board, cfg, count: int) -> list[int]:
+    _check_slots_dir(repo, cfg)
     repo.git("worktree", "prune")
     known = {wt.path.resolve() for wt in repo.worktrees()}
     for n in range(1, count + 1):
         path = slot_path(repo, cfg, n)
+        if path.resolve() == repo.root.resolve():
+            raise ArtelError(f"slot {n} would be the main worktree {path}")
         if path.resolve() not in known:
             if path.exists() and any(path.iterdir()):
                 raise ArtelError(f"{path} exists but is not a git worktree; remove it or change slots_dir")
             repo.git("worktree", "add", "--detach", str(path), INTEGRATION)
-        board.upsert_slot(n, str(path))
+            board.upsert_slot(n, str(path))
+            board.set_slot_setup_hash(n, None)   # a re-created slot has no installed dependencies
+        else:
+            board.upsert_slot(n, str(path))
     return list(range(1, count + 1))
 
 
@@ -86,60 +109,90 @@ def guard(repo: Repo, board, cfg, n: int) -> Path:
         raise SlotGuardError(f"{expected} is not inside {_slots_root(repo, cfg)}")
     if not expected.is_dir():
         raise SlotGuardError(f"slot {n} directory {expected} does not exist")
-    top = repo.git("rev-parse", "--show-toplevel", cwd=expected, check=False)
-    if top.returncode != 0 or Path(top.stdout.strip()).resolve() != expected.resolve():
+    if expected.resolve() == repo.root.resolve() or expected.resolve() in repo.root.resolve().parents:
+        raise SlotGuardError(f"{expected} is the main worktree or contains it")
+    info = _git(repo, "rev-parse", "--path-format=absolute", "--show-toplevel", "--git-common-dir", "--git-dir",
+                cwd=expected, check=False)
+    lines = info.stdout.splitlines()
+    if info.returncode != 0 or len(lines) != 3:
+        raise SlotGuardError(f"{expected} is not a git worktree")
+    top, common, git_dir = (Path(line).resolve() for line in lines)
+    if top != expected.resolve():
         raise SlotGuardError(f"{expected} is not the top level of a git worktree")
+    if common != repo.common_dir.resolve():
+        raise SlotGuardError(f"{expected} belongs to another repository")
+    if git_dir == common or not _inside(git_dir, common):
+        raise SlotGuardError(f"{expected} is not a linked worktree of this repository")
     return expected
+
+
+_STATE_PATHS = ("rebase-merge", "rebase-apply", "BISECT_LOG", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_HEAD")
 
 
 def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
     """Private: only called after guard()."""
-    if repo.git("rev-parse", "-q", "--verify", "MERGE_HEAD", cwd=path, check=False).returncode == 0:
-        repo.git("merge", "--abort", cwd=path, check=False)
-    repo.git("reset", "--hard", cwd=path)
+    asked = _git(repo, "rev-parse", "--path-format=absolute", *[a for name in _STATE_PATHS
+                                                               for a in ("--git-path", name)], cwd=path)
+    state = {name: Path(line).exists() for name, line in zip(_STATE_PATHS, asked.stdout.splitlines())}
+    if state["rebase-merge"] or state["rebase-apply"]:   # a writer killed mid-rebase or mid-am wedges the slot
+        _git(repo, "rebase", "--abort", cwd=path, check=False)
+        _git(repo, "am", "--abort", cwd=path, check=False)
+        if any(Path(line).exists() for name, line in zip(_STATE_PATHS, asked.stdout.splitlines())
+               if name.startswith("rebase")):
+            _git(repo, "rebase", "--quit", cwd=path, check=False)
+    if state["BISECT_LOG"]:
+        _git(repo, "bisect", "reset", cwd=path, check=False)
+    if state["CHERRY_PICK_HEAD"]:
+        _git(repo, "cherry-pick", "--quit", cwd=path, check=False)
+    if state["REVERT_HEAD"]:
+        _git(repo, "revert", "--quit", cwd=path, check=False)
+    if state["MERGE_HEAD"]:
+        _git(repo, "merge", "--abort", cwd=path, check=False)
+    _git(repo, "reset", "--hard", cwd=path)
     excludes = [arg for pattern in keep for arg in ("-e", pattern)]
-    repo.git("clean", "-ffdx", *excludes, cwd=path)
+    _git(repo, "clean", "-ffdx", *excludes, cwd=path)
 
 
 def _head(repo: Repo, path: Path) -> str:
-    return repo.git("rev-parse", "HEAD", cwd=path).stdout.strip()
+    return _git(repo, "rev-parse", "HEAD", cwd=path).stdout.strip()
 
 
 def prepare_slot(repo: Repo, board, cfg, n: int, task_id: int) -> str:
     path = guard(repo, board, cfg, n)
     branch = task_branch(task_id)
+    repo.git("worktree", "prune")   # a vanished slot must not look like a holder of the branch
     elsewhere = checked_out_elsewhere(repo, branch, except_path=path)
     if elsewhere is not None:
         raise SlotBusy(elsewhere, branch)
     scrub(repo, path, cfg["slot_keep"])
     if repo.branch_exists(branch):
-        repo.git("switch", branch, cwd=path)
+        _git(repo, "switch", branch, cwd=path)
     else:
-        repo.git("switch", "-C", branch, INTEGRATION, cwd=path)
+        _git(repo, "switch", "-C", branch, INTEGRATION, cwd=path)
     return _head(repo, path)
 
 
 def prepare_detached(repo: Repo, board, cfg, n: int) -> str:
     path = guard(repo, board, cfg, n)
     scrub(repo, path, cfg["slot_keep"])
-    repo.git("switch", "--detach", INTEGRATION, cwd=path)
+    _git(repo, "switch", "--detach", INTEGRATION, cwd=path)
     return _head(repo, path)
 
 
 def start_conflict_merge(repo: Repo, board, cfg, n: int) -> list[str]:
     path = guard(repo, board, cfg, n)
-    merged = repo.git(*merge_identity_args(repo), "merge", "--no-commit", "--no-ff", INTEGRATION,
-                      cwd=path, check=False)
+    merged = _git(repo, *merge_identity_args(repo), "merge", "--no-commit", "--no-ff", INTEGRATION,
+                  cwd=path, check=False)
     if merged.returncode not in (0, 1):
         raise GitError(["merge", "--no-commit", "--no-ff", INTEGRATION], merged.stderr)
-    out = repo.git("diff", "--name-only", "--diff-filter=U", cwd=path).stdout
-    return [line for line in out.splitlines() if line]
+    out = _git(repo, "diff", "--name-only", "--diff-filter=U", "-z", cwd=path).stdout   # -z: no C-quoting
+    return [name for name in out.split("\0") if name]
 
 
 def leave_slot(repo: Repo, board, cfg, n: int) -> None:
     path = guard(repo, board, cfg, n)
     scrub(repo, path, cfg["slot_keep"])
-    repo.git("switch", "--detach", cwd=path)
+    _git(repo, "switch", "--detach", cwd=path)
 
 
 def setup_hash(path: Path, setup_cmd, inputs: Sequence[str]) -> str:
@@ -223,7 +276,7 @@ def reconcile_slots(repo: Repo, board, cfg) -> None:
             continue
         try:
             leave_slot(repo, board, cfg, slot.n)
-        except SlotGuardError as exc:
+        except ArtelError as exc:   # SlotGuardError or a GitError: keep detaching the other slots
             first_error = first_error or exc
     if first_error is not None:
         raise first_error
@@ -235,6 +288,7 @@ def task_branch_exists(repo: Repo, task_id: int) -> bool:
 
 def delete_task_branch(repo: Repo, board, cfg, task_id: int) -> None:
     branch = task_branch(task_id)
+    repo.git("worktree", "prune")
     if not repo.branch_exists(branch):
         return
     slots = {Path(s.path).resolve(): s.n for s in board.list_slots()}

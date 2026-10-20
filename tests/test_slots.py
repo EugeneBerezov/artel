@@ -1,5 +1,6 @@
 import json
 import os
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -244,6 +245,8 @@ class PrepareTest(SlotsCase):
             self.assertEqual(slots.merge_identity_args(self.repo), pair)   # a name is missing too
             git(self.repo_path, "config", "user.name", "Me")
             self.assertEqual(slots.merge_identity_args(self.repo), [])
+        git(self.repo_path, "config", "--unset", "user.email")
+        git(self.repo_path, "config", "--unset", "user.name")
         self.assertEqual(slots.merge_identity_args(self.repo), [])   # identity from the environment (tests/__init__)
 
     def test_conflict_merge_works_without_any_identity(self):
@@ -255,7 +258,6 @@ class PrepareTest(SlotsCase):
 
 
 def subprocess_ok(path, *args):
-    import subprocess
     return subprocess.run(["git", *args], cwd=path, capture_output=True).returncode == 0
 
 
@@ -308,6 +310,157 @@ class GuardTest(SlotsCase):
         path.mkdir()   # exists but is not a worktree: git would resolve the toplevel to the main repository
         with self.assertRaises(slots.SlotGuardError):
             slots.guard(self.repo, self.board, self.cfg, 1)
+
+
+class HardeningTest(SlotsCase):
+    def test_ensure_refuses_to_adopt_the_main_worktree(self):
+        root = self.tmp / "artel-1"
+        root.mkdir()
+        git(root, "init", "-q", "-b", "main")
+        git(root, "config", "commit.gpgsign", "false")
+        (root / "f").write_text("x", encoding="utf-8")
+        git(root, "add", "f")
+        git(root, "commit", "-q", "-m", "seed")
+        git(root, "branch", INTEGRATION, "main")
+        repo = Repo.discover(root)
+        board = B.open_board(self.tmp / "other.db")
+        self.addCleanup(board.close)
+        cfg = C.load_config(repo, env={}, cli={"slots_dir": ("..", "test")})   # slot 1 would be the repo itself
+        (root / "untracked.txt").write_text("keep", encoding="utf-8")
+        with self.assertRaises(ArtelError):
+            slots.ensure_slots(repo, board, cfg, 1)
+        self.assertEqual(board.list_slots(), [])
+        self.assertEqual((root / "untracked.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_guard_refuses_another_repository_in_the_slot_directory(self):
+        import shutil
+        self.slot(1)
+        path = slots.slot_path(self.repo, self.cfg, 1)
+        shutil.rmtree(path)
+        path.mkdir()
+        git(path, "init", "-q", "-b", "main")   # an unrelated repository where the slot should be
+        (path / "theirs.txt").write_text("keep", encoding="utf-8")
+        for call in (lambda: slots.guard(self.repo, self.board, self.cfg, 1),
+                     lambda: slots.leave_slot(self.repo, self.board, self.cfg, 1),
+                     lambda: slots.reconcile_slots(self.repo, self.board, self.cfg)):
+            with self.assertRaises(slots.SlotGuardError):
+                call()
+        self.assertEqual((path / "theirs.txt").read_text(encoding="utf-8"), "keep")
+
+    def test_inherited_git_dir_does_not_redirect_slot_commands(self):
+        [n] = self.slot()
+        env = {"GIT_DIR": str(self.repo.common_dir), "GIT_WORK_TREE": str(self.repo_path)}
+        with mock.patch.dict(os.environ, env):
+            slots.prepare_slot(self.repo, self.board, self.cfg, n, 5)
+            slots.leave_slot(self.repo, self.board, self.cfg, n)
+        self.assertEqual(self.branch_of(self.repo_path), "main")   # the main worktree was never touched
+        self.assertTrue(slots.task_branch_exists(self.repo, 5))
+
+    def test_leave_clears_a_rebase_left_by_a_killed_writer(self):
+        [n] = self.slot()
+        self.commit_on_branch(n, 5, name="shared.txt")
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("shared.txt", "other\n", "integration edit")
+        git(self.repo_path, "checkout", "-q", "main")
+        path = slots.slot_path(self.repo, self.cfg, n)
+        rebase = subprocess.run(["git", "rebase", INTEGRATION], cwd=path, capture_output=True)
+        self.assertNotEqual(rebase.returncode, 0)   # conflict: rebase-merge state is left behind
+        slots.leave_slot(self.repo, self.board, self.cfg, n)
+        self.assertEqual(self.branch_of(path), "")
+        self.assertEqual(git(path, "status", "--porcelain"), "")
+        slots.delete_task_branch(self.repo, self.board, self.cfg, 5)   # the branch is free again
+        self.assertFalse(slots.task_branch_exists(self.repo, 5))
+
+    def test_leave_clears_a_bisect_session(self):
+        [n] = self.slot()
+        self.commit_on_branch(n, 5)
+        path = slots.slot_path(self.repo, self.cfg, n)
+        git(path, "bisect", "start")
+        slots.leave_slot(self.repo, self.board, self.cfg, n)
+        slots.delete_task_branch(self.repo, self.board, self.cfg, 5)
+        self.assertFalse(slots.task_branch_exists(self.repo, 5))
+
+    def test_recreated_slot_forgets_its_setup_hash(self):
+        import shutil
+        counter = self.tmp / "c.txt"
+        code = f"open({json.dumps(str(counter))}, 'a').write('x')"
+        [n] = self.slot(1, **{"commands.setup": py_cmd(code)})
+        path = slots.slot_path(self.repo, self.cfg, n)
+        self.assertEqual(slots.run_setup_if_needed(self.repo, self.board, self.cfg, n, path, task_id=None), "ok")
+        shutil.rmtree(path)
+        slots.reconcile_slots(self.repo, self.board, self.cfg)
+        self.slot(1)
+        self.assertIsNone(self.board.list_slots()[0].setup_hash)
+        self.assertEqual(slots.run_setup_if_needed(self.repo, self.board, self.cfg, n, path, task_id=None), "ok")
+        self.assertEqual(counter.read_text(encoding="utf-8"), "xx")
+
+    def test_conflict_paths_are_not_c_quoted(self):
+        [n] = self.slot()
+        name = "ключ файл.txt"
+        self.commit_on_branch(n, 5, name=name)
+        slots.leave_slot(self.repo, self.board, self.cfg, n)
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file(name, "different\n", "integration edit")
+        git(self.repo_path, "checkout", "-q", "main")
+        slots.prepare_slot(self.repo, self.board, self.cfg, n, 5)
+        self.assertEqual(slots.start_conflict_merge(self.repo, self.board, self.cfg, n), [name])
+
+    def test_slots_dir_inside_git_or_at_the_root_is_refused(self):
+        for bad in (".git", ".git/slots", "x/.git/y", ".", ".."):
+            with self.assertRaises(ArtelError, msg=bad):
+                self.slot(1, slots_dir=bad)
+
+    def test_delete_task_branch_survives_a_vanished_slot(self):
+        import shutil
+        [n] = self.slot()
+        self.commit_on_branch(n, 5)
+        shutil.rmtree(slots.slot_path(self.repo, self.cfg, n))   # the slot vanished while holding the branch
+        slots.delete_task_branch(self.repo, self.board, self.cfg, 5)
+        self.assertFalse(slots.task_branch_exists(self.repo, 5))
+
+    def test_prepare_ignores_a_vanished_holder_of_the_branch(self):
+        import shutil
+        self.slot(2)
+        self.commit_on_branch(1, 5)
+        shutil.rmtree(slots.slot_path(self.repo, self.cfg, 1))
+        slots.prepare_slot(self.repo, self.board, self.cfg, 2, 5)   # no SlotBusy for a pruned worktree
+        self.assertEqual(self.branch_of(slots.slot_path(self.repo, self.cfg, 2)), "artel/5")
+
+    def test_reconcile_keeps_detaching_after_a_git_error(self):
+        self.slot(2)
+        self.commit_on_branch(2, 5)
+        real = slots.leave_slot
+
+        def flaky(repo, board, cfg, n):
+            if n == 1:
+                raise slots.GitError(["switch"], "locked file")
+            return real(repo, board, cfg, n)
+
+        with mock.patch.object(slots, "leave_slot", flaky), self.assertRaises(slots.GitError):
+            slots.reconcile_slots(self.repo, self.board, self.cfg)
+        self.assertEqual(self.branch_of(slots.slot_path(self.repo, self.cfg, 2)), "")
+
+    def test_refused_merge_is_an_error_not_an_empty_conflict_list(self):
+        [n] = self.slot()
+        self.commit_on_branch(n, 5, name="mine.txt")
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("incoming.txt", "i\n", "integration adds a file")
+        git(self.repo_path, "checkout", "-q", "main")
+        slots.prepare_slot(self.repo, self.board, self.cfg, n, 5)
+        (slots.slot_path(self.repo, self.cfg, n) / "incoming.txt").write_text("untracked", encoding="utf-8")
+        with self.assertRaises(slots.GitError):   # git refuses (exit 2): untracked file in the way
+            slots.start_conflict_merge(self.repo, self.board, self.cfg, n)
+
+    def test_setup_run_row_carries_round_and_killed_flags(self):
+        tid = self.new_task()
+        task = self.board.get_task(tid)
+        self.board.update_task(tid, expect_state="open", expect_version=task.version, round=3)
+        [n] = self.slot(1, **{"commands.setup": py_cmd("import time; time.sleep(30)"), "setup_timeout": "1s",
+                              "kill_grace": "1s"})
+        path = slots.slot_path(self.repo, self.cfg, n)
+        self.assertEqual(slots.run_setup_if_needed(self.repo, self.board, self.cfg, n, path, task_id=tid), "timeout")
+        (run,) = self.board.list_runs(tid)
+        self.assertEqual((run.round, run.timed_out, run.killed, run.outcome), (3, True, True, "timeout"))
 
 
 class BranchTest(SlotsCase):
