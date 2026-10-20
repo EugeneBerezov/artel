@@ -47,12 +47,14 @@ def heavy_argv(cmd: Command, heavy_lock: Command, shell: str) -> list[str]:
 
 
 def _decode(raw: bytes) -> str:
-    return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+    return raw.decode("utf-8", errors="replace").removesuffix("\n").removesuffix("\r")
 
 
-def _pump(stream, sink_path: Path | None, on_line, errors: list) -> None:
+def _pump(stream, sink_path: Path | None, on_line, errors: list, abandoned: threading.Event) -> None:
     """Copy lines from a binary `stream` to a file and a callback until EOF. A failing log file or callback
-    never stops the reading: an undrained pipe would block the child."""
+    never stops the reading: an undrained pipe would block the child. After `abandoned` is set (run_tree
+    gave up on a pipe an escaped process still holds) lines are read and dropped: nothing is written or
+    reported once the caller has moved on."""
     sink = None
     if sink_path is not None:
         try:
@@ -62,6 +64,8 @@ def _pump(stream, sink_path: Path | None, on_line, errors: list) -> None:
             errors.append(exc)
     try:
         for raw in iter(stream.readline, b""):
+            if abandoned.is_set():
+                continue
             line = _decode(raw)
             if sink is not None:
                 try:
@@ -83,6 +87,11 @@ def _pump(stream, sink_path: Path | None, on_line, errors: list) -> None:
                 sink.close()
             except OSError:
                 pass
+        if abandoned.is_set():   # run_tree left this pipe to us; release it now that the holder is gone
+            try:
+                stream.close()
+            except OSError:
+                pass
 
 
 def _feed(stream, text: str) -> None:
@@ -101,20 +110,23 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
              on_line: Callable[[str], None] | None = None,
              stop_event: threading.Event | None = None) -> ProcResult:
     started = time.monotonic()
+    if not argv:
+        raise ArtelError("cannot start an empty command")
     try:
         proc = subprocess.Popen(
             platform.command_line(argv), cwd=str(cwd), env=None if env is None else dict(env),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             **platform.popen_kwargs())   # binary pipes: decoded here as UTF-8, "\n" untouched
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         raise ArtelError(f"cannot start {argv[0]}: {exc}") from exc
     pid = proc.pid
     group = pid
     fingerprint = None
     timed_out = stopped = False
     errors: list[Exception] = []
-    threads: list[threading.Thread] = []
+    threads: list[tuple[threading.Thread, object]] = []   # (thread, the stream it owns)
+    abandoned = threading.Event()
     try:
         platform.register_tree(proc)
         group = platform.group_of(proc)
@@ -126,12 +138,12 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
         if not merge_stderr:
             pumps.append((proc.stderr, err_path, None))   # drained even without a log so the child never blocks
         for stream, path, callback in pumps:
-            t = threading.Thread(target=_pump, args=(stream, path, callback, errors), daemon=True)
+            t = threading.Thread(target=_pump, args=(stream, path, callback, errors, abandoned), daemon=True)
             t.start()
-            threads.append(t)
+            threads.append((t, stream))
         feeder = threading.Thread(target=_feed, args=(proc.stdin, stdin_text), daemon=True)
         feeder.start()
-        threads.append(feeder)
+        threads.append((feeder, proc.stdin))
 
         deadline = None if timeout is None else started + timeout
         while proc.poll() is None:
@@ -139,6 +151,9 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
                 stopped = True
             elif deadline is not None and time.monotonic() >= deadline:
                 timed_out = True
+            if (stopped or timed_out) and proc.poll() is not None:
+                stopped = timed_out = False   # it finished by itself between the poll and the check
+                break
             if stopped or timed_out:
                 platform.terminate_tree(pid, group, kill_grace, fingerprint)
                 try:
@@ -161,16 +176,20 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
         raise
     finally:
         limit = time.monotonic() + JOIN_DEADLINE
-        for t in threads:
+        for t, _ in threads:
             t.join(max(0.0, limit - time.monotonic()))
-        if not any(t.is_alive() for t in threads):
-            for stream in (proc.stdin, proc.stdout, proc.stderr):
-                if stream is not None:
-                    try:
-                        stream.close()
-                    except OSError:
-                        pass   # stdin already broken
+        if any(t.is_alive() for t, _ in threads):
+            abandoned.set()   # a pipe is still held by an escaped process: its pump goes quiet
+        owned = {id(stream) for t, stream in threads if t.is_alive()}   # closing a stream in use would block
+        for stream in (proc.stdin, proc.stdout, proc.stderr):
+            if stream is not None and id(stream) not in owned:
+                try:
+                    stream.close()
+                except OSError:
+                    pass   # stdin already broken
     if errors:
-        raise errors[0]   # a log or callback failure; the run itself was fully drained
+        # PD (T8 review): a log or on_line failure is fatal for the caller, after the run was fully drained
+        # and the tree terminated; callers (stages, integrate) treat it as an internal error.
+        raise errors[0]
     return ProcResult(returncode=proc.returncode, timed_out=timed_out, stopped=stopped,
                       duration=time.monotonic() - started)

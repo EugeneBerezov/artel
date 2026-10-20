@@ -9,7 +9,7 @@ from unittest import mock
 
 from artel import platform as P, procs
 from artel.errors import ArtelError
-from tests.helpers import IGNORE_SOFT_STOP, py_cmd
+from tests.helpers import IGNORE_SOFT_STOP, py_cmd, subprocess_env
 
 TREE = ("import subprocess, sys, time\n"
         "c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
@@ -40,6 +40,7 @@ class RunTreeTest(unittest.TestCase):
     def run_py(self, code, **kw):
         kw.setdefault("timeout", 30.0)
         kw.setdefault("kill_grace", 1.0)
+        kw.setdefault("env", subprocess_env())   # UTF-8 stdio in the child: Windows defaults to cp1252
         return procs.run_tree(py_cmd(code), cwd=self.dir, **kw)
 
     def test_returncode_and_lines(self):
@@ -87,12 +88,12 @@ class RunTreeTest(unittest.TestCase):
     def test_on_start_reports_pid_group_fingerprint(self):
         seen = []
         lines = []
-        self.run_py("import os\nprint(os.getpid())\n", on_start=lambda *a: seen.append(a), on_line=lines.append)
+        self.run_py("import os, time\nprint(os.getpid(), flush=True)\ntime.sleep(0.5)\n", on_start=lambda *a: seen.append(a), on_line=lines.append)
         self.assertEqual(len(seen), 1)
         pid, group, fingerprint = seen[0]
         self.assertEqual(str(pid), lines[0])
         self.assertEqual(group, pid)   # own process group (POSIX) / group id is the pid (Windows)
-        self.assertTrue(fingerprint is None or isinstance(fingerprint, str))
+        self.assertTrue(fingerprint)   # catches dropping the fingerprint from on_start
 
     def test_timeout_kills_grandchildren(self):
         lines = []
@@ -148,6 +149,34 @@ class RunTreeTest(unittest.TestCase):
         self.assertFalse(res.timed_out)
         self.assertLess(time.monotonic() - start, 15)
         self.assertTrue(wait_dead(int(lines[0])))
+
+    @unittest.skipIf(P.IS_WINDOWS, "needs a process outside the job/group")
+    def test_escaped_pipe_holder_is_abandoned_quietly(self):
+        """Mutation caught: a pump that keeps reporting after run_tree returned; an unbounded join."""
+        code = ("import subprocess, sys\n"
+                "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(3.0); print(\"late\", "
+                "flush=True)'], start_new_session=True)\n"
+                "print('first', flush=True)\n")
+        lines = []
+        saved = procs.JOIN_DEADLINE
+        procs.JOIN_DEADLINE = 0.5
+        self.addCleanup(setattr, procs, "JOIN_DEADLINE", saved)
+        start = time.monotonic()
+        res = self.run_py(code, on_line=lines.append)
+        self.assertLess(time.monotonic() - start, 2.5)   # returned at the deadline, not when the pipe closed
+        self.assertEqual(res.returncode, 0)
+        time.sleep(3.5)
+        self.assertEqual(lines, ["first"])               # "late" arrived after run_tree returned: dropped
+
+    def test_trailing_cr_is_not_stripped_twice(self):
+        """Mutation caught: rstrip("\\r\\n") eating every trailing CR."""
+        lines = []
+        self.run_py("import sys\nsys.stdout.buffer.write(b'a\\r\\r\\nb\\n')\n", on_line=lines.append)
+        self.assertEqual(lines, ["a\r", "b"])
+
+    def test_empty_argv_is_artel_error(self):
+        with self.assertRaises(ArtelError):
+            procs.run_tree([], cwd=self.dir, timeout=1.0, kill_grace=1.0)
 
     def test_unstartable_command_is_artel_error(self):
         with self.assertRaises(ArtelError):
