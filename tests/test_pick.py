@@ -159,6 +159,25 @@ class SelectTest(unittest.TestCase):
                  make_task(id=3, state="verifying", area=("docs",))]
         self.assertEqual(select(tasks), [3])
 
+    def test_due_branchless_attack_runs_next_to_overlapping_running_task(self):
+        # catches: treating a vet-triggered attack (then set) as an area holder in steps 1-3
+        tasks = [make_task(id=1, state="writing", area=("src",), running=True),
+                 make_task(id=2, state="attacking", then="open", area=("src",))]
+        self.assertEqual(select(tasks), [2])
+
+    def test_only_done_dependencies_unblock(self):
+        # catches: accepting verified / awaiting_accept / rejected as "done"
+        for state in ("verified", "awaiting_accept", "rejected", "stuck", "blocked"):
+            tasks = [make_task(id=1, state=state), make_task(id=2, state="open", area=("a",))]
+            self.assertEqual(select(tasks, {2: [1]}), [], state)
+        tasks = [make_task(id=1, state="done"), make_task(id=2, state="open", area=("a",))]
+        self.assertEqual(select(tasks, {2: [1]}), [2])
+
+    def test_verifying_picks_lowest_id_not_priority(self):
+        tasks = [make_task(id=5, state="verifying", priority=9, area=("a",)),
+                 make_task(id=3, state="verifying", priority=0, area=("b",))]
+        self.assertEqual(select(tasks), [3])
+
     def test_blocked_and_stuck_tasks_are_not_selected(self):
         tasks = [make_task(id=i, state=s) for i, s in enumerate(
             ("blocked", "stuck", "awaiting_approval", "awaiting_accept", "done", "rejected", "verified"), 1)]
@@ -176,6 +195,8 @@ class WaitingReasonTest(unittest.TestCase):
         self.assertEqual(pick.waiting_reason(tasks[3], tasks, []), "area overlaps #2")
         self.assertIsNone(pick.waiting_reason(tasks[5], tasks, []))
         self.assertIsNone(pick.waiting_reason(tasks[2], tasks, []))   # not an open task
+        tasks[2] = make_task(id=2, state="verified", area=("src",))   # verified still holds its area
+        self.assertEqual(pick.waiting_reason(tasks[3], tasks, []), "area overlaps #2")
 
     def test_dependency_reason_wins_over_area(self):
         tasks = {1: make_task(id=1, state="open"), 2: make_task(id=2, state="writing", area=("src",)),

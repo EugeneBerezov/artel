@@ -106,6 +106,7 @@ class JournalTest(unittest.TestCase):
         self.assertEqual((closing.status, closing.ref, closing.text, closing.round, closing.stage),
                          ("closed", f, f"closed #{f}", 2, "review"))
         self.assertNotEqual(c, f)
+        self.assertEqual((closing.severity, closing.task_id, closing.kind), ("major", self.tid, "FINDING"))
 
     def test_close_unknown_or_closed_finding_raises(self):
         f = self.finding()
