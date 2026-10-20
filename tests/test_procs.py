@@ -96,7 +96,7 @@ class RunTreeTest(unittest.TestCase):
 
     def test_timeout_kills_grandchildren(self):
         lines = []
-        res = procs.run_tree(py_cmd(TREE), cwd=self.dir, timeout=1.0, kill_grace=1.0, on_line=lines.append)
+        res = procs.run_tree(py_cmd(TREE), cwd=self.dir, timeout=3.0, kill_grace=1.0, on_line=lines.append)
         self.assertTrue(res.timed_out)
         self.assertFalse(res.stopped)
         grandchild = int(lines[0])
@@ -104,21 +104,28 @@ class RunTreeTest(unittest.TestCase):
 
     def test_soft_stop_ignored_gets_hard_kill(self):
         code = IGNORE_SOFT_STOP + "import time\nprint('up', flush=True)\ntime.sleep(60)\n"
+        up = threading.Event()
         start = time.monotonic()
-        res = procs.run_tree(py_cmd(code), cwd=self.dir, timeout=0.5, kill_grace=0.5)
+
+        def on_line(line):
+            up.set()
+
+        # the timeout starts at spawn; 3 s leaves room for interpreter start so the handler is installed
+        res = procs.run_tree(py_cmd(code), cwd=self.dir, timeout=3.0, kill_grace=0.5, on_line=on_line)
+        self.assertTrue(up.is_set())
         self.assertTrue(res.timed_out)
-        self.assertLess(time.monotonic() - start, 8)
+        self.assertLess(time.monotonic() - start, 12)
 
     def test_stop_event_terminates(self):
         lines = []
         stop = threading.Event()
-        timer = threading.Timer(0.8, stop.set)
-        timer.start()
-        try:
-            res = procs.run_tree(py_cmd(TREE), cwd=self.dir, timeout=60.0, kill_grace=1.0, on_line=lines.append,
-                                 stop_event=stop)
-        finally:
-            timer.cancel()
+
+        def on_line(line):   # stop once the child has printed its grandchild's pid
+            lines.append(line)
+            stop.set()
+
+        res = procs.run_tree(py_cmd(TREE), cwd=self.dir, timeout=60.0, kill_grace=1.0, on_line=on_line,
+                             stop_event=stop)
         self.assertTrue(res.stopped)
         self.assertFalse(res.timed_out)
         self.assertLess(res.duration, 20)
@@ -147,11 +154,46 @@ class RunTreeTest(unittest.TestCase):
             procs.run_tree([str(self.dir / "no-such-binary")], cwd=self.dir, timeout=5.0, kill_grace=1.0)
 
     def test_on_line_error_is_raised_after_the_run(self):
+        # catches: stopping the reader after a callback error (the child would block on a full pipe)
         def boom(line):
             raise RuntimeError("callback failed")
 
+        code = "for i in range(3000):\n    print('x' * 100, flush=True)\n"
+        start = time.monotonic()
         with self.assertRaises(RuntimeError):
-            self.run_py("print('a')\nprint('b' * 100000)\n", on_line=boom, timeout=20.0)
+            self.run_py(code, on_line=boom, timeout=20.0)
+        self.assertLess(time.monotonic() - start, 15)
+
+    def test_unwritable_log_does_not_block_the_child(self):
+        # catches: a log write error ending the reader (the child blocks on a full pipe until the timeout)
+        blocker = self.dir / "file"
+        blocker.write_text("x", encoding="utf-8")
+        code = "for i in range(3000):\n    print('x' * 100, flush=True)\n"
+        start = time.monotonic()
+        with self.assertRaises(OSError):
+            self.run_py(code, log_path=blocker / "log", timeout=20.0)
+        self.assertLess(time.monotonic() - start, 15)
+
+    def test_log_is_appended_not_truncated(self):
+        log = self.dir / "run.log"
+        log.write_text("earlier\n", encoding="utf-8")
+        self.run_py("print('now')", log_path=log)
+        self.assertEqual(log.read_text(encoding="utf-8"), "earlier\nnow\n")
+
+    def test_child_may_write_a_lot_before_reading_stdin(self):
+        # catches: feeding stdin synchronously (deadlocks when the child fills its stdout first)
+        code = ("import sys\nfor i in range(3000):\n    print('x' * 100, flush=True)\n"
+                "print(len(sys.stdin.read()))\n")
+        lines = []
+        res = self.run_py(code, stdin_text="y" * 300000, on_line=lines.append, timeout=30.0)
+        self.assertEqual(res.returncode, 0)
+        self.assertEqual(lines[-1], "300000")
+
+    def test_newlines_are_not_translated(self):
+        lines = []
+        self.run_py("import sys\nd = sys.stdin.buffer.read()\nprint(d.count(b'\\r'), len(d), flush=True)\n",
+                    stdin_text="a\nb\n", on_line=lines.append)
+        self.assertEqual(lines, ["0 4"])
 
     def test_on_start_error_kills_the_tree(self):
         pids = []

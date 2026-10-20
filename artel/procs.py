@@ -46,18 +46,30 @@ def heavy_argv(cmd: Command, heavy_lock: Command, shell: str) -> list[str]:
     return platform.resolve_argv(heavy_lock) + argv
 
 
+def _decode(raw: bytes) -> str:
+    return raw.decode("utf-8", errors="replace").rstrip("\r\n")
+
+
 def _pump(stream, sink_path: Path | None, on_line, errors: list) -> None:
-    """Copy lines from `stream` to a file and a callback until EOF; never stops reading on a callback error."""
+    """Copy lines from a binary `stream` to a file and a callback until EOF. A failing log file or callback
+    never stops the reading: an undrained pipe would block the child."""
     sink = None
-    try:
-        if sink_path is not None:
+    if sink_path is not None:
+        try:
             sink_path.parent.mkdir(parents=True, exist_ok=True)
-            sink = open(sink_path, "w", encoding="utf-8", newline="\n")
-        for raw in iter(stream.readline, ""):
-            line = raw.rstrip("\r\n")
+            sink = open(sink_path, "a", encoding="utf-8", newline="\n")
+        except OSError as exc:
+            errors.append(exc)
+    try:
+        for raw in iter(stream.readline, b""):
+            line = _decode(raw)
             if sink is not None:
-                sink.write(line + "\n")
-                sink.flush()
+                try:
+                    sink.write(line + "\n")
+                    sink.flush()
+                except (OSError, ValueError) as exc:   # disk full, file gone: keep draining, report later
+                    errors.append(exc)
+                    sink = None
             if on_line is not None:
                 try:
                     on_line(line)
@@ -67,13 +79,16 @@ def _pump(stream, sink_path: Path | None, on_line, errors: list) -> None:
         pass   # the pipe was closed under us
     finally:
         if sink is not None:
-            sink.close()
+            try:
+                sink.close()
+            except OSError:
+                pass
 
 
 def _feed(stream, text: str) -> None:
     try:
         if text:
-            stream.write(text)
+            stream.write(text.encode("utf-8"))   # bytes: no "\n" → "\r\n" translation on Windows
         stream.close()
     except (OSError, ValueError):
         pass   # the child closed stdin or exited
@@ -91,7 +106,7 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
             platform.command_line(argv), cwd=str(cwd), env=None if env is None else dict(env),
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
-            encoding="utf-8", errors="replace", **platform.popen_kwargs())
+            **platform.popen_kwargs())   # binary pipes: decoded here as UTF-8, "\n" untouched
     except OSError as exc:
         raise ArtelError(f"cannot start {argv[0]}: {exc}") from exc
     pid = proc.pid
@@ -135,8 +150,8 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
             time.sleep(POLL)
         proc.wait()
         # the leader is gone; a child may still hold the pipes (e.g. a server started by `sh -c "npm test"`)
-        if platform.tree_alive(pid, group):
-            platform.terminate_tree(pid, group, kill_grace)
+        # (unconditional: it also releases the Windows job handle; the fingerprint stops it signalling a reused pid)
+        platform.terminate_tree(pid, group, kill_grace, fingerprint)
     except BaseException:
         platform.terminate_tree(pid, group, kill_grace, fingerprint)
         try:
@@ -156,6 +171,6 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
                     except OSError:
                         pass   # stdin already broken
     if errors:
-        raise errors[0]
+        raise errors[0]   # a log or callback failure; the run itself was fully drained
     return ProcResult(returncode=proc.returncode, timed_out=timed_out, stopped=stopped,
                       duration=time.monotonic() - started)
