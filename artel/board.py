@@ -121,7 +121,7 @@ class Request:
 
 
 _TASK_FIELDS = tuple(f.name for f in dataclasses.fields(Task))
-_TASK_BOOLS = frozenset(f.name for f in dataclasses.fields(Task) if f.type is bool)
+_TASK_BOOLS = frozenset({"attack", "strong", "review_closure", "answered", "running"})
 _NOT_UPDATABLE = frozenset({"id", "version", "created_at", "updated_at"})
 _RUNNING_COLUMNS = ("running_kind", "running_started_at", "running_pid", "running_group",
                     "running_fingerprint", "running_slot")
@@ -190,10 +190,14 @@ def open_board(path: Path, *, busy_timeout_ms: int = 5000, factory=sqlite3.Conne
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), timeout=busy_timeout_ms / 1000, isolation_level=None,
                            factory=factory, check_same_thread=False)
-    conn.row_factory = sqlite3.Row
-    conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
-    board = Board(conn, _choose_journal_mode(conn))
-    board._init_schema()
+    try:
+        conn.row_factory = sqlite3.Row
+        conn.execute(f"PRAGMA busy_timeout={int(busy_timeout_ms)}")
+        board = Board(conn, _choose_journal_mode(conn))
+        board._init_schema()
+    except BaseException:
+        conn.close()   # a leaked handle keeps the db and -wal/-shm files open (Windows cleanup)
+        raise
     return board
 
 
@@ -205,7 +209,12 @@ def _choose_journal_mode(conn: sqlite3.Connection) -> str:
     except sqlite3.OperationalError as e:
         if "locked" in str(e):
             raise BoardBusy(str(e)) from e
-    row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+    try:
+        row = conn.execute("PRAGMA journal_mode=DELETE").fetchone()
+    except sqlite3.OperationalError as e:
+        if "locked" in str(e):
+            raise BoardBusy(str(e)) from e
+        raise
     return str(row[0]).lower()
 
 
@@ -220,7 +229,8 @@ class Board:
 
     @contextmanager
     def tx(self) -> Iterator[sqlite3.Connection]:
-        """BEGIN IMMEDIATE … COMMIT / ROLLBACK. Re-entrant: an inner call joins the outer transaction."""
+        """BEGIN IMMEDIATE … COMMIT / ROLLBACK. Re-entrant: an inner call joins the outer transaction
+        (no savepoint: an exception caught by the caller between the two does not undo the inner writes)."""
         if self._tx_depth:
             self._tx_depth += 1
             try:
@@ -239,17 +249,23 @@ class Board:
             yield self.conn
         except BaseException:
             self._tx_depth = 0
-            self.conn.execute("ROLLBACK")
+            self._rollback()
             raise
         else:
             self._tx_depth = 0
             try:
                 self.conn.execute("COMMIT")
             except sqlite3.OperationalError as e:
-                self.conn.execute("ROLLBACK")
+                self._rollback()
                 if "locked" in str(e):
                     raise BoardBusy(str(e)) from e
                 raise
+
+    def _rollback(self) -> None:
+        try:
+            self.conn.execute("ROLLBACK")
+        except sqlite3.Error:
+            pass   # never mask the original exception
 
     def _init_schema(self) -> None:
         with self.tx() as conn:
@@ -257,6 +273,9 @@ class Board:
                 conn.execute(statement)
             conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES ('schema_version', ?)",
                          (str(SCHEMA_VERSION),))
+            found = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
+            if found != str(SCHEMA_VERSION):
+                raise ArtelError(f"board schema version {found} is not supported (this artel: {SCHEMA_VERSION})")
 
     # tasks ---------------------------------------------------------------
 
@@ -266,6 +285,8 @@ class Board:
                     merge: str | None = None, after: Sequence[int] = ()) -> int:
         if state not in STATES:
             raise ValueError(f"unknown task state: {state!r}")
+        if isinstance(area, str):
+            raise ValueError("area must be a sequence of paths, not a string")
         now = time.time()
         with self.tx() as conn:
             cur = conn.execute(
@@ -287,6 +308,8 @@ class Board:
 
     def list_tasks(self, states: Iterable[str] | None = None) -> list[Task]:
         rows = self.conn.execute("SELECT * FROM tasks ORDER BY id").fetchall()
+        if isinstance(states, str):
+            raise ValueError("states must be an iterable of state names, not a string")
         wanted = None if states is None else set(states)
         return [t for t in map(_task_from_row, rows) if wanted is None or t.state in wanted]
 
@@ -295,6 +318,8 @@ class Board:
         for name in fields:
             if name not in _TASK_FIELDS or name in _NOT_UPDATABLE:
                 raise ValueError(f"cannot update task column: {name!r}")
+        if "state" in fields and fields["state"] not in STATES:
+            raise ValueError(f"unknown task state: {fields['state']!r}")
         values = []
         for name, value in fields.items():
             if name == "area":
@@ -400,12 +425,14 @@ class Board:
                    duration_ms: int | None = None, cost_usd: float | None = None,
                    session_id: str | None = None) -> None:
         with self.tx() as conn:
-            conn.execute(
+            cur = conn.execute(
                 "UPDATE runs SET ended_at = ?, outcome = ?, usage = ?, exit_code = ?, timed_out = ?, killed = ?,"
                 " first_context = ?, last_context = ?, turns = ?, duration_ms = ?, cost_usd = ?, session_id = ?"
                 " WHERE id = ?",
                 (time.time(), outcome, json.dumps(usage), exit_code, int(timed_out), int(killed), first_context,
                  last_context, turns, duration_ms, cost_usd, session_id, run_id))
+            if cur.rowcount != 1:
+                raise ArtelError(f"unknown run: {run_id}")
 
     def list_runs(self, task_id: int) -> list[Run]:
         rows = self.conn.execute("SELECT * FROM runs WHERE task_id = ? ORDER BY id", (task_id,)).fetchall()
@@ -432,8 +459,11 @@ class Board:
 
     def finish_request(self, request_id: int, error: str | None = None) -> None:
         with self.tx() as conn:
-            conn.execute("UPDATE requests SET applied_at = ?, error = ? WHERE id = ?",
-                         (time.time(), error, request_id))
+            cur = conn.execute("UPDATE requests SET applied_at = ?, error = ? WHERE id = ? AND applied_at IS NULL",
+                               (time.time(), error, request_id))
+            if cur.rowcount != 1:
+                self.get_request(request_id)   # unknown id raises UnknownRequest
+                raise ArtelError(f"request {request_id} is already finished")
 
     def get_request(self, request_id: int) -> Request:
         row = self.conn.execute("SELECT * FROM requests WHERE id = ?", (request_id,)).fetchone()

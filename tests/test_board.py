@@ -161,6 +161,78 @@ class BoardTest(unittest.TestCase):
         self.assertEqual(self.board.get_task(tid).priority, 4)
         self.assertEqual(self.board.get_meta("k"), "v")
 
+    def test_tx_state_is_clean_after_rollback_and_commit(self):
+        # catches: forgetting to reset the depth counter on rollback/commit (later tx() would join nothing)
+        with self.assertRaises(RuntimeError):
+            with self.board.tx():
+                self.board.set_meta("a", "1")
+                raise RuntimeError("boom")
+        self.assertEqual(self.board._tx_depth, 0)
+        with self.board.tx() as conn:
+            self.assertTrue(conn.in_transaction)
+        self.assertEqual(self.board._tx_depth, 0)
+        self.assertFalse(self.board.conn.in_transaction)
+        with self.assertRaises(RuntimeError):
+            with self.board.tx():
+                with self.board.tx():
+                    self.board.set_meta("b", "1")
+                    raise RuntimeError("inner")
+        self.assertEqual(self.board._tx_depth, 0)
+        self.assertIsNone(self.board.get_meta("b"))
+        self.assertFalse(self.board.conn.in_transaction)
+        self.board.set_meta("c", "1")   # a plain write still commits
+        self.assertEqual(self.board.get_meta("c"), "1")
+
+    def test_open_failure_closes_connection(self):
+        closed = []
+
+        class Tracking(sqlite3.Connection):
+            def close(self):
+                closed.append(True)
+                super().close()
+
+            def execute(self, sql, *args):
+                if sql.strip().upper().startswith("PRAGMA JOURNAL_MODE"):
+                    raise sqlite3.OperationalError("database is locked")
+                return super().execute(sql, *args)
+
+        with self.assertRaises(B.BoardBusy):
+            B.open_board(Path(self._tmp.name) / "b3.db", factory=Tracking)
+        self.assertEqual(closed, [True])
+
+    def test_reopen_rejects_other_schema_version(self):
+        self.board.set_meta("schema_version", "2")
+        with self.assertRaises(B.ArtelError):
+            B.open_board(self.path)
+
+    def test_string_arguments_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.new_task(area="src")
+        with self.assertRaises(ValueError):
+            self.board.list_tasks("open")
+        tid = self.new_task()
+        with self.assertRaises(ValueError):
+            self.board.update_task(tid, expect_state="open", expect_version=0, state="bogus")
+
+    def test_finish_unknown_ids_raise(self):
+        with self.assertRaises(B.ArtelError):
+            self.board.finish_run(99, outcome="ok", usage={}, exit_code=0, timed_out=False, killed=False)
+        rid = self.board.add_request("pause", None, {})
+        self.board.finish_request(rid)
+        with self.assertRaises(B.ArtelError):   # second finish must not overwrite applied_at
+            self.board.finish_request(rid)
+        with self.assertRaises(B.UnknownRequest):
+            self.board.finish_request(404)
+
+    def test_all_bool_columns_roundtrip(self):
+        tid = self.new_task()
+        t = self.board.get_task(tid)
+        names = ["attack", "strong", "review_closure", "answered", "running"]
+        self.board.update_task(tid, expect_state="open", expect_version=t.version, **{n: True for n in names})
+        t = self.board.get_task(tid)
+        for n in names:
+            self.assertIs(getattr(t, n), True, n)
+
     def test_second_writer_times_out_with_board_busy(self):
         other = B.open_board(self.path, busy_timeout_ms=50)
         with self.board.tx():
