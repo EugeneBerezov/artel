@@ -16,7 +16,7 @@
 - English everywhere: code, identifiers, comments, messages, docs, commit messages.
 - Distribution `artel-agents`, import package `artel`, command `artel`; install with `pipx`/`uv tool`; optional single-file `artel.pyz` (§12).
 - Platforms: Linux, macOS, Windows (native, Git for Windows), WSL (§2 goal 8, §12). **All OS-specific code lives in `artel/platform.py`**: no other module imports `fcntl`, `msvcrt`, `ctypes`, `signal`, calls `os.killpg`/`os.setsid`, passes `start_new_session`/`creationflags`, or branches on `os.name`/`sys.platform` (portability lint, Task 2).
-- UTF-8 everywhere: every `open`, `Path.read_text`/`write_text`, and text-mode `subprocess` call passes `encoding="utf-8"` (plus `errors="replace"` when reading process output). artel writes `\n` and never rewrites repository files (§12).
+- UTF-8 everywhere: every `open`, `Path.read_text`/`write_text`, and text-mode `subprocess` call passes `encoding="utf-8"` (plus `errors="replace"` when reading process output). artel writes `\n` and never rewrites repository files (§12). The one exception is the Windows `.cmd` launchers, which carry a code-page preamble (PD-33).
 - No symlinks, no executable-bit assumptions on repository files, no `/tmp`: artel's temporary files go under `<git-common-dir>/artel/tmp` (§12). Tests may use `tempfile`, always as `TemporaryDirectory(ignore_cleanup_errors=True)`.
 - Command settings (`commands.setup`, `commands.verify`, `commands.heavy_lock`, `commands.heavy_lock_check`, `notify.command`) accept a string (run through the configured `shell`) or a list (run directly); lists are the portable form (§12).
 - No listening sockets; the only network traffic is outbound HTTPS to the configured notifier (§2).
@@ -55,7 +55,7 @@ Each is listed again under "Spec gaps" for the owner. Tasks cite them as **PD-n*
 - **PD-3 Unclosed earlier findings.** A review's blocking decision is computed from open findings after applying `closed`: unclosed blocker/major findings of earlier rounds stay open and block even if the reviewer returned `pass`.
 - **PD-4 Closure rounds** (round ≥ 2 or a conflict-resolution review): new findings other than `blocker` are recorded as `minor` with the prefix `[downgraded: closure round] `.
 - **PD-5 Attack findings** are FINDING entries with `stage='attack'`; given to the writer, excluded from review closure accounting.
-- **PD-6 Area holding.** A task holds its area in `attacking, writing, reviewing, fixing, verifying, verified`; overlap is path-component prefix; empty area overlaps everything. Vet and attack-before-code (no branch) hold no area.
+- **PD-6 Area holding.** A task holds its area in `attacking, writing, reviewing, fixing, verifying, verified`; overlap is path-component prefix; empty area overlaps everything. Vet and the attack of a vet-triggered risky task (`then` set, no branch) hold no area; a human `--attack` task holds its area from `attacking` on. *Amended (controller, 2026-10-20, owner to confirm):* `pick.select` steps 1–3 (answered, due stages, verifying) skip a task whose area overlaps a running task (a live job or `running = 1`) or a task already selected in the same call, so two overlapping tasks never run at once (§3 area, §5 step 2).
 - **PD-7 Priority:** higher integer first, then lower id; default 0.
 - **PD-8 Branch checked out elsewhere:** the task is skipped this tick; status shows `held: artel/<id> checked out at <path>`.
 - **PD-9 `artel heavy -- CMD`** with a CMD matching no `project_tools` pattern is refused (exit 2).
@@ -68,17 +68,32 @@ Each is listed again under "Spec gaps" for the owner. Tasks cite them as **PD-n*
 - **PD-19 Human notes.** Rework notes and reject reasons are `ANSWER` entries by `human` with prefixes `rework: ` / `reject: `.
 - **PD-20 Verify log in the fix prompt:** tail of the latest verify log, ≤ `context_budget` bytes, fenced as untrusted.
 - **PD-21 Over-long agent text** in a structured result is truncated with `…` by the runner; over-long `artel note` is refused with a hint to commit a file.
-- **PD-22 Rate-limit statuses.** Rank: `"allowed"` 0, `"rejected"` 2, any other string 1. `limit_stop = "allowed_warning"` pauses new picks at rank ≥ 1; `"rejected"` at rank 2; rank 2 always requeues the stage with no counter.
-- **PD-23 Usage.** Each run stores the summed final `usage`, `total_cost_usd`, `num_turns`, `duration_ms`, the context size (input + cache tokens) of the first and last API call, and `session_id`; a killed run stores the sum of the assistant usages seen.
+- **PD-22 Rate-limit statuses.** Rank: `"allowed"` 0, `"rejected"` 2, any other string 1. `limit_stop = "allowed_warning"` pauses new picks at rank ≥ 1; `"rejected"` at rank 2; rank 2 requeues the stage with no counter unless the run delivered a valid structured result (PD-40, amended by the controller 2026-10-20, owner to confirm).
+- **PD-23 Usage.** Each run stores the summed final `usage`, `total_cost_usd`, `num_turns`, `duration_ms`, the context size (input + cache tokens) of the first and last API call, and `session_id`; a killed run stores the sum of the assistant usages seen, counting each `message.id` once (the last usage seen for that id: one API call may emit several `assistant` lines — amended by the controller 2026-10-20, owner to confirm).
 - **PD-24 Permission denials** are recorded as a runner `FAIL` entry (`denied: <tool_name> <tool_input, truncated>`); they do not change the outcome.
 - **PD-25 String `heavy_lock` prefix** with `shell` sh/bash runs as `[sh, "-c", '<prefix> "$@"', "artel-heavy", *argv]`; with pwsh/cmd a string prefix is a config error.
-- **PD-26 Stop.** `artel stop [--now]` enqueues a `stop` request and also writes the stop file (§12); the runner acts on whichever it sees first and clears both. Signals (SIGINT/SIGTERM, Ctrl+C/Ctrl+Break) are an extra soft stop.
+- **PD-26 Stop.** `artel stop [--now]` enqueues a `stop` request and also writes the stop file (§12); the runner acts on whichever it sees first and clears both. Signals (SIGINT/SIGTERM, Ctrl+C/Ctrl+Break) are an extra soft stop. *Amended (controller, 2026-10-20, owner to confirm):* with no runner running, `artel stop` only says so (no request, no stop file); `Runner.start` deletes a stale stop file and finishes pending `stop` requests with error `stale: no runner`, so a later `artel run` does not exit at once.
 - **PD-27 Vet result.** The shared schema gains optional fields `risky: bool`, `risk_signals: [string]`, `duplicate_of: integer|null`. Vet outcome `pass` = adequate, `findings` = inadequate (reason in `summary`), `ask`, `fail`. `risky` is true when the agent says so or any `risk_signals` item is returned.
 - **PD-28 Stuck stage.** The task records `stuck_from` (the stage state it got stuck in) so `rework` on a branchless stuck task returns to that stage (§3.1 last rework row).
 - **PD-29 Conflict review.** After a `fix_kind=conflict` fix, the next review uses the closure template (`review_closure = 1` on the task) regardless of `round`.
 - **PD-30 Reject while running.** The runner terminates the running job (`terminate_tree`), clears `running`, then applies `reject`.
 - **PD-31 Setup pause end.** The `setup_failed` pause lifts by itself when the setup hash (command + `setup_inputs`) changes or after `setup_retry`; `resume --force` lifts it at once.
 - **PD-32 Vet in a slot.** Vet and attack-before-code run in a free slot detached at the integration tip (§3.1) with the reviewer profile; `vet` uses the `review` model.
+
+Added after controller attack #1 — all **(controller, 2026-10-20, owner to confirm)**:
+
+- **PD-33 `.cmd` launchers.** cmd.exe decodes a batch file in the console code page and expands `%`. The `artel.cmd` shim and `write_wrapper`'s `.cmd` file are UTF-8 with a preamble that saves the active code page, switches to 65001 (`chcp 65001 >nul`) and restores it before exiting with the command's exit code; `%` in baked paths is written `%%`. This is the only exception to the plain UTF-8 rule (§12 says UTF-8; cmd.exe cannot read it otherwise).
+- **PD-34 Base job bookkeeping.** The base-moved job (§5 "Base moved") belongs to no task: it never sets a task's `running`; its pid, group, fingerprint and slot are stored in meta `base_running` (JSON) while it runs and reconcile terminates it like a task's tree; its setup/verify logs are `logs/base/<setup|verify>-<n>.log` with no `runs` row (`n` = 1 + existing files of that kind). An exception in it writes a runner `FAIL` entry with `task_id` NULL and pauses the board as `base_conflict` with `pause_detail = "internal error: <tail>"` (ended by `resume`).
+- **PD-35 "Ready with new commits" reference** (§3.1 rows 99–102). `write`: the task branch has commits not in `artel/integration` (`git rev-list --count artel/integration..HEAD` > 0). `fix` with `fix_kind` review or verify: `HEAD != task.fix_base`, where `fix_base` is the task-branch tip recorded by every transition into `fixing` (rows that set `fix_base=tip`; the caller passes `tip`). Conflict fix: `merge_committed`. Commits made before an `ask`, a requeue or a runner restart therefore count; a run-start comparison would reset finished work.
+- **PD-36 Accepted flag.** `accept` (R35) sets `accepted = 1`; `verify green` goes to `verified` when `merge = auto` or the task is `accepted` (R31a), to `awaiting_accept` only when `merge = ask` and not `accepted` (R31b). `accepted` is cleared when the task enters `fixing` from verify (R32, R33) or is reset (R17): changed code needs a new accept. Breaks the loop accept → fast-forward impossible → re-verify → `awaiting_accept` (§3.1 rows 118, 122, 124).
+- **PD-37 Risky tasks review on the strong model.** Vet rows R04c/R04d set `risky = 1`; `choose_model` escalates every review of a risky task to `models.strong` with reason `task risky (vet)` (§4 escalates on `--attack`; a vet-triggered attack is the same signal).
+- **PD-38 Internal error event.** `events.EVENT_KINDS` gains `error`: an internal runner error in a job (§3.1 says "notify", §7 has no kind). Text: task id, title, stage and "see artel show <id>" — never the traceback (§7: no file contents). `notify.on` accepts it and its default includes it.
+- **PD-39 Conflict at the cap** (R34b). A merge conflict with `verify_fixes ≥ max_verify_fixes` blocks like a red verify (`asked_by=verify`, `cause=cap`); §3.1 "same, cap reached" is read as covering conflicts. The answer path is spec gap 3.
+- **PD-40 Limit hit in the result.** A run is `rate_limited` when it saw a rank-2 `rate_limit_event` or its result has `is_error: true` and `api_error_status == 429` (unobserved, spike Q2; Task 16 records what a real limit hit shows). A rate-limited run without a valid structured result is requeued with no counter and pauses the board; with a valid result the result is applied normally and the board only pauses. A limit hit seen only in the error result carries no reset time: the pause lasts until the latest future `resets_at` recorded in meta `limit:*`, else until `artel resume --force`, and the `paused` notification says so.
+- **PD-41 `.cmd` agent command.** On Windows, when `agent_command` resolves to a `.cmd`/`.bat` file, `agent_claude.agent_argv` unwraps it to the program it launches (npm `cmd-shim` form: node + the `cli.js` path; `platform.write_wrapper` form: its quoted argv) so the inline `--json-schema` never passes through cmd.exe; an unrecognized batch file is an `ArtelError` naming `agent_command` and the list form to use. `claude.exe` wins over `claude.cmd` by `PATHEXT` order. Resolves spec gap 12's `.cmd` question without an owner decision.
+- **PD-42 Unknown closure ids.** `closed` ids that are not open review findings of the task are dropped before recording with a runner `FAIL` entry `closed #<id> ignored: not an open finding of #<task>`; they never fail the stage or cost an attempt.
+- **PD-43 Conflict fix skips setup.** A `fix` with `fix_kind=conflict` does not run setup (the merge may leave markers in `setup_inputs`, e.g. a lockfile, and setup would pause the board forever); the following verify rechecks `setup_inputs` (§5 step 7).
+- **PD-44 String `agent_command`.** A string `argv` setting is one executable name or path and is never split (shlex would eat Windows backslashes); arguments need the list form.
 
 ## Waves, slice, shared files
 
@@ -87,7 +102,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 | Wave | Tasks (RISKY in bold) |
 |---|---|
 | W1 | 1 Skeleton + CLI |
-| W2 | 2 CI + lint + pyz · **3 Platform** · 4 Board · 5 Config |
+| W2 | 2 CI + lint + pyz · **3 Platform** → 28 T2 follow-up · 4 Board · 5 Config |
 | W3 | 6 Journal + pick · **7 Transitions** · 8 Procs · **9 Agent adapter** |
 | W4 | **10 Slots** · 11 Templates + agent commands · 12 Prompts |
 | W5 | **13 Stages** · **14 Verify + integrate** |
@@ -100,7 +115,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 
 **Vertical slice:** after Task 15, `artel add` → write → review → verify → integrate works end to end with the fake agent and one slot. Task 16 then runs one real `claude` (haiku) task in a toy repo before anything else is built on top.
 
-**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/e2e.py` (15, then read-only), `artel/config_schema.py` (5 only; later tasks must not add settings without a plan change), `artel/cmd_config.py` (5 → 11), `artel/runner.py` (15 → 18 → 22 → 26), `artel/stages.py` (13 → 21 → 26), `artel/prompts.py` (12 → 21), `tests/fake_agent.py` (9 → 26), `artel/cmd_human.py` (19 → 26). The wave table already respects this.
+**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15, then read-only), `artel/config_schema.py` (5 only; later tasks must not add settings without a plan change), `artel/cmd_config.py` (5 → 11), `artel/runner.py` (15 → 18 → 22 → 26), `artel/stages.py` (13 → 21 → 26), `artel/prompts.py` (12 → 21), `tests/fake_agent.py` (9 → 26), `artel/cmd_human.py` (19 → 26). The wave table already respects this.
 
 ---
 
@@ -108,8 +123,8 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 
 ```
 pyproject.toml                    package metadata, console script, package data          (T1)
-.github/workflows/ci.yml          OS × Python matrix; pyz smoke test; release on tags      (T2)
-tools/build_pyz.py                builds dist/artel.pyz with stdlib zipapp                  (T2)
+.github/workflows/ci.yml          OS × Python matrix; pyz smoke test; release on tags      (T2; T28)
+tools/build_pyz.py                builds dist/artel.pyz with stdlib zipapp                  (T2; T28)
 README.md                         user documentation, generated defaults table             (T27)
 artel/__init__.py, __main__.py    version, python -m artel                                 (T1)
 artel/errors.py                   ArtelError hierarchy, exit codes                         (T1)
@@ -142,7 +157,8 @@ docs/live-slice-<date>.md         one real claude task through the slice        
 docs/spike-resume-<date>.md       live check of `claude -p --resume` (spike Q8)            (T25, controller)
 tests/__init__.py, helpers.py     git isolation, temp repos, py_cmd, subprocess_env         (T1; T3)
 tests/factories.py                make_task for pure tests                                 (T4)
-tests/test_portability_lint.py    AST lint                                                 (T2)
+tests/test_portability_lint.py    AST lint                                                 (T2; T3, T28)
+tests/test_ci_env.py              CI encoding env reaches child processes                  (T28)
 tests/fake_agent.py, fixtures/    fake `claude` and stream fixtures                         (T9; T26)
 tests/e2e.py                      E2ECase, drive, FakeClock, orphan check                  (T15)
 tests/fake_telegram.py            local fake Telegram endpoint                             (T17)
@@ -477,17 +493,22 @@ Full test list: `LintRulesTest`: `test_open_without_encoding`; `test_read_write_
 
 **Acceptance:** the lint is green on the tree and fails on the seeded snippets; when pushed, all six matrix jobs run the suite and the pyz smoke test. The controller pushes the branch after this task only with the owner's consent; until then CI evidence is "not run" and is reported as such.
 
+**Follow-up:** the controller review of the merged task (T2-1) found gaps; they are Task 28 (W2, after Task 3).
+
 ---
 
 ### Task 3: Platform module — **RISKY (strong-model review)**
 
 **Spec:** §12 table (runner lock, process trees, pid liveness, stop request, finding the agent CLI, shell selection, free disk, long paths), §3.1 (recorded processes carry their start time), §5 (SIGTERM → `kill_grace` → SIGKILL), PD-25, PD-26.
 
-**Context for the writer:** Global Constraints + PD-25, PD-26 + this task.
+**Context for the writer:** Global Constraints + PD-25, PD-26, PD-33 + this task.
+
+**Rework (2026-10-20, controller review T3-1 — CI red, reopened).** The merged version is reworked against this section; the changes to pinned behavior are: the stop handler only records the stop (`install_stop_handlers() -> StopRequest`, callers poll it outside signal context); `terminate_tree` sweeps the group (POSIX) or the job (Windows) when the leader is already gone; `pid_alive` is False for zombies on every OS (macOS via `ps -o stat=`); `shell="cmd"` command lines are built by hand (`command_line`); `.cmd` files follow PD-33; `hard_kill`'s `taskkill` fallback re-checks the fingerprint; Windows `tree_alive` asks the job; `shell_argv("bash")` on Windows uses Git Bash; `long_paths_warning` reads `git config --type=bool`; OS-specific test pairs are restored.
 
 **Files:**
 - Create: `artel/platform.py`, `tests/test_platform.py`
 - Modify: `tests/helpers.py` (add `IGNORE_SOFT_STOP` snippet, see below)
+- Modify: `tests/test_portability_lint.py` (exempt `tests/test_platform.py` from the `os.name`/`sys.platform` part of rule 1 — rule 4 already allows OS skips there)
 
 **Interfaces:**
 - Consumes: `artel.errors.ArtelError`.
@@ -509,21 +530,40 @@ Full test list: `LintRulesTest`: `test_open_without_encoding`; `test_read_write_
       # parent exited) and so a crashed runner's agents die with it (handle closed by the OS)
   def group_of(proc: subprocess.Popen) -> int   # POSIX os.getpgid(proc.pid) (== pid); Windows proc.pid
   def soft_terminate(pid: int, group: int) -> None   # POSIX killpg(group, SIGTERM); Windows os.kill(pid, CTRL_BREAK_EVENT); ignores ProcessLookupError/OSError
-  def hard_kill(pid: int, group: int) -> None        # POSIX killpg(group, SIGKILL); Windows TerminateJobObject if a job is
-                                                     # registered for pid, then `taskkill /T /F /PID <pid>` as fallback
-                                                     # (output captured, utf-8, errors ignored)
-  def tree_alive(pid: int, group: int) -> bool       # POSIX killpg(group, 0) succeeds (PermissionError → True); Windows pid_alive(pid)
-  def pid_alive(pid: int) -> bool                    # POSIX os.kill(pid, 0); Windows OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) +
-                                                     # GetExitCodeProcess == STILL_ACTIVE (259) via ctypes
-  def process_fingerprint(pid: int) -> str | None    # process start time, on every OS (§3.1); None only if the pid is gone:
+                                                     # (Windows: a failed CTRL_BREAK — no shared console — is written to stderr once)
+  def hard_kill(pid: int, group: int, fingerprint: str | None = None) -> None
+                                                     # POSIX killpg(group, SIGKILL); Windows TerminateJobObject if a job is
+                                                     # registered for pid (then the handle is closed and removed), else
+                                                     # `taskkill /T /F /PID <pid>` only if fingerprint is None or still matches
+                                                     # (pid reuse); output captured, utf-8, errors ignored
+  def tree_alive(pid: int, group: int) -> bool       # POSIX killpg(group, 0) succeeds (PermissionError → True); Windows: the registered
+                                                     # job's ActiveProcesses > 0 (QueryInformationJobObject), else pid_alive(pid)
+  def pid_alive(pid: int) -> bool                    # POSIX os.kill(pid, 0) and not a zombie (Linux /proc/<pid>/stat state "Z";
+                                                     # macOS `ps -o stat= -p <pid>` starts with "Z"); Windows
+                                                     # OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess ==
+                                                     # STILL_ACTIVE (259) via ctypes; ERROR_ACCESS_DENIED → True
+  def process_fingerprint(pid: int) -> str | None    # process start time, on every OS (§3.1); None if the pid is gone or a zombie:
                                                      # Linux field 22 of /proc/<pid>/stat; macOS `ps -o lstart= -p <pid>`
-                                                     # (utf-8, stripped); Windows GetProcessTimes creation time
+                                                     # (utf-8, stripped, LC_ALL=C; 1 s resolution); Windows GetProcessTimes creation time
   def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None = None) -> bool
-      # current = process_fingerprint(pid); current is None → False (gone); fingerprint is not None and
-      # current != fingerprint → False (pid reused, never signal it);
-      # soft_terminate; poll tree_alive every 0.05 s up to grace; hard_kill if still alive; True
-  def install_stop_handlers(callback: Callable[[], None]) -> None
-      # POSIX: SIGINT, SIGTERM; Windows: SIGINT, SIGBREAK — each calls callback() once per signal
+      # current = process_fingerprint(pid);
+      # current is not None and fingerprint is not None and current != fingerprint → False (pid reused, never signal);
+      # current is None (leader exited, reaped or zombie) → the tree may still hold children: POSIX — if
+      #   tree_alive(group) the group is ours (a pgid is not reused while the group exists): soft/hard kill the
+      #   group as below; Windows — terminate the registered job (if any) and close/remove its handle;
+      #   nothing alive → False;
+      # else soft_terminate; poll every 0.05 s up to grace until neither the group/job is alive nor the leader
+      #   (leader exit is detected with pid_alive, so an unreaped or zombie leader never costs the full grace);
+      #   hard_kill if anything is left; True when it signalled anything
+  @dataclass
+  class StopRequest:
+      count: int = 0                                 # signals received; the handler only increments it
+      def requested(self) -> bool                    # count > 0
+  def install_stop_handlers() -> StopRequest
+      # POSIX: SIGINT, SIGTERM; Windows: SIGINT, SIGBREAK. The handler does no I/O, takes no lock and calls
+      # nothing: it increments StopRequest.count (a print or Event.set from signal context can raise
+      # "reentrant call" or deadlock). Callers poll requested() outside signal context — the runner every
+      # tick, waiting at most poll_interval.
   def which(name: str) -> str | None                 # shutil.which (PATHEXT resolves claude.exe / claude.cmd)
   def resolve_argv(argv: Sequence[str]) -> list[str] # argv[0] through which(); ArtelError("cannot find <x> on PATH") if absent
   def git_bash_candidates(exec_path: str, env: Mapping[str, str]) -> list[Path]   # pure, testable everywhere:
@@ -533,27 +573,34 @@ Full test list: `LintRulesTest`: `test_open_without_encoding`; `test_read_write_
                                  # (the WSL launcher); ArtelError naming Git for Windows otherwise
   def shell_argv(shell: str, command: str, *, windows: bool = IS_WINDOWS) -> list[str]
       # "auto" → POSIX ["sh", "-c", command]; Windows [find_git_bash(), "-c", command];
-      # "sh"/"bash" → [which(shell) or shell, "-c", command];
+      # "sh"/"bash" → [which(shell) or shell, "-c", command], except "bash" on Windows → [find_git_bash(), "-c",
+      # command] (never System32\bash.exe or the WindowsApps alias: both are WSL);
       # "pwsh" → ["pwsh", "-NoProfile", "-NonInteractive", "-Command", command];
       # "cmd" → ["cmd", "/d", "/s", "/c", command]; other → ArtelError
+  def command_line(argv: Sequence[str], *, windows: bool = IS_WINDOWS) -> str | list[str]
+      # what to pass to Popen/run: Windows and argv[:4] == ["cmd", "/d", "/s", "/c"] → the hand-built string
+      # 'cmd /d /s /c "' + argv[4] + '"' (the command verbatim: list2cmdline would write \" which cmd does not
+      # understand); anything else → list(argv). procs.run_tree and cmd_agent.run_heavy always go through it.
   def prefix_argv(shell: str, prefix: str, command_argv: Sequence[str], *, windows: bool = IS_WINDOWS) -> list[str]
       # PD-25: shell sh/bash/auto → shell_argv(shell, prefix + ' "$@"') + ["artel-heavy", *command_argv],
       # i.e. [<sh>, "-c", '<prefix> "$@"', "artel-heavy", *command_argv]; pwsh/cmd → ArtelError
       # ("commands.heavy_lock must be a list when shell is pwsh or cmd")
   def shim_files(python: str, *, windows: bool = IS_WINDOWS) -> dict[str, str]     # pure: file name → content
       # always "artel": "#!/bin/sh\nexec \"<python>\" -m artel \"$@\"\n" (Git Bash on Windows reads it too);
-      # Windows also "artel.cmd": "@\"<python>\" -m artel %*\r\n"
+      # Windows also "artel.cmd": PD-33 preamble (save code page, chcp 65001) + "\"<python, % doubled>\" -m artel %*"
+      # + restore code page + exit with the saved exit code; "\r\n" line ends
   def write_shim(bin_dir: Path, python: str) -> Path   # writes shim_files (utf-8, newline as given);
                                                        # POSIX chmod 0o755 on "artel"; returns bin_dir
   def shim_invocation(bin_dir: Path) -> list[str]      # how tests run the shim: POSIX [bin/artel]; Windows [bin/artel.cmd]
   def write_wrapper(stem: Path, argv: Sequence[str]) -> list[str]
-      # a launcher script that runs argv + its own arguments: Windows `<stem>.cmd` containing
-      # `@"a" "b" %*` (the same batch-file path a real `claude.cmd` takes); POSIX `<stem>` sh script
-      # `exec "a" "b" "$@"` + chmod 0o755; returns the argv that invokes it (used by Task 9 to test
-      # argument quoting through a `.cmd` shim)
+      # a launcher script that runs argv + its own arguments: Windows `<stem>.cmd` with the PD-33 preamble and
+      # `"a" "b" %*` (`%` in a, b doubled; the same batch-file path a real `claude.cmd` takes); POSIX `<stem>`
+      # sh script `exec "a" "b" "$@"` + chmod 0o755; returns the argv that invokes it (used by Task 9 to test
+      # unwrapping a `.cmd` agent command, PD-41)
   def free_bytes(path: Path) -> int                    # shutil.disk_usage(path).free
   def long_paths_warning(repo_git: Callable[..., str], *, windows: bool = IS_WINDOWS) -> str | None
-      # Windows and `git config core.longpaths` != "true" → warning text naming the command to fix it; else None
+      # Windows and repo_git("config", "--type=bool", "core.longpaths") != "true" (git normalizes 1/yes/on) →
+      # warning text naming the command to fix it; else None
   ```
   `tests/helpers.py` gains:
   ```python
@@ -608,16 +655,17 @@ class TreeTest(unittest.TestCase):
 ```
 
 Full test list (portable unless marked):
-- `LockTest`: `test_lock_excludes_other_process` (hold `FileLock` here; a child `py` process trying non-blocking acquire prints `False`; after release prints `True`); `test_release_idempotent`; `test_lock_creates_parent_dir`.
-- `TreeTest`: `test_terminate_tree_kills_grandchild`; `test_soft_stop_ignored_gets_hard_kill`; `test_tree_alive_false_after_exit`; `test_terminate_skips_on_fingerprint_mismatch` (bogus fingerprint → returns False, child still alive); `test_job_object_kills_orphaned_grandchild` (child spawns a grandchild and exits; `hard_kill(child_pid, group)` still kills the grandchild — on POSIX through the process group, on Windows through the job; portable test, both families).
-- `PidTest`: `test_pid_alive_self_true`; `test_pid_alive_exited_false`; `test_fingerprint_stable_for_self` (two calls equal, non-empty, every OS); `test_fingerprint_differs_for_another_process`; `test_fingerprint_none_for_exited_pid`.
-- `StopHandlerTest`: `test_soft_terminate_runs_callback` (child installs `install_stop_handlers` that prints `stopped` and exits 0; parent `soft_terminate`; child output contains `stopped`).
-- `ShellTest` (pure, all OS): `test_shell_argv_variants` (`windows=False` auto → `sh -c`; `windows=True` with `find_git_bash` patched → `<bash.exe> -c`; pwsh; cmd; unknown raises); `test_prefix_argv_sh` (`["sh", "-c", 'tools/locks.sh heavy artel --wait -- "$@"', "artel-heavy", "npm", "test"]`); `test_prefix_argv_refused_for_pwsh`; `test_git_bash_candidates_order`; `test_shell_runs_command_on_this_os` (`subprocess.run(shell_argv("auto", "exit 3"))` returns 3; on Windows CI this uses Git Bash).
-- `ShimTest`: `test_shim_files_posix_and_windows` (pure); `test_wrapper_passes_arguments_verbatim` (wrapper around `py_cmd` that prints `json.dumps(sys.argv[1:])`; arguments with spaces, quotes, braces and non-ASCII come back identical — on Windows this exercises `.cmd` quoting); `test_written_shim_runs_artel` (`write_shim` into a temp dir, run `shim_invocation(dir) + ["--version"]` with `PYTHONPATH` set to the repo root → `0.1.0`).
-- `MiscTest`: `test_which_finds_python`; `test_resolve_argv_missing_raises`; `test_free_bytes_positive`; `test_long_paths_warning` (pure with `windows=True` and a fake `repo_git` returning `""` → warning; `"true"` → None; `windows=False` → None).
+Each test added in the rework names, in its docstring, the mutation it catches.
+- `LockTest`: `test_lock_excludes_other_process` (hold `FileLock` here; a child `py` process trying non-blocking acquire prints `False`; after release prints `True`); `test_release_idempotent`; `test_lock_creates_parent_dir`; `test_blocking_acquire_waits_for_release` (a thread releases after 0.3 s; `acquire(blocking=True)` returns True after it — catches a blocking acquire that returns False); `test_lock_freed_when_holder_dies` (a child holds the lock and is hard-killed → non-blocking acquire here returns True).
+- `TreeTest`: `test_terminate_tree_kills_grandchild`; `test_soft_stop_ignored_gets_hard_kill`; `test_tree_alive_false_after_exit`; `test_terminate_skips_on_fingerprint_mismatch` (bogus fingerprint → returns False, child still alive); `test_job_object_kills_orphaned_grandchild` (child spawns a grandchild and exits; `hard_kill(child_pid, group)` still kills the grandchild — on POSIX through the process group, on Windows through the job; portable test, both families); `test_terminate_tree_sweeps_group_after_leader_exit` (leader spawns a grandchild that holds stdout, leader exits and is reaped with `proc.wait()`; `terminate_tree(pid, group, 2.0)` returns True and the grandchild dies — catches "leader gone → False" leaving orphans); `test_terminate_tree_sends_soft_stop_first` (child handles SIGTERM/SIGBREAK by writing a marker file and exiting; the marker exists — catches dropping `soft_terminate`); `test_terminate_tree_returns_promptly_after_soft_stop` (child exits on the soft stop, `grace=30` → returns in < 5 s — catches waiting the full grace for an unreaped/zombie leader, the macOS case); `test_terminate_returns_false_when_nothing_alive`.
+- `PidTest`: `test_pid_alive_self_true`; `test_pid_alive_exited_false`; `test_fingerprint_stable_for_self` (two calls equal, non-empty, every OS); `test_fingerprint_differs_for_another_process` (the second child starts ≥ 1.1 s after the first: macOS `lstart` has 1 s resolution); `test_fingerprint_none_for_exited_pid`; pairs: `test_pid_alive_false_for_unreaped_zombie` (POSIX only: child exits, not yet reaped → False — catches dropping the zombie check) / `test_pid_alive_access_denied_is_alive` (Windows only: pid 4, the System process → True — catches a wrong `ERROR_ACCESS_DENIED` branch); `test_fingerprint_shape_linux` (digits) / `test_fingerprint_shape_macos` (`ps lstart` text) / `test_fingerprint_shape_windows` (creation-time integer) — each `skipUnless` its OS.
+- `StopHandlerTest`: `test_stop_handler_only_records` (child: `s = P.install_stop_handlers()`, prints `up`, loops `while not s.requested(): time.sleep(0.05)`, then prints `stopped` and exits 0; parent reads `up`, `soft_terminate`; exit code 0 and `stopped` in the output — the handler does no I/O, so the result never depends on print timing; catches the CI-red reentrant print).
+- `ShellTest` (pure unless marked): `test_shell_argv_variants` (`windows=False` auto → `sh -c`; `windows=True` with `find_git_bash` patched → `<bash.exe> -c`; pwsh; cmd; unknown raises); `test_shell_argv_sh_bash_use_which` (patched `which` → its path is argv[0] — catches swapping the sh/bash branch); `test_shell_argv_bash_on_windows_uses_git_bash` (`windows=True`, patched `find_git_bash`); `test_command_line_for_cmd` (`windows=True` → `'cmd /d /s /c "echo "a b""'`; `windows=False` and non-cmd argv → the list unchanged); `test_prefix_argv_sh` (`["sh", "-c", 'tools/locks.sh heavy artel --wait -- "$@"', "artel-heavy", "npm", "test"]`); `test_prefix_argv_refused_for_pwsh`; `test_git_bash_candidates_order` (exact list: env path first, then ancestors in order — catches swapping the order); `test_shell_runs_command_on_this_os` (`subprocess.run(shell_argv("auto", "exit 3"))` returns 3; on Windows CI this uses Git Bash); pair `test_cmd_shell_runs_quoted_command` (Windows only: `command_line(shell_argv("cmd", 'echo "a b"'))` prints `"a b"`) / `test_sh_shell_runs_quoted_command` (POSIX only: the same through `sh`).
+- `ShimTest`: `test_shim_files_posix_and_windows` (pure; the `.cmd` text has the PD-33 preamble and doubled `%`); `test_wrapper_passes_arguments_verbatim` (wrapper around `py_cmd` that prints `json.dumps(sys.argv[1:])`; arguments with spaces, quotes, braces, non-ASCII, `&`, `%`, `^`, `|`, `<`, `>` and space-free `a&b` come back identical — on Windows this exercises `.cmd` quoting); `test_wrapper_in_non_ascii_percent_dir` (the wrapper and its script live in a directory named `тест 100%`; it runs and exits with the script's code — catches a UTF-8 `.cmd` read in the OEM code page and an unescaped `%`); `test_written_shim_runs_artel` (`write_shim` into a temp dir, run `shim_invocation(dir) + ["--version"]` with `PYTHONPATH` set to the repo root → `0.1.0`).
+- `MiscTest`: `test_which_finds_python`; `test_resolve_argv_missing_raises`; `test_free_bytes_positive`; `test_long_paths_warning` (pure with `windows=True` and a fake `repo_git` that asserts `--type=bool` is passed and returns `""` → warning; `"true"` → None; `windows=False` → None).
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_platform -v` — FAIL.
-- [ ] **Step 3: Implement.** All OS branches in this file only; Windows ctypes calls use `kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)` with explicit `argtypes`/`restype`.
+- [ ] **Step 3: Implement.** All OS branches in this file only; Windows ctypes calls use `kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)` with explicit `argtypes`/`restype`. OS-conditional tests are `skipUnless` pairs keyed on `P.IS_WINDOWS` or `sys.platform` (allowed in this test module only). Record the PD-33 encoding choice in the commit message (it was a SPEC-GAP: the spec says UTF-8).
 - [ ] **Step 4: Whole suite** — PASS locally (Linux). Windows/macOS evidence comes from the CI matrix; the reviewer reads the Windows branches line by line against the §12 table.
 - [ ] **Step 5: Commit** — `git commit -m "Platform: locks, process trees, liveness, shell, shims per OS"`
 
@@ -627,9 +675,9 @@ Full test list (portable unless marked):
 
 ### Task 4: Board — SQLite schema, transactions, WAL fallback
 
-**Spec:** §3 (board), §3.1 (states incl. `vetting`/`awaiting_approval`, fields `then`, `rejected_by`, `cause`, `fix_kind=conflict`, `running` flag, single-writer `requests` table), §4 (per-stage measurements for `artel stats`), §8 (SQLite rules), PD-23, PD-28, PD-29. The runner lock is `platform.FileLock` (Task 3) used by the runner directly; the board has no lock class.
+**Spec:** §3 (board), §3.1 (states incl. `vetting`/`awaiting_approval`, fields `then`, `rejected_by`, `cause`, `fix_kind=conflict`, `running` flag, single-writer `requests` table), §4 (per-stage measurements for `artel stats`), §8 (SQLite rules), PD-23, PD-28, PD-29, PD-34, PD-35, PD-36, PD-37. The runner lock is `platform.FileLock` (Task 3) used by the runner directly; the board has no lock class.
 
-**Context for the writer:** Global Constraints + PD-23, PD-28, PD-29 + this task.
+**Context for the writer:** Global Constraints + PD-23, PD-28, PD-29, PD-34, PD-35, PD-36, PD-37 + this task.
 
 **Files:**
 - Create: `artel/board.py`, `tests/test_board.py`, `tests/factories.py`
@@ -658,9 +706,12 @@ Full test list (portable unless marked):
       rejected_by: str | None         # "vet" | "human" | None (approve from rejected only when "vet")
       stuck_from: str | None          # stage state the task got stuck in (PD-28)
       review_closure: bool            # next review uses the closure template (PD-29)
+      fix_base: str | None            # task-branch tip when the task last entered fixing (PD-35)
+      accepted: bool                  # human accepted the verified commit (PD-36)
+      risky: bool                     # vet found the task risky (PD-37)
       answered: bool
       last_verify: str | None         # "green" | "red" | "conflict" | "timeout" | None
-      running: bool; running_kind: str | None   # "agent" | "setup" | "verify" | "base"
+      running: bool; running_kind: str | None   # "agent" | "setup" | "verify" (the base job is not a task, PD-34)
       running_started_at: float | None          # for stage_timeout bookkeeping and status
       running_pid: int | None
       running_group: int | None       # process group id on POSIX, the pid on Windows (platform.group_of)
@@ -695,7 +746,8 @@ Full test list (portable unless marked):
       def get_task(self, task_id: int) -> Task
       def list_tasks(self, states: Iterable[str] | None = None) -> list[Task]
       def update_task(self, task_id: int, *, expect_state: str, expect_version: int, **fields) -> bool
-          # compare-and-set inside tx(); bumps version and updated_at; False when state/version moved
+          # compare-and-set inside tx(); bumps version and updated_at; False when state/version moved;
+          # every column name in generated SQL is double-quoted ("then" is an SQLite keyword)
       def set_running(self, task_id: int, *, kind: str, pid: int, group: int,
                       fingerprint: str | None, slot: int | None) -> None
       def clear_running(self, task_id: int) -> None   # requeue: clears running_* only, no counter
@@ -740,7 +792,8 @@ Full test list (portable unless marked):
     extra_review_rounds INTEGER NOT NULL DEFAULT 0, extra_verify_fixes INTEGER NOT NULL DEFAULT 0,
     attempts INTEGER NOT NULL DEFAULT 0, round INTEGER NOT NULL DEFAULT 0,
     verify_fixes INTEGER NOT NULL DEFAULT 0, fix_kind TEXT, asked_by TEXT, cause TEXT,
-    then TEXT, rejected_by TEXT, stuck_from TEXT, review_closure INTEGER NOT NULL DEFAULT 0,
+    "then" TEXT, rejected_by TEXT, stuck_from TEXT, review_closure INTEGER NOT NULL DEFAULT 0,
+    fix_base TEXT, accepted INTEGER NOT NULL DEFAULT 0, risky INTEGER NOT NULL DEFAULT 0,
     answered INTEGER NOT NULL DEFAULT 0, last_verify TEXT,
     running INTEGER NOT NULL DEFAULT 0, running_kind TEXT, running_started_at REAL, running_pid INTEGER,
     running_group INTEGER, running_fingerprint TEXT, running_slot INTEGER,
@@ -764,7 +817,18 @@ Full test list (portable unless marked):
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, command TEXT NOT NULL,
     task_id INTEGER, payload TEXT NOT NULL DEFAULT '{}', applied_at REAL, error TEXT);
   ```
-  `meta` holds `schema_version`; later tasks use keys `pause_reason` (`manual` | `base_conflict` | `limit` | `disk` | `setup_failed`), `pause_until`, `pause_detail`, `runner_pid`, `limit:<type>`, `last_base`, `heavy_lock_stale`.
+  `"then"` is quoted because `THEN` is an SQLite keyword (unquoted it is a syntax error); every statement that names it quotes it, and `update_task` quotes all column names.
+  `meta` holds `schema_version`; later tasks use these keys, with these value formats (pinned here so writers and readers in different waves agree):
+  | key | written by | value |
+  |---|---|---|
+  | `pause_reason` | T14, T15, T18, T22 | `manual` \| `base_conflict` \| `limit` \| `disk` \| `setup_failed` |
+  | `pause_until` | T22 | unix seconds as `repr(float)` text, e.g. `"1792464000.0"`; absent = no end time |
+  | `pause_detail` | T14, T15, T22 | one line of text, ≤ 400 bytes UTF-8 |
+  | `runner_pid` | T15 | decimal pid |
+  | `limit:<rateLimitType>` | T22 | JSON `{"status": str, "rank": int, "resets_at": float \| null, "utilization": float \| null, "seen_at": float}` |
+  | `last_base` | T14 | full sha of the base tip last merged |
+  | `heavy_lock_stale` | T22 | the check's output, one line, ≤ 400 bytes; absent when not stale |
+  | `base_running` | T15 | JSON `{"pid": int, "group": int, "fingerprint": str \| null, "slot": int, "started_at": float}` while a base job runs (PD-34) |
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -791,7 +855,7 @@ class FailingWal(sqlite3.Connection):
 
 class BoardTest(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.path = Path(self._tmp.name) / "artel" / "board.db"
         self.board = B.open_board(self.path)
 
@@ -838,7 +902,9 @@ Full test list (`tests/test_board.py`):
 - `test_slots_upsert_and_assign`.
 - `test_runs_numbering_per_task_and_stage` (two `write` runs → n 1, 2; first `review` → n 1; `finish_run` stores usage dict).
 - `test_requests_pending_and_finish`.
-- `test_new_states_and_fields_roundtrip` (`vetting`, `awaiting_approval`; `then`, `rejected_by`, `cause`, `stuck_from`, `review_closure`, `fix_kind="conflict"`).
+- `test_new_states_and_fields_roundtrip` (`vetting`, `awaiting_approval`; `then`, `rejected_by`, `cause`, `stuck_from`, `review_closure`, `fix_base`, `accepted`, `risky`, `fix_kind="conflict"`).
+- `test_then_column_is_quoted` (`update_task(..., then="open")` succeeds and reads back; catches an unquoted `then` in the schema or in `update_task`'s SQL).
+- `test_meta_formats_roundtrip` (`limit:five_hour` JSON and `pause_until` float text written and parsed back as in the table above).
 - `test_finish_run_stores_measurements` (first/last context, turns, duration, cost, session id; `all_runs(stages=["write"])` filters).
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_board -v` — expected FAIL (`No module named 'artel.board'`).
@@ -852,9 +918,9 @@ Full test list (`tests/test_board.py`):
 
 ### Task 5: Configuration — schema, loading with sources, `artel config`
 
-**Spec:** §9, §10 (visible values and sources; `config`, `config explain`, `config set`), §6 (profiles with explicit `--permission-mode`), §12 (command settings string-or-list, `shell` setting), §4 (vetting `autoapprove`/`risk_signals`, `[rotation]` with `writer_max_context = 0` = unset), §14a (out-of-scope keys absent), PD-10, PD-31.
+**Spec:** §9, §10 (visible values and sources; `config`, `config explain`, `config set`), §6 (profiles with explicit `--permission-mode`), §12 (command settings string-or-list, `shell` setting), §4 (vetting `autoapprove`/`risk_signals`, `[rotation]` with `writer_max_context = 0` = unset), §14a (out-of-scope keys absent), PD-10, PD-31, PD-38, PD-44.
 
-**Context for the writer:** Global Constraints + PD-10, PD-31 + this task.
+**Context for the writer:** Global Constraints + PD-10, PD-31, PD-38, PD-44 + this task.
 
 **Files:**
 - Create: `artel/config_schema.py`, `artel/config.py`, `artel/cmd_config.py`, `tests/test_config.py`
@@ -869,7 +935,8 @@ Full test list (`tests/test_board.py`):
         key: str                 # dotted: "max_agents", "models.write", "commands.verify", "notify.on"
         kind: str                # "int" | "str" | "bool" | "duration" | "size" | "str_list" | "enum" | "enum_list"
                                  # | "command" (str → configured shell, or list → direct argv; "" / [] = unset)
-                                 # | "argv" (executable + args: list, or str split with shlex.split(posix=True))
+                                 # | "argv" (executable + args as a list, or a str = one executable name/path,
+                                 #   never split — PD-44)
         default: object          # TOML-typed default as written to artel.toml ("90m", "3G", 2, [...])
         meaning: str             # one line: what it controls
         cost: str                # one line: quota/cost effect ("" when none)
@@ -924,7 +991,7 @@ Full test list (`tests/test_board.py`):
     | `profiles.common` | str_list | `["-p", "--model", "{model}", "--output-format", "stream-json", "--verbose", "--json-schema", "{schema}", "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config", "--exclude-dynamic-system-prompt-sections", "--append-system-prompt-file", "{unattended_notice}"]` |
     | `profiles.writer` | str_list | `["--permission-mode", "acceptEdits", "--allowedTools", "Bash(artel note *) Bash(artel add *) Bash(artel heavy *) Bash(git add *) Bash(git commit *) Bash(git status *) Bash(git diff *)", "{project_tools}"]` |
     | `profiles.reviewer` | str_list | `["--permission-mode", "default", "--disallowedTools", "Edit Write NotebookEdit", "--allowedTools", "Bash(artel note *) Bash(git diff *) Bash(git log *) Bash(git show *) Bash(git status *)", "{project_read_tools}"]` |
-    | `notify.on` | enum_list blocked/stuck/paused/resumed/done/runner_stopped | `["blocked", "stuck", "paused", "resumed", "runner_stopped"]` |
+    | `notify.on` | enum_list blocked/stuck/paused/resumed/done/runner_stopped/error | `["blocked", "stuck", "paused", "resumed", "runner_stopped", "error"]` (PD-38) |
     | `notify.command` | command | `""` |
     | `notify.telegram_enabled` | bool | `false` |
     | `notify.telegram_token_env` | str | `"ARTEL_TELEGRAM_TOKEN"` |
@@ -933,7 +1000,7 @@ Full test list (`tests/test_board.py`):
     | `notify.telegram_chat_file` | str | `""` |
     | `notify.telegram_api_base` | str | `"https://api.telegram.org"` |
 
-    Profile defaults follow spec §6 as amended by the spike (explicit `--permission-mode` in both profiles; `{schema}` is replaced by the schema's inline JSON text, spike Q1). T9 owns the placeholder expansion. `--setting-sources` is deliberately absent (spike Q7: user knob, default off; the `explain` text of `profiles.common` says how to add it). Every `meaning` is one line; `cost` is filled for every setting that changes agent runs or model choice (e.g. `review_rounds`: "each round is one fresh reviewer run"; `models.strong_diff_lines`: "lower = more reviews on the strong model").
+    Profile defaults follow spec §6 as amended by the spike (explicit `--permission-mode` in both profiles; `{schema}` is replaced by the schema's inline JSON text, spike Q1). T9 owns the placeholder expansion. `--setting-sources` is deliberately absent (spike Q7: user knob, default off; the `explain` text of `profiles.common` says how to add it). Every `meaning` is one line; `cost` is filled for every setting that changes agent runs or model choice (e.g. `review_rounds`: "each round is one fresh reviewer run"; `models.strong_diff_lines`: "lower = more reviews on the strong model"). The `explain` text of every `rotation.*` key says it takes effect only when writer session rotation is built (Task 26, which may be skipped after Task 25); until then every writer is fresh.
   - `artel.config`:
     ```python
     def parse_duration(s: str | int | float) -> float   # "90m"→5400.0, "30s"→30.0, "100ms"→0.1, "1.5s"→1.5, "1h", "2d"; numbers pass; else UsageError
@@ -989,7 +1056,7 @@ class SchemaTest(unittest.TestCase):
 
 class LoadTest(RepoTestCase):
     def test_sources_precedence(self):
-        (self.repo_path / "artel.toml").write_text("max_agents = 3\n[models]\nreview = \"haiku\"\n")
+        (self.repo_path / "artel.toml").write_text("max_agents = 3\n[models]\nreview = \"haiku\"\n", encoding="utf-8")
         cfg = C.load_config(Repo.discover(self.repo_path), env={"ARTEL_MODELS_REVIEW": "opus"},
                             cli={"max_agents": (4, "flag -n")})
         self.assertEqual((cfg["max_agents"], cfg.source("max_agents")), (4, "flag -n"))
@@ -999,7 +1066,7 @@ class LoadTest(RepoTestCase):
 
 Full test list:
 - `SchemaTest`: `test_keys_and_defaults_match_plan_table` (exact key set and defaults); `test_every_setting_has_meaning_and_explain`; `test_cost_present_for_quota_settings` (max_agents, max_attempts, review_rounds, max_verify_fixes, models.*, stage_timeout, limit_stop, profiles.* have non-empty cost); `test_rendered_toml_parses_back_to_defaults`; `test_rendered_toml_has_comment_on_every_key_line`; `test_out_of_scope_keys_absent`; `test_defaults_markdown_has_row_per_setting`; `test_both_profiles_pass_permission_mode` (writer `acceptEdits`, reviewer `default`; no `bypassPermissions` anywhere); `test_rotation_and_vet_settings` (`[rotation]` table rendered; `writer_max_context` 0 explained as "no threshold"; `autoapprove` choices).
-- `ParseTest`: `test_parse_duration` (`"90m"`, `"30s"`, `"100ms"`, `"1.5s"`, `"1h"`, `"2d"`, `45`, bad `"5x"` raises); `test_parse_size` (`"3G"`, `"500M"`, `"1024K"`, `1000`, bad raises); `test_coerce_lists_from_string` (comma and TOML array); `test_coerce_enum_rejects_unknown`; `test_coerce_bool`; `test_command_kind_string_or_list` (`"npm test"` stays a string; `'["npm", "test"]'` becomes a list; `[]` and `""` mean unset).
+- `ParseTest`: `test_parse_duration` (`"90m"`, `"30s"`, `"100ms"`, `"1.5s"`, `"1h"`, `"2d"`, `45`, bad `"5x"` raises); `test_parse_size` (`"3G"`, `"500M"`, `"1024K"`, `1000`, bad raises); `test_coerce_lists_from_string` (comma and TOML array); `test_coerce_enum_rejects_unknown`; `test_coerce_bool`; `test_command_kind_string_or_list` (`"npm test"` stays a string; `'["npm", "test"]'` becomes a list; `[]` and `""` mean unset); `test_argv_string_is_never_split` (PD-44: `agent_command = 'C:\Tools\claude.exe'` and `'/opt/my tools/claude'` stay one string).
 - `LoadTest`: `test_defaults_without_file`; `test_sources_precedence`; `test_unknown_key_in_file_is_error`; `test_invalid_value_names_key`; `test_config_read_from_main_worktree_even_in_linked_worktree`.
 - `SetTest`: `test_set_keeps_comment_and_other_lines`; `test_set_adds_missing_key_under_table`; `test_set_invalid_value_leaves_file_unchanged`; `test_set_unknown_key_errors`; `test_set_windows_path_is_escaped` (`config set commands.heavy_lock 'C:\\Tools\\lock.exe'` writes a valid TOML basic string that reads back unchanged; file written as UTF-8 with `\n`).
 - `CommandTest` (call `cmd_config.run` with a Namespace, capture stdout, chdir into repo via `os.chdir` in setUp/tearDown): `test_config_lists_every_key_with_source`; `test_explain_prints_long_text`; `test_set_then_show_source_artel_toml`.
@@ -1018,7 +1085,7 @@ Full test list:
 **Spec (journal):** §3.2 (kinds, limits, corrections), §4 (findings with severity), PD-3, PD-5, PD-21.
 **Spec (pick):** §3 (area), §5 step 2 (pick order, `--after`, area overlap), §5 step 7 (verify one at a time), PD-6, PD-7.
 
-**Context for the writer:** Global Constraints + PD-3, PD-5, PD-6, PD-7, PD-21 + this task.
+**Context for the writer:** Global Constraints + PD-3, PD-5, PD-6 (amended), PD-7, PD-21 + this task.
 
 **Files:**
 - Create: `artel/journal.py`, `tests/test_journal.py`
@@ -1066,21 +1133,28 @@ Full test list:
 - Produces (`artel.pick`, pure functions):
   ```python
   IN_FLIGHT = ("attacking", "writing", "reviewing", "fixing", "verifying", "verified")   # hold areas (PD-6),
-                                                    # except attacking with then != None (no branch yet)
+                                                    # except attacking with then != None (vet-triggered, no branch);
+                                                    # a human --attack task (then None) holds its area while attacking
   DUE_STAGES = ("vetting", "attacking", "writing", "reviewing", "fixing")
   def normalize_area(path: str) -> str             # strip "./", trailing "/", collapse "//"; "" stays ""
   def areas_overlap(a: Sequence[str], b: Sequence[str]) -> bool
       # empty sequence = whole repo → overlaps everything; else any pair where one is a
       # path-component prefix of the other
+  def holds_area(task: Task) -> bool               # state in IN_FLIGHT and not (attacking with then set)
   def select(tasks: Sequence[Task], deps: Mapping[int, Sequence[int]], *, free_slots: int,
-             verify_busy: bool) -> list[Task]
-      # returns at most free_slots tasks (none with running=True), in this order:
+             verify_busy: bool, busy: Collection[int] = ()) -> list[Task]
+      # `busy` = ids of tasks with a live job in the runner (a task is picked and its job started before the
+      # worker sets `running`): busy tasks and tasks with running=True are never selected, but still hold
+      # their areas. "Running" below = id in busy or running=True.
+      # Returns at most free_slots tasks, in this order:
       #  1. answered=True tasks in DUE_STAGES, by (-priority, id)
       #  2. other tasks in DUE_STAGES, by (-priority, id)
       #  3. at most one "verifying" task (lowest id), only if not verify_busy
+      #     — steps 1–3 skip a task whose area (unless it holds no area: vet, vet-triggered attack) overlaps
+      #       a running task that holds an area or a task already selected in this call (PD-6 amended)
       #  4. "proposed" tasks by (-priority, id) — the runner applies `pick` (proposed → vetting); no area check
       #  5. "open" tasks by (-priority, id) whose deps are all "done" and whose area does not
-      #     overlap any IN_FLIGHT task nor any task already selected in this call
+      #     overlap any task that holds_area nor any task already selected in this call
   def waiting_reason(task: Task, tasks_by_id: Mapping[int, Task], deps: Sequence[int]) -> str | None
       # for status: "after #3 (open)", "after #4 (rejected)", "area overlaps #2"
   ```
@@ -1098,7 +1172,7 @@ from artel import board as B, journal as J
 
 class JournalTest(unittest.TestCase):
     def setUp(self):
-        self._tmp = tempfile.TemporaryDirectory()
+        self._tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.board = B.open_board(Path(self._tmp.name) / "board.db")
         self.tid = self.board.insert_task(title="t", state="reviewing", created_by="human")
 
@@ -1132,7 +1206,7 @@ Full test list: `test_append_and_read_back`; `test_unknown_kind_rejected`; `test
         self.assertEqual([t.id for t in got], [3])
 ```
 
-Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` vs `src/ab` false, `src` vs `src/a` true, `()` vs anything true); `test_answered_first`; `test_in_flight_stages_before_open`; `test_priority_then_id`; `test_running_tasks_never_selected`; `test_verifying_only_one_and_not_when_busy`; `test_open_task_with_overlapping_area_waits`; `test_two_open_overlapping_tasks_not_selected_together`; `test_after_dependency_must_be_done`; `test_free_slots_limit`; `test_proposed_picked_for_vetting_before_open`; `test_vetting_is_a_due_stage`; `test_branchless_attack_holds_no_area` (attacking with `then` set does not block an overlapping open task); `test_waiting_reason_strings`.
+Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` vs `src/ab` false, `src` vs `src/a` true, `()` vs anything true); `test_answered_first`; `test_in_flight_stages_before_open`; `test_priority_then_id`; `test_running_tasks_never_selected`; `test_verifying_only_one_and_not_when_busy`; `test_open_task_with_overlapping_area_waits`; `test_two_open_overlapping_tasks_not_selected_together`; `test_after_dependency_must_be_done`; `test_free_slots_limit`; `test_proposed_picked_for_vetting_before_open`; `test_vetting_is_a_due_stage`; `test_branchless_attack_holds_no_area` (attacking with `then` set does not block an overlapping open task); `test_human_attack_holds_area` (attacking with `then` None blocks an overlapping open task); `test_busy_task_not_selected_but_holds_area` (an `open` task whose id is in `busy` is not selected again and an overlapping open task waits — catches dispatching one task twice); `test_answered_task_waits_for_overlapping_running_task` (blocked→writing answered task with area `src` is skipped while a `reviewing` task on `src/a` is running; selected when it is not — catches overlapping tasks running together); `test_two_due_overlapping_tasks_not_selected_together`; `test_waiting_reason_strings`.
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_journal tests.test_pick -v` — FAIL.
 - [ ] **Step 3: Implement** both modules; journal writes go through `board.tx()`; `pick.py` stays pure.
@@ -1145,9 +1219,9 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
 
 ### Task 7: Transition table as data and engine — **RISKY (strong-model review)**
 
-**Spec:** §3.1 (every row of the table at f236e02, defaults, "every transition not in the table is an error"), §4 (vetting outcomes and `autoapprove`), §10 last bullet (verdicts and caps carry the setting), PD-28, PD-29, PD-30.
+**Spec:** §3.1 (every row of the table at f236e02, defaults, "every transition not in the table is an error"), §4 (vetting outcomes and `autoapprove`), §10 last bullet (verdicts and caps carry the setting), PD-28, PD-29, PD-30, PD-35, PD-36, PD-37, PD-39.
 
-**Context for the writer:** Global Constraints + PD-28, PD-29, PD-30 + this task.
+**Context for the writer:** Global Constraints + PD-28, PD-29, PD-30, PD-35, PD-36, PD-37, PD-39 + this task.
 
 **Files:**
 - Create: `artel/transitions.py`, `tests/test_transitions.py`
@@ -1166,6 +1240,11 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
                    merge: str, autoapprove: str) -> "Limits"
           # review_rounds = (task.review_rounds or review_rounds) + task.extra_review_rounds
           # max_verify_fixes = max_verify_fixes + task.extra_verify_fixes; merge = task.merge or merge
+      @staticmethod
+      def from_cfg(task: Task, cfg: Mapping[str, object]) -> "Limits"
+          # for_task with cfg["max_attempts"], cfg["review_rounds"], cfg["max_verify_fixes"], cfg["merge"],
+          # cfg["autoapprove"]; the one place effective limits are computed (stages, integrate, requests,
+          # cmd_human and the runner all call it; this module still imports no config code)
   @dataclass(frozen=True)
   class Row:
       rid: str                         # "R01" …, see TABLE
@@ -1190,14 +1269,19 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
   EFFECTS = ("delete_branch", "reset_branch", "terminate_running", "append_findings", "append_answer",
              "ask_open_findings", "pause_setup_failed", "notify_internal_error")
   TABLE: tuple[Row, ...]
-  def decide(task: Task | None, event: str, limits: Limits, *, stage: str | None = None,
-             has_branch: bool | None = None) -> Transition
-      # pure. `stage` required for "ask"; `has_branch` required for "rework"; raises TransitionError
+  def decide(task: Task | None, event: str, limits: Limits | None, *, stage: str | None = None,
+             has_branch: bool | None = None, tip: str | None = None) -> Transition
+      # pure. `stage` required for "ask"; `has_branch` required for "rework"; `tip` (current sha of the task
+      # branch) required when the matching row sets "fix_base=tip" (PD-35) — missing → TransitionError;
+      # `limits` may be None only for task creation (R01/R02 read no limits; a guard that needs limits
+      # with None → TransitionError)
   def apply(board, task_id: int, event: str, limits: Limits, *, stage: str | None = None,
-            has_branch: bool | None = None) -> Transition
+            has_branch: bool | None = None, tip: str | None = None) -> Transition
       # loads task, decide(), board.update_task(expect_state, expect_version, state=to, **updates);
-      # StaleTask if CAS fails; never touches git, journal or processes (effects are returned)
-  def create(board, event: str, **task_fields) -> int   # R01/R02 via decide(None, …) then insert_task
+      # StaleTask if CAS fails; never touches git, journal or processes (effects are returned).
+      # Callers that may enter fixing (stages.finish_stage, integrate.finish_verify, requests.apply_pending)
+      # pass tip=repo.rev(task_branch(task_id))
+  def create(board, event: str, **task_fields) -> int   # R01/R02 via decide(None, event, None) then insert_task
   ```
   The table (exact data; spec rows that cover several guarded cases are split `a`/`b`/…; order follows §3.1):
   ```python
@@ -1212,8 +1296,8 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
       Row("R04a", ("vetting",), "vet_ok", "open", when=("auto=non_risky|all",), cause="autoapprove"),
       Row("R04b", ("vetting",), "vet_ok", "awaiting_approval", when=("auto=none",), cause="autoapprove"),
       Row("R04c", ("vetting",), "vet_risky", "attacking", when=("auto=none|non_risky",),
-          sets=("then=awaiting_approval",), cause="autoapprove"),
-      Row("R04d", ("vetting",), "vet_risky", "attacking", when=("auto=all",), sets=("then=open",),
+          sets=("then=awaiting_approval", "risky=1"), cause="autoapprove"),
+      Row("R04d", ("vetting",), "vet_risky", "attacking", when=("auto=all",), sets=("then=open", "risky=1"),
           cause="autoapprove"),
       Row("R05", ("vetting",), "vet_inadequate", "rejected", sets=("rejected_by=vet",)),
       Row("R06", ("vetting",), "stage_failed", "=", sets=("attempts+1",), stuck_on_cap=True,
@@ -1238,7 +1322,7 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
       Row("R16", ("fixing",), "ready", "reviewing", when=("fix_kind=conflict",),
           sets=("fix_kind=none", "review_closure=1")),
       Row("R17", ("writing", "fixing"), "stage_failed", "open",
-          sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none"),
+          sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0"),
           effects=("reset_branch",), stuck_on_cap=True, cause="max_attempts"),
       Row("R18", STAGE_STATES, "ask", "blocked", sets=("asked_by=stage", "cause=ask")),
       Row("R19", JOB_STATES, "setup_failed", "=", effects=("pause_setup_failed",)),
@@ -1246,7 +1330,7 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
           effects=("notify_internal_error",), stuck_on_cap=True, cause="max_attempts"),
       Row("R21", ("reviewing",), "review_clear", "verifying", sets=("review_closure=0",)),
       Row("R22a", ("reviewing",), "review_blocking", "fixing", when=("round<rounds",),
-          sets=("fix_kind=review", "review_closure=0"), cause="review_rounds"),
+          sets=("fix_kind=review", "review_closure=0", "fix_base=tip"), cause="review_rounds"),
       Row("R22b", ("reviewing",), "review_blocking", "blocked", when=("round>=rounds",),
           sets=("asked_by=review", "cause=cap", "review_closure=0"), effects=("ask_open_findings",),
           cause="review_rounds"),
@@ -1257,34 +1341,39 @@ Full test list: `test_normalize_area`; `test_overlap_component_prefix` (`src/a` 
       Row("R25", ("blocked",), "answer", "reviewing", when=("asked_by=review", "cause=ask"),
           sets=("clear_ask",), effects=("append_answer",)),
       Row("R26", ("blocked",), "answer", "fixing", when=("asked_by=review", "cause=cap"),
-          sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask"), effects=("append_answer",)),
+          sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip"),
+          effects=("append_answer",)),
       Row("R27", ("blocked",), "answer", "vetting", when=("asked_by=vet",), sets=("clear_ask",),
           effects=("append_answer",)),
       Row("R28", ("blocked",), "answer", "fixing", when=("asked_by=verify",),
-          sets=("fix_kind=verify", "extra_verify_fixes+1", "clear_ask"), effects=("append_answer",)),
+          sets=("fix_kind=verify", "extra_verify_fixes+1", "clear_ask", "fix_base=tip"),
+          effects=("append_answer",)),
       Row("R29a", ("blocked",), "rework", "fixing", when=("has_branch",),
-          sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask"), effects=("append_answer",)),
+          sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip"),
+          effects=("append_answer",)),
       Row("R29b", ("stuck",), "rework", "fixing", when=("has_branch",),
-          sets=("fix_kind=review", "extra_review_rounds+1", "attempts=0", "stuck_from=none", "answered=1"),
+          sets=("fix_kind=review", "extra_review_rounds+1", "attempts=0", "stuck_from=none", "answered=1",
+                "fix_base=tip"),
           effects=("append_answer",)),
       Row("R30", ("stuck",), "rework", "@stuck_from", when=("no_branch",),
           sets=("attempts=0", "stuck_from=none", "answered=1"), effects=("append_answer",)),
-      Row("R31a", ("verifying",), "verify_green", "verified", when=("merge=auto",), cause="merge"),
-      Row("R31b", ("verifying",), "verify_green", "awaiting_accept", when=("merge=ask",), cause="merge"),
+      Row("R31a", ("verifying",), "verify_green", "verified", when=("merge=auto|accepted",), cause="merge"),
+      Row("R31b", ("verifying",), "verify_green", "awaiting_accept", when=("merge=ask", "not_accepted"),
+          cause="merge"),
       Row("R32", ("verifying",), "verify_conflict", "fixing", when=("vfix<cap",),
-          sets=("fix_kind=conflict", "verify_fixes+1"), cause="max_verify_fixes"),
+          sets=("fix_kind=conflict", "verify_fixes+1", "accepted=0"), cause="max_verify_fixes"),
       Row("R33", ("verifying",), "verify_red", "fixing", when=("vfix<cap",),
-          sets=("fix_kind=verify", "verify_fixes+1"), cause="max_verify_fixes"),
+          sets=("fix_kind=verify", "verify_fixes+1", "accepted=0", "fix_base=tip"), cause="max_verify_fixes"),
       Row("R34a", ("verifying",), "verify_red", "blocked", when=("vfix>=cap",),
           sets=("asked_by=verify", "cause=cap"), cause="max_verify_fixes"),
       Row("R34b", ("verifying",), "verify_conflict", "blocked", when=("vfix>=cap",),
-          sets=("asked_by=verify", "cause=cap"), cause="max_verify_fixes"),
-      Row("R35", ("awaiting_accept",), "accept", "verified"),
+          sets=("asked_by=verify", "cause=cap"), cause="max_verify_fixes"),                   # PD-39
+      Row("R35", ("awaiting_accept",), "accept", "verified", sets=("accepted=1",)),           # PD-36
       Row("R36", ("verified",), "ff_ok", "done", effects=("delete_branch",)),
       Row("R37", ("verified",), "ff_impossible", "verifying"),
   )
   ```
-  Guard semantics: `attack`/`not_attack` → `task.attack`; `fix_kind=X` → `task.fix_kind == X`; `then=X` (`none` = None); `auto=a|b` → `limits.autoapprove in (a, b)`; `approvable` → state is not `rejected` or `task.rejected_by == "vet"`; `round<rounds` → `task.round < limits.review_rounds`; `vfix<cap` → `task.verify_fixes < limits.max_verify_fixes`; `merge=X`; `asked_by=X|Y`; `cause=X`; `has_branch`/`no_branch` → the `has_branch` argument (required, else `TransitionError`). Updates: `clear_ask` = `asked_by=None, cause=None, answered=1`; `asked_by=stage` maps `vetting→vet`, `attacking→attack`, `writing→write`, `reviewing→review`, `fixing→fix` and `decide` checks the `stage` argument matches. Targets: `@asked` maps `write→writing`, `fix→fixing` (fix_kind kept); `@stuck_from` → `task.stuck_from`. When `stuck_on_cap` fires, the target becomes `stuck` and `stuck_from` is set to the source state — except R17, whose branch was reset, which sets `stuck_from = "writing"` (PD-28). A matching set must be exactly one row; zero → `TransitionError`; more than one → `AssertionError` (table bug). Requeue is not a transition (the caller clears `running`).
+  Guard semantics: `attack`/`not_attack` → `task.attack`; `fix_kind=X` → `task.fix_kind == X`; `then=X` (`none` = None); `auto=a|b` → `limits.autoapprove in (a, b)`; `approvable` → state is not `rejected` or `task.rejected_by == "vet"`; `round<rounds` → `task.round < limits.review_rounds`; `vfix<cap` → `task.verify_fixes < limits.max_verify_fixes`; `merge=X` → `limits.merge == X`; `merge=auto|accepted` → `limits.merge == "auto" or task.accepted`; `not_accepted` → `not task.accepted`; `asked_by=X|Y`; `cause=X`; `has_branch`/`no_branch` → the `has_branch` argument (required, else `TransitionError`). Updates: `clear_ask` = `asked_by=None, cause=None, answered=1`; `fix_base=tip` = the `tip` argument (PD-35); `fix_base=none`; `accepted=0|1`; `risky=1`; `asked_by=stage` maps `vetting→vet`, `attacking→attack`, `writing→write`, `reviewing→review`, `fixing→fix` and `decide` checks the `stage` argument matches. Targets: `@asked` maps `write→writing`, `fix→fixing` (fix_kind kept); `@stuck_from` → `task.stuck_from`. When `stuck_on_cap` fires, the target becomes `stuck` and `stuck_from` is set to the source state — except R17, whose branch was reset, which sets `stuck_from = "writing"` (PD-28). A matching set must be exactly one row; zero → `TransitionError`; more than one → `AssertionError` (table bug). Requeue is not a transition (the caller clears `running`).
   `Transition.cause` strings: stuck → `"attempts 2 >= max_attempts 2"`; R22a/b → `"round 1 < review_rounds 2"` / `"round 2 >= review_rounds 2"`; R31 → `"merge=ask"`; R32–R34 → `"verify_fixes 1 < max_verify_fixes 2"`; R04 → `"autoapprove=non_risky"`.
 
 - [ ] **Step 1: Write the failing tests.** One test per data row (`test_R01_…` … `test_R37_…`), built with `tests.factories.make_task`, plus the meta tests.
@@ -1336,8 +1425,8 @@ class MetaTests(unittest.TestCase):
 ```
 
 Full test list:
-- Row tests, one per data row: `R01` add_human → open; `R02` add_agent → proposed; `R03` pick proposed → vetting; `R04a` vet_ok with non_risky and with all → open; `R04b` vet_ok with none → awaiting_approval; `R04c` vet_risky with none and non_risky → attacking, then=awaiting_approval; `R04d` vet_risky with all → attacking, then=open; `R05` vet_inadequate → rejected, rejected_by=vet; `R06` vet fail counts, sticks at cap with stuck_from=vetting; `R07a`/`R07b` attack_clear with `then` → awaiting_approval / open, `then` cleared; `R08` approve from proposed, awaiting_approval, rejected-by-vet; approve from rejected-by-human raises; `R09` reject from every LIVE state (subTests), effects `terminate_running`, `delete_branch`; reject from done raises; `R10a`/`R10b` pick open with/without attack; `R11` attack_clear without `then` → writing; `R12` attack_blocker → blocked (attack, ask); `R13` attack/review fail counts then sticks; `R14a` writer ready → reviewing round 1; `R14b` review fix ready → round + 1; `R15` verify fix ready → verifying, no round; `R16` conflict fix ready → reviewing, review_closure=1, round unchanged; `R17` writer/fixer fail → open with resets, stuck at cap with stuck_from=writing; `R18` ask from each STAGE_STATE (subTests; asked_by mapping; mismatched stage raises); `R19` setup_failed from each JOB_STATE: same state, no counters, effect `pause_setup_failed`; `R20` internal_error counts, sticks at cap, effect `notify_internal_error`; `R21` review_clear → verifying; `R22a`/`R22b` blocking below/at cap (also with `review_rounds=3` override and `extra_review_rounds=1`); `R23` answer after attack → attacking keeps `then`; `R24` answer resumes write/fix (fix keeps fix_kind); `R25` reviewer question → reviewing, no round; `R26` review cap answer → fixing, extra round; `R27` answer after vet ask → vetting; `R28` answer after verify cap → fixing(verify), extra fix; `R29a` rework blocked with branch; `R29b` rework stuck with branch resets attempts; `R30` rework stuck without branch → the stuck stage (vetting, attacking, writing subTests), attempts 0; rework without `has_branch` argument raises; `R31a`/`R31b` verify green auto/ask (also task.merge override); `R32` conflict below cap → fixing(conflict); `R33` red below cap → fixing(verify); `R34a`/`R34b` red/conflict at cap → blocked(verify, cap); `R35` accept; `R36` ff_ok → done, delete_branch; `R37` ff_impossible → verifying, no updates.
-- Meta tests: `test_every_row_has_a_test`; `test_table_rows_are_unambiguous` (for every state × event × sample task combination — guards varied over fix_kind, then, asked_by, cause, autoapprove, merge, counters, has_branch — at most one row matches); `test_every_state_and_event_is_known` (rows reference only `board.STATES`, `EVENTS`, `EFFECTS`); `test_unlisted_transition_is_error_and_board_unchanged`; `test_requeue_is_not_a_transition`; `test_apply_raises_stale_on_lost_cas`; `test_create_uses_R01_R02`; `test_limits_for_task_effective_values`.
+- Row tests, one per data row: `R01` add_human → open; `R02` add_agent → proposed; `R03` pick proposed → vetting; `R04a` vet_ok with non_risky and with all → open; `R04b` vet_ok with none → awaiting_approval; `R04c` vet_risky with none and non_risky → attacking, then=awaiting_approval, risky=1; `R04d` vet_risky with all → attacking, then=open, risky=1; `R05` vet_inadequate → rejected, rejected_by=vet; `R06` vet fail counts, sticks at cap with stuck_from=vetting; `R07a`/`R07b` attack_clear with `then` → awaiting_approval / open, `then` cleared; `R08` approve from proposed, awaiting_approval, rejected-by-vet; approve from rejected-by-human raises; `R09` reject from every LIVE state (subTests), effects `terminate_running`, `delete_branch`; reject from done raises; `R10a`/`R10b` pick open with/without attack; `R11` attack_clear without `then` → writing; `R12` attack_blocker → blocked (attack, ask); `R13` attack/review fail counts then sticks; `R14a` writer ready → reviewing round 1; `R14b` review fix ready → round + 1; `R15` verify fix ready → verifying, no round; `R16` conflict fix ready → reviewing, review_closure=1, round unchanged; `R17` writer/fixer fail → open with resets (fix_base None, accepted 0), stuck at cap with stuck_from=writing; `R18` ask from each STAGE_STATE (subTests; asked_by mapping; mismatched stage raises); `R19` setup_failed from each JOB_STATE: same state, no counters, effect `pause_setup_failed`; `R20` internal_error counts, sticks at cap, effect `notify_internal_error`; `R21` review_clear → verifying; `R22a`/`R22b` blocking below/at cap (also with `review_rounds=3` override and `extra_review_rounds=1`; R22a stores `fix_base` = the `tip` argument; without `tip` → TransitionError); `R23` answer after attack → attacking keeps `then`; `R24` answer resumes write/fix (fix keeps fix_kind); `R25` reviewer question → reviewing, no round; `R26` review cap answer → fixing, extra round; `R27` answer after vet ask → vetting; `R28` answer after verify cap → fixing(verify), extra fix; `R29a` rework blocked with branch; `R29b` rework stuck with branch resets attempts; `R30` rework stuck without branch → the stuck stage (vetting, attacking, writing subTests), attempts 0; rework without `has_branch` argument raises; `R31a`/`R31b` verify green auto/ask (also task.merge override; `merge=ask` with `accepted` → verified, PD-36); `R32` conflict below cap → fixing(conflict), accepted 0; `R33` red below cap → fixing(verify), accepted 0, fix_base = tip; `R34a`/`R34b` red/conflict at cap → blocked(verify, cap); `R35` accept sets accepted; `R36` ff_ok → done, delete_branch; `R37` ff_impossible → verifying, no updates.
+- Meta tests: `test_every_row_has_a_test`; `test_table_rows_are_unambiguous` (for every state × event × sample task combination — guards varied over fix_kind, then, asked_by, cause, autoapprove, merge, counters, has_branch — at most one row matches); `test_every_state_and_event_is_known` (rows reference only `board.STATES`, `EVENTS`, `EFFECTS`); `test_unlisted_transition_is_error_and_board_unchanged`; `test_requeue_is_not_a_transition`; `test_apply_raises_stale_on_lost_cas`; `test_create_uses_R01_R02` (works with `limits=None`); `test_limits_for_task_effective_values`; `test_limits_from_cfg` (a plain dict as cfg); `test_rows_entering_fixing_set_fix_base` (every row whose target is `fixing` except R32 (a conflict fix is judged by `merge_committed`) sets `fix_base=tip`; catches a new fixing row without it); `test_accept_loop_ends` (awaiting_accept → R35 → R37 → verifying → verify_green with merge=ask → verified, not awaiting_accept).
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_transitions -v` — FAIL.
 - [ ] **Step 3: Implement** `decide` as a scan of `TABLE` with guard and update interpreters (small dicts of named callables); `apply` = `get_task` → `decide` → `update_task` → `StaleTask` on `False`.
@@ -1358,7 +1447,7 @@ Full test list:
 - Create: `artel/procs.py`, `tests/test_procs.py`
 
 **Interfaces:**
-- Consumes: `artel.platform` (`popen_kwargs`, `register_tree`, `group_of`, `terminate_tree`, `process_fingerprint`, `shell_argv`, `prefix_argv`, `resolve_argv`) (T3); `artel.errors`.
+- Consumes: `artel.platform` (`popen_kwargs`, `register_tree`, `group_of`, `terminate_tree`, `tree_alive`, `process_fingerprint`, `shell_argv`, `prefix_argv`, `resolve_argv`, `command_line`) (T3); `artel.errors`.
 - Produces (`artel.procs`, portable — no OS branches):
   ```python
   Command = str | list[str]          # a command setting: string → configured shell, list → direct argv
@@ -1367,6 +1456,10 @@ Full test list:
       returncode: int | None; timed_out: bool; stopped: bool; duration: float
   def command_argv(cmd: Command, shell: str) -> list[str]
       # str → platform.shell_argv(shell, cmd); list → platform.resolve_argv(cmd); "" / [] → ArtelError
+  OnStart = Callable[[str, int, int, str | None], None]
+      # (kind, pid, group, fingerprint) with kind "agent" | "setup" | "verify": the callback shape slots,
+      # stages and integrate take, so the runner records running_kind correctly; run_tree itself takes the
+      # kind-less (pid, group, fingerprint) form and callers wrap: lambda p, g, f: on_start("setup", p, g, f)
   def heavy_argv(cmd: Command, heavy_lock: Command, shell: str) -> list[str]
       # heavy_lock "" or []: command_argv(cmd, shell);
       # heavy_lock list: platform.resolve_argv(heavy_lock) + command_argv(cmd, shell);
@@ -1377,14 +1470,17 @@ Full test list:
                on_start: Callable[[int, int, str | None], None] | None = None,
                on_line: Callable[[str], None] | None = None,
                stop_event: threading.Event | None = None) -> ProcResult
-      # Popen(argv, stdin=PIPE (always attached — spike Q4), stdout=PIPE, stderr=PIPE or STDOUT,
-      #       encoding="utf-8", errors="replace", **platform.popen_kwargs()); platform.register_tree(proc)
-      #       immediately (Windows Job Object);
+      # Popen(platform.command_line(argv), stdin=PIPE (always attached — spike Q4), stdout=PIPE,
+      #       stderr=PIPE or STDOUT, encoding="utf-8", errors="replace", **platform.popen_kwargs());
+      #       platform.register_tree(proc) immediately (Windows Job Object);
       # on_start(pid, group, fingerprint) right after spawn; writes stdin_text then closes stdin;
       # a reader thread appends each stdout line to log_path (utf-8, "\n") and calls on_line;
       # stderr goes to log_path + ".stderr" unless merge_stderr; on timeout or stop_event:
-      # platform.terminate_tree(pid, group, kill_grace); returns after the leader exits and the
-      # reader threads have drained
+      # platform.terminate_tree(pid, group, kill_grace, fingerprint);
+      # after the leader exits (normally or not): if platform.tree_alive(pid, group) — a child kept running,
+      # e.g. a server started by `sh -c "npm test"` that holds stdout — platform.terminate_tree(pid, group,
+      # kill_grace) sweeps the group/job (the leader is gone, T3); then the reader threads are joined with a
+      # 5 s deadline and abandoned (daemon threads) after it, so run_tree never hangs on a pipe held open
   ```
 
 - [ ] **Step 1: Write the failing tests** (all children are Python processes — portable).
@@ -1433,7 +1529,7 @@ class RunTreeTest(unittest.TestCase):
         self.assertLess(time.monotonic() - start, 8)
 ```
 
-Full test list: `test_returncode_and_lines` (on_line receives each line; log file has them, UTF-8 text `"привет ✓"` round-trips); `test_stdin_is_delivered`; `test_stdin_attached_even_when_empty` (child `sys.stdin.read()` returns `""` immediately); `test_stderr_to_side_file_or_merged`; `test_on_start_reports_pid_group_fingerprint`; `test_timeout_kills_grandchildren`; `test_soft_stop_ignored_gets_hard_kill`; `test_stop_event_terminates` (set from a timer thread; `stopped=True`, `timed_out=False`); `test_command_argv_string_uses_shell_list_runs_direct` (string `"exit 3"` with `shell="auto"` → returncode 3; list `py_cmd("import sys; sys.exit(4)")` → 4); `test_heavy_argv_forms` (list prefix: `[sys.executable, marker_script] + command`; string prefix with `shell="sh"` → `["sh", "-c", '<prefix> "$@"', "artel-heavy", …]` — compare argv only, do not execute `sh` in tests); `test_empty_command_rejected`.
+Full test list: `test_returncode_and_lines` (on_line receives each line; log file has them, UTF-8 text `"привет ✓"` round-trips); `test_stdin_is_delivered`; `test_stdin_attached_even_when_empty` (child `sys.stdin.read()` returns `""` immediately); `test_stderr_to_side_file_or_merged`; `test_on_start_reports_pid_group_fingerprint`; `test_timeout_kills_grandchildren`; `test_soft_stop_ignored_gets_hard_kill`; `test_stop_event_terminates` (set from a timer thread; `stopped=True`, `timed_out=False`); `test_command_argv_string_uses_shell_list_runs_direct` (string `"exit 3"` with `shell="auto"` → returncode 3; list `py_cmd("import sys; sys.exit(4)")` → 4); `test_heavy_argv_forms` (list prefix: `[sys.executable, marker_script] + command`; string prefix with `shell="sh"` → equals `platform.prefix_argv("sh", prefix, procs.command_argv(command, "sh"))` and `argv[1:4] == ["-c", '<prefix> "$@"', "artel-heavy"]` — argv[0] is whatever `which("sh")` finds on this OS (Git's `sh.exe` on Windows CI), so never compare it to the literal `"sh"`; compare argv only, do not execute `sh` in tests); `test_empty_command_rejected`; `test_leader_exit_sweeps_leftover_children_and_returns` (leader starts a grandchild that inherits stdout and sleeps 60 s, then exits 0; `run_tree` returns within 15 s with returncode 0 and the grandchild is dead — catches waiting forever on a pipe held by an orphan); `test_cmd_string_goes_through_command_line` (patch `platform.command_line` to record its argument; `run_tree` passes argv through it).
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_procs -v` — FAIL. **Step 3: Implement** (reader threads for stdout/stderr, main thread waits with deadline; never leave zombies). **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Procs: process trees with streaming, timeout, stop; command argv"`
@@ -1444,15 +1540,15 @@ Full test list: `test_returncode_and_lines` (on_line receives each line; log fil
 
 ### Task 9: Agent adapter (Claude Code) and fake agent
 
-**Spec:** §4 (structured result, `--json-schema`), §5 steps 4–5 (stream-json log, `rate_limit_event`, usage, partial usage when killed), §6 (tool profiles, prompt on stdin, explicit `--permission-mode`), §12 (finding the agent CLI: `claude.exe` / `claude.cmd`), §4 (vet stage result), §13 (fake agent), §15 and `docs/spike-2026-10-19.md` Q1–Q7, PD-18, PD-22, PD-23, PD-24, PD-27.
+**Spec:** §4 (structured result, `--json-schema`), §5 steps 4–5 (stream-json log, `rate_limit_event`, usage, partial usage when killed), §6 (tool profiles, prompt on stdin, explicit `--permission-mode`), §12 (finding the agent CLI: `claude.exe` / `claude.cmd`), §4 (vet stage result), §13 (fake agent), §15 and `docs/spike-2026-10-19.md` Q1–Q7, PD-18, PD-22, PD-23, PD-24, PD-27, PD-40, PD-41, PD-44.
 
-**Context for the writer:** Global Constraints + Spike facts + PD-18, PD-22, PD-23, PD-24, PD-27 + this task.
+**Context for the writer:** Global Constraints + Spike facts + PD-18, PD-22, PD-23, PD-24, PD-27, PD-40, PD-41, PD-44 + this task.
 
 **Files:**
 - Create: `artel/agent_claude.py`, `tests/fake_agent.py`, `tests/fixtures/stream/` (`result_structured.jsonl`, `rate_limit_allowed.jsonl`, `result_error.jsonl`, `killed_midway.jsonl`, `permission_denied.jsonl`), `tests/test_agent_claude.py`, `tests/test_fake_agent.py`
 
 **Interfaces:**
-- Consumes: `Config` (`agent_command`, `profiles.*`, `commands.project_tools`, `commands.project_read_tools`) (T5); `platform.resolve_argv`, `platform.write_wrapper` (T3). Severities are the constant `SEVERITIES = ("blocker", "major", "minor")` defined here (same values as `journal.SEVERITIES`; Task 6 runs in parallel, a test asserts equality once both exist).
+- Consumes: `Config` (`agent_command`, `profiles.*`, `commands.project_tools`, `commands.project_read_tools`) (T5); `platform.resolve_argv`, `platform.write_wrapper` (T3). Severities are the constant `SEVERITIES = ("blocker", "major", "minor")` defined here (same values as `journal.SEVERITIES`; Task 6 runs in parallel; the equality test belongs to Task 13, the first task that imports both).
 - Produces (`artel.agent_claude` — the only module that knows stream-json field names):
   ```python
   # Each constant carries a comment citing the spike question it comes from.
@@ -1461,6 +1557,8 @@ Full test list: `test_returncode_and_lines` (on_line receives each line; log fil
   DENIALS_FIELD = "permission_denials"       # Q4: [{tool_name, tool_use_id, tool_input}]
   RATE_LIMIT_TYPE = "rate_limit_event"       # Q2
   RATE_LIMIT_CONTAINER = "rate_limit_info"   # Q2: status, resetsAt (unix s), rateLimitType, unifiedWindows
+  API_ERROR_FIELD = "api_error_status"       # Q1: a result key; its value on a limit hit is unobserved
+  LIMIT_ERROR_STATUS = 429                   # PD-40 assumption (HTTP 429), to be checked by Task 16
   RESULT_SCHEMA: dict                        # JSON schema of §4: outcome enum, summary, question,
                                              # findings[{severity, text, basis}], closed[string|integer],
                                              # plus optional vet fields (PD-27): risky: boolean,
@@ -1492,7 +1590,12 @@ Full test list: `test_returncode_and_lines` (on_line receives each line; log fil
   class StreamParser:
       structured: dict | None         # result.structured_output, if present
       usage: Usage                    # result.usage when seen; before that, sum of assistant.message.usage
+                                      # counting each message.id once (its last usage; PD-23)
       result_seen: bool; is_error: bool
+      api_error_status: object        # result.api_error_status as given (None when absent)
+      max_rank: int                   # highest RateLimit.rank seen in this run (0 if none)
+      def limit_hit(self) -> bool     # PD-40: max_rank == 2, or is_error and api_error_status == 429
+                                      # (int or the string "429")
       denials: list[dict]             # result.permission_denials
       session_id: str | None          # from system/init or result (Q1 result keys include session_id)
       def feed(self, line: str) -> RateLimit | None   # never raises on bad JSON or unknown types
@@ -1503,8 +1606,18 @@ Full test list: `test_returncode_and_lines` (on_line receives each line; log fil
       # "findings" needs a non-empty findings list; "ask" needs a non-empty question
   def schema_json() -> str            # compact JSON text of RESULT_SCHEMA, byte-identical across runs
                                       # (it is part of the cached prefix, Q6)
+  def unwrap_cmd_shim(text: str, shim_path: Path) -> list[str] | None
+      # pure (PD-41): the argv a Windows batch launcher runs, or None if it is not a recognized form.
+      # Recognized: the npm cmd-shim forms ("%~dp0\node.exe" / "%_prog%" / node + "%dp0%\…\cli.js" %*) →
+      # [<shim dir>\node.exe if present else "node", <shim dir>\…\cli.js]; the platform.write_wrapper form
+      # (one line of double-quoted tokens followed by %*, `%%` meaning `%`) → those tokens
+  def agent_argv(cfg: Config) -> list[str]
+      # platform.resolve_argv(agent_command as a list: a string is one executable, PD-44); if argv[0] ends
+      # with .cmd/.bat (case-insensitive) → unwrap_cmd_shim(file text, path) + argv[1:], or ArtelError
+      # "agent_command <path> is a batch file artel cannot unwrap; set agent_command to a list
+      # [node, cli.js] or to claude.exe". No OS branch: the suffix test is portable.
   def build_argv(cfg: Config, *, profile: str, model: str, notice_path: Path) -> list[str]
-      # platform.resolve_argv(agent_command as list) + expand(profiles.common) + expand(profiles.<writer|reviewer>);
+      # agent_argv(cfg) + expand(profiles.common) + expand(profiles.<writer|reviewer>);
       # "{model}", "{schema}" (→ schema_json(), inline per Q1), "{unattended_notice}" substituted inside tokens;
       # a token exactly "{project_tools}" / "{project_read_tools}" expands to the list items as separate argv
       # entries (dropped when empty). Raises ArtelError if the expanded argv contains "bypassPermissions" or
@@ -1517,9 +1630,9 @@ Full test list: `test_returncode_and_lines` (on_line receives each line; log fil
   ```
 - Produces (`tests/fake_agent.py`): a script used as `agent_command = [sys.executable, "<repo>/tests/fake_agent.py"]` (list form — portable). Behavior:
   - Reads the prompt from stdin; reads `ARTEL_TASK`, `ARTEL_STAGE`, `ARTEL_ROUND` from env; parses `--model` from argv.
-  - Appends `{"argv": [...], "stage": ..., "task": ..., "model": ..., "prompt": ..., "cwd": ...}` to `$ARTEL_FAKE_DIR/calls.jsonl` (UTF-8).
+  - Appends `{"argv": [...], "stage": ..., "task": ..., "model": ..., "prompt": ..., "cwd": ..., "pid": os.getpid()}` to `$ARTEL_FAKE_DIR/calls.jsonl` (UTF-8); `pid` lets `E2ECase.tearDown` (T15) check that every agent process is dead.
   - Loads the scenario `$ARTEL_FAKE_DIR/scenario.json`: `{"<task>:<stage>#<n>": [actions], "<task>:<stage>": [...], "<stage>": [...], "*": [...]}`; first matching key wins; `n` is the 1-based count of this task+stage call, kept in `$ARTEL_FAKE_DIR/counts.json`.
-  - Actions, in order: `{"write": [rel_path, content]}` (UTF-8, `\n`), `{"commit": message}` (`git add -A`, `git commit -m`), `{"note": ["FACT", text, basis]}` (runs `artel note` through the PATH shim found with `shutil.which("artel")`), `{"assistant": usage_dict}`, `{"rate_limit": [status, resets_at, limit_type, utilization]}`, `{"sleep": seconds}`, `{"result": obj}` (emits `sample_result_line(obj, usage)`), `{"result_error": true}`, `{"denied": [tool_name, tool_input]}` (adds to the result's denials), `{"result_raw": text}`, `{"exit": code}`. Default when nothing matches: `{"result": {"outcome": "fail", "summary": "no scenario"}}`.
+  - Actions, in order: `{"write": [rel_path, content]}` (UTF-8, `\n`), `{"commit": message}` (`git add -A`, `git commit -m`), `{"note": ["FACT", text, basis]}` (runs `artel note` through the PATH shim found with `shutil.which("artel")`), `{"assistant": usage_dict}`, `{"rate_limit": [status, resets_at, limit_type, utilization]}`, `{"sleep": seconds}`, `{"result": obj}` (emits `sample_result_line(obj, usage)`), `{"result_error": true}`, `{"result_error": 429}` (error result with `api_error_status: 429` — the PD-40 limit-hit shape), `{"denied": [tool_name, tool_input]}` (adds to the result's denials), `{"result_raw": text}`, `{"exit": code}`. Default when nothing matches: `{"result": {"outcome": "fail", "summary": "no scenario"}}`.
 
 - [ ] **Step 1: Read `docs/spike-2026-10-19.md` fully.** The spike kept no raw streams, so build the fixtures from the shapes it records: `result_structured.jsonl` = a `system/init` line, two `assistant` lines with `message.usage`, the Q2 `rate_limit_event` line, and a `result` line with the Q1 key set (`structured_output`, `result` as a string, `usage`, `total_cost_usd`, `num_turns: 2`, `is_error: false`, `stop_reason: "tool_use"`); `rate_limit_allowed.jsonl` = the Q2 line verbatim; `result_error.jsonl` (`is_error: true`, no `structured_output`); `killed_midway.jsonl` (init + assistant lines, no result); `permission_denied.jsonl` (result with one Q4-shaped denial). Write in the module docstring which facts come from which spike question and that non-`allowed` statuses are unobserved (PD-22).
 
@@ -1556,17 +1669,17 @@ class ParserTest(unittest.TestCase):
 ```
 
 Full test list:
-- `ParserTest`: `test_structured_result_and_summed_usage`; `test_stop_reason_tool_use_is_not_failure`; `test_error_result_is_failure`; `test_missing_structured_output_is_failure`; `test_killed_midway_keeps_partial_usage` (no result → `failed()`, usage = sum of assistant usages, `final False`); `test_permission_denials_collected`; `test_session_id_and_context_tokens` (session id from the init/result line; `context_tokens()` = input + cache tokens of the last assistant call); `test_rate_limit_fields_from_spike_line` (status `allowed`, rank 0, `resets_at` 1792464000, `limit_type` `five_hour`, utilization 0.1, windows has `seven_day`); `test_unknown_status_ranks_as_warning`; `test_rejected_ranks_2`; `test_bad_json_and_unknown_type_ignored`; `test_samples_roundtrip_through_parser`; `test_sample_lines_match_fixture_shape` (same keys/nesting as the fixture lines).
+- `ParserTest`: `test_structured_result_and_summed_usage`; `test_stop_reason_tool_use_is_not_failure`; `test_error_result_is_failure`; `test_missing_structured_output_is_failure`; `test_killed_midway_keeps_partial_usage` (no result → `failed()`, usage = sum of assistant usages, `final False`); `test_partial_usage_counts_each_message_id_once` (two assistant lines with the same `message.id` → counted once, the later one — PD-23); `test_permission_denials_collected`; `test_session_id_and_context_tokens` (session id from the init/result line; `context_tokens()` = input + cache tokens of the last assistant call); `test_rate_limit_fields_from_spike_line` (status `allowed`, rank 0, `resets_at` 1792464000, `limit_type` `five_hour`, utilization 0.1, windows has `seven_day`); `test_unknown_status_ranks_as_warning`; `test_rejected_ranks_2`; `test_limit_hit_from_error_result` (PD-40: `is_error` + `api_error_status` 429 → `limit_hit()`; `is_error` with another status → not; a rank-2 event → `limit_hit()` even with a valid result); `test_bad_json_and_unknown_type_ignored`; `test_samples_roundtrip_through_parser`; `test_sample_lines_match_fixture_shape` (same keys/nesting as the fixture lines).
 - `ValidateTest`: `test_valid_per_stage` (subTest each stage/outcome); `test_writer_cannot_pass` (PD-18); `test_reviewer_cannot_ready`; `test_findings_needs_items`; `test_ask_needs_question`; `test_bad_severity`; `test_closed_ids_normalized`; `test_non_dict_invalid`; `test_vet_fields_validated` (risky bool, risk_signals list of strings, duplicate_of int or null; vet `findings` needs a non-empty `summary` as the reason, no findings list required); `test_vet_fields_rejected_on_other_stages_ignored` (extra vet fields on a write result are dropped, not an error).
-- `ArgvTest`: `test_writer_argv_has_common_and_writer_flags` (incl. `--permission-mode acceptEdits`); `test_reviewer_argv_is_read_only_profile` (`--permission-mode default`, `--disallowedTools`); `test_schema_is_inline_json` (the token after `--json-schema` parses with `json.loads` and equals `RESULT_SCHEMA`); `test_schema_json_is_stable`; `test_project_tools_expand_to_separate_args`; `test_empty_project_tools_dropped`; `test_agent_command_list_and_string` (list `[sys.executable, "x.py"]`; string `"claude"` resolved via a patched `platform.which`); `test_missing_permission_mode_refused`; `test_bypass_permissions_refused`; `test_prompt_never_in_argv`; `test_inline_schema_survives_cmd_wrapper` (portable: `platform.write_wrapper(tmp/"fake", [sys.executable, tests/fake_agent.py])` as `agent_command`; run `build_argv(...)` through `procs`-free `subprocess.run(argv, input=prompt, encoding="utf-8")`; the fake agent's recorded argv has the `--json-schema` token equal to `schema_json()` byte for byte and the prompt arrived on stdin — on Windows this is the `claude.cmd` quoting path; if it fails there, report it: the fix — resolving a `.cmd` shim to its underlying `node` command, or passing the schema another way — is an owner decision, see Spec gaps).
-- `tests/test_fake_agent.py` (`RepoTestCase`): `test_fake_records_call_and_emits_result`; `test_fake_commits`; `test_fake_scenario_key_precedence_and_counts`; `test_fake_rate_limit_and_sleep`; `test_fake_error_and_denial`; `test_fake_default_fail`.
+- `ArgvTest`: `test_writer_argv_has_common_and_writer_flags` (incl. `--permission-mode acceptEdits`); `test_reviewer_argv_is_read_only_profile` (`--permission-mode default`, `--disallowedTools`); `test_schema_is_inline_json` (the token after `--json-schema` parses with `json.loads` and equals `RESULT_SCHEMA`); `test_schema_json_is_stable`; `test_project_tools_expand_to_separate_args`; `test_empty_project_tools_dropped`; `test_agent_command_list_and_string` (list `[sys.executable, "x.py"]`; string `"claude"` resolved via a patched `platform.which`; string `C:\Tools\claude.exe` with a patched `which` stays one token — PD-44); `test_missing_permission_mode_refused`; `test_bypass_permissions_refused`; `test_prompt_never_in_argv`; `test_unwrap_npm_cmd_shim` (pure: the text of an npm `claude.cmd` in both cmd-shim generations → `[<dir>\node.exe or "node", <dir>\node_modules\@anthropic-ai\claude-code\cli.js]`); `test_unwrap_write_wrapper_text` (pure: the text `platform.write_wrapper` writes on Windows, with `%%` → the original argv); `test_unknown_batch_file_refused` (a `.cmd` with arbitrary content → ArtelError naming `agent_command`); `test_inline_schema_never_passes_cmd` (portable: `platform.write_wrapper(tmp/"fake", [sys.executable, tests/fake_agent.py])` as `agent_command`; on Windows `agent_argv` unwraps the `.cmd` (argv[0] is the Python executable), on POSIX the sh wrapper is run as is; run `build_argv(...)` with `subprocess.run(argv, input=prompt, encoding="utf-8", env=tests.helpers.subprocess_env(ARTEL_FAKE_DIR=…))` — without `env` the fake agent cannot import `artel` on CI; the fake agent's recorded argv has the `--json-schema` token equal to `schema_json()` byte for byte and the prompt arrived on stdin).
+- `tests/test_fake_agent.py` (`RepoTestCase`): `test_fake_records_call_and_emits_result`; `test_fake_commits`; `test_fake_scenario_key_precedence_and_counts`; `test_fake_rate_limit_and_sleep`; `test_fake_error_and_denial` (also `result_error: 429`); `test_fake_default_fail`; `test_fake_records_pid` (the recorded `pid` is the fake agent's process id, not the test's).
 
 - [ ] **Step 3: Run** `python3 -m unittest tests.test_agent_claude tests.test_fake_agent -v` — FAIL.
 - [ ] **Step 4: Implement.**
 - [ ] **Step 5: Whole suite** — PASS.
 - [ ] **Step 6: Commit** — `git commit -m "Agent adapter: Claude Code argv, stream-json parsing, fake agent"`
 
-**Acceptance:** every constant cites the spike; no other module mentions `structured_output`, `rate_limit_info` or `permission_denials`; the fake agent emits lines only via the adapter's `sample_*` helpers; the prompt goes on stdin only.
+**Acceptance:** every constant cites the spike; no other module mentions `structured_output`, `rate_limit_info`, `api_error_status` or `permission_denials`; a `.cmd` agent command never runs through cmd.exe (PD-41); the fake agent emits lines only via the adapter's `sample_*` helpers; the prompt goes on stdin only.
 
 ---
 
@@ -1574,15 +1687,19 @@ Full test list:
 
 **Spec:** §3 (slot location, exclusion), §5 step 3 (porcelain check, `switch -C`, `switch`, `clean -ffdx` keeping `slot_keep`, setup under `heavy_lock` when the `setup_inputs` hash changes), §5 step 6 (detach after every stage), §5 reconcile (`worktree prune`, detach every slot), §3.1 ("Leaving a slot": abort merge, `reset --hard`, `clean -ffdx` keeping `slot_keep`, `switch --detach`, refused on any path that is not a registered slot under `slots_dir`; "Slots for stages without a branch": detached at the integration tip; conflict fix: the runner leaves `merge --no-commit` in progress; effects `delete_branch` / `reset_branch`; setup failure → `setup_failed` event), PD-8, PD-31.
 
-**Context for the writer:** Global Constraints + PD-8, PD-16, PD-31, PD-32 + this task.
+**Context for the writer:** Global Constraints + PD-8, PD-16, PD-31, PD-32, PD-34 + this task.
 
 **Files:**
 - Create: `artel/slots.py`, `tests/test_slots.py`
 
 **Interfaces:**
-- Consumes: `Repo`, `INTEGRATION`, `task_branch` (T1); `Board` slot methods, `Board.start_run/finish_run` (T4); `Config` keys `slots_dir`, `slot_keep`, `shell`, `commands.setup`, `commands.setup_inputs`, `commands.heavy_lock`, `setup_timeout`, `kill_grace` (T5); `procs.run_tree`, `procs.heavy_argv` (T8).
+- Consumes: `Repo`, `INTEGRATION`, `task_branch` (T1); `Board` slot methods, `Board.start_run/finish_run` (T4); `Config` keys `slots_dir`, `slot_keep`, `shell`, `commands.setup`, `commands.setup_inputs`, `commands.heavy_lock`, `setup_timeout`, `kill_grace` (T5); `procs.run_tree`, `procs.heavy_argv`, `procs.OnStart` (T8).
 - Produces (`artel.slots`):
   ```python
+  def merge_identity_args(repo: Repo) -> list[str]
+      # [] if user.email is configured, else ["-c", "user.name=artel", "-c", "user.email=artel@localhost"]
+      # (PD-16). Defined here (W4) because start_conflict_merge needs it; integrate (T14) imports it
+      # from here (integrate already imports slots, so no cycle).
   def slot_path(repo: Repo, cfg: Config, n: int) -> Path        # repo.root / cfg["slots_dir"] / f"artel-{n}"
   def ensure_slots(repo: Repo, board: Board, cfg: Config, count: int) -> list[int]
       # creates missing worktrees with `git worktree add --detach <path> artel/integration`,
@@ -1605,7 +1722,7 @@ Full test list:
       # guard; scrub; `git switch --detach artel/integration` — for vet and attack-before-code (PD-32)
   def start_conflict_merge(repo: Repo, board: Board, cfg: Config, n: int) -> list[str]
       # after prepare_slot for a fix with fix_kind=conflict: `git merge --no-commit --no-ff
-      # artel/integration` (identity args per PD-16); returns the conflicted paths
+      # artel/integration` (merge_identity_args, PD-16); returns the conflicted paths
       # (`git diff --name-only --diff-filter=U`); the merge stays in progress for the agent
   class SlotBusy(ArtelError): where: Path
   def leave_slot(repo: Repo, board: Board, cfg: Config, n: int) -> None
@@ -1615,19 +1732,21 @@ Full test list:
       # sha256 over json.dumps(setup_cmd) and, for each input in order, its relative path (with "/")
       # and bytes read in binary mode (missing file contributes "<missing>"); identical on every OS
   def run_setup_if_needed(repo: Repo, board: Board, cfg: Config, n: int, path: Path, *,
-                          task_id: int, on_start=None, stop_event=None) -> str
+                          task_id: int | None, on_start: OnStart | None = None, stop_event=None,
+                          env: Mapping[str, str] | None = None) -> str
       # "skipped" when commands.setup is empty or hash equals the slot's stored hash;
-      # else run_tree(heavy_argv(setup, heavy_lock, shell)) under setup_timeout as a run of stage "setup"
-      # (log logs/<id>/setup-<n>.log, merged stderr); "ok" stores the hash;
-      # "failed" | "timeout" | "stopped" clear the stored hash
+      # else run_tree(heavy_argv(setup, heavy_lock, shell), env=env) under setup_timeout as a run of stage
+      # "setup" (log logs/<id>/setup-<n>.log, merged stderr); task_id None = the base job (PD-34): log
+      # logs/base/setup-<n>.log and no runs row; on_start is called with kind "setup";
+      # "ok" stores the hash; "failed" | "timeout" | "stopped" clear the stored hash
   def setup_changed(path: Path, cfg: Config, stored_hash: str | None) -> bool   # for lifting the setup pause (PD-31)
   def reconcile_slots(repo: Repo, board: Board, cfg: Config) -> None
       # git worktree prune; leave_slot on every registered slot that exists; re-create missing ones lazily
   def task_branch_exists(repo: Repo, task_id: int) -> bool
-  def delete_task_branch(repo: Repo, task_id: int) -> None
-      # leave_slot on any registered slot that has it checked out, then `git branch -D`; no-op if absent;
-      # raises SlotBusy if checked out in a non-slot worktree
-  def apply_git_effects(repo: Repo, board: Board, task_id: int, effects: Sequence[str]) -> None
+  def delete_task_branch(repo: Repo, board: Board, cfg: Config, task_id: int) -> None
+      # leave_slot(repo, board, cfg, n) on any registered slot that has it checked out, then `git branch -D`;
+      # no-op if absent; raises SlotBusy if checked out in a non-slot worktree
+  def apply_git_effects(repo: Repo, board: Board, cfg: Config, task_id: int, effects: Sequence[str]) -> None
       # "delete_branch" and "reset_branch" → delete_task_branch; other effects ignored here
   ```
 
@@ -1645,7 +1764,7 @@ Full test list:
         self.assertEqual(cm.exception.where.resolve(), other.resolve())
 ```
 
-Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths `<root>/.claude/worktrees/artel-1..2`, detached, registered); `test_ensure_is_idempotent`; `test_prepare_new_branch_from_integration_tip`; `test_prepare_resumes_existing_branch` (commit on `artel/5`, detach, prepare again → HEAD is that commit — "resume after ASK"); `test_prepare_after_reset_branch_starts_fresh` (`apply_git_effects(..., ["reset_branch"])` then prepare → HEAD == integration tip — "reset after FAIL"); `test_clean_keeps_slot_keep_paths` (untracked `node_modules/x` survives, untracked `junk.txt` and ignored `build/` removed); `test_uncommitted_changes_discarded`; `test_branch_held_by_other_worktree_is_refused`; `test_slot_reused_across_tasks` (task 1 then task 2 in slot 1); `test_detach_keeps_branch`; `test_setup_hash_changes_with_inputs_and_command`; `test_setup_skipped_when_hash_unchanged` (setup = list `py_cmd` that appends a line to a counter file outside the slot; runs once for two prepares); `test_setup_runs_under_heavy_prefix` (heavy_lock = list `[sys.executable, <marker script>]` where the script appends `locked` to a marker file and then runs `sys.argv[1:]` with `subprocess.run`, exiting with its code); `test_setup_failure_clears_hash` (setup `py_cmd("import sys; sys.exit(3)")` → "failed"); `test_setup_timeout` (setup `py_cmd("import time; time.sleep(30)")`, `setup_timeout = "1s"`, `kill_grace = "1s"` → "timeout"); `test_reconcile_prunes_and_detaches` (delete one slot dir by hand → pruned; other slot on a branch → detached); `test_delete_task_branch_detaches_slot_first`; `test_guard_refuses_unregistered_path` (a worktree created by hand under `slots_dir` but not registered → SlotGuardError, its untracked file survives); `test_guard_refuses_registered_path_outside_slots_dir` (board row edited to point at the main worktree → SlotGuardError, main worktree untouched); `test_leave_aborts_merge_in_progress` (start_conflict_merge, then leave_slot → no MERGE_HEAD, clean tree, detached); `test_prepare_detached_at_integration_tip`; `test_start_conflict_merge_reports_paths`; `test_setup_changed_detects_input_change`.
+Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths `<root>/.claude/worktrees/artel-1..2`, detached, registered); `test_ensure_is_idempotent`; `test_prepare_new_branch_from_integration_tip`; `test_prepare_resumes_existing_branch` (commit on `artel/5`, detach, prepare again → HEAD is that commit — "resume after ASK"); `test_prepare_after_reset_branch_starts_fresh` (`apply_git_effects(repo, board, cfg, tid, ["reset_branch"])` then prepare → HEAD == integration tip — "reset after FAIL"); `test_clean_keeps_slot_keep_paths` (untracked `node_modules/x` survives, untracked `junk.txt` and ignored `build/` removed); `test_uncommitted_changes_discarded`; `test_branch_held_by_other_worktree_is_refused`; `test_slot_reused_across_tasks` (task 1 then task 2 in slot 1); `test_detach_keeps_branch`; `test_setup_hash_changes_with_inputs_and_command`; `test_setup_skipped_when_hash_unchanged` (setup = list `py_cmd` that appends a line to a counter file outside the slot; runs once for two prepares); `test_setup_runs_under_heavy_prefix` (heavy_lock = list `[sys.executable, <marker script>]` where the script appends `locked` to a marker file and then runs `sys.argv[1:]` with `subprocess.run`, exiting with its code); `test_setup_failure_clears_hash` (setup `py_cmd("import sys; sys.exit(3)")` → "failed"); `test_setup_timeout` (setup `py_cmd("import time; time.sleep(30)")`, `setup_timeout = "1s"`, `kill_grace = "1s"` → "timeout"); `test_reconcile_prunes_and_detaches` (delete one slot dir by hand → pruned; other slot on a branch → detached); `test_delete_task_branch_detaches_slot_first`; `test_guard_refuses_unregistered_path` (a worktree created by hand under `slots_dir` but not registered → SlotGuardError, its untracked file survives); `test_guard_refuses_registered_path_outside_slots_dir` (board row edited to point at the main worktree → SlotGuardError, main worktree untouched); `test_leave_aborts_merge_in_progress` (start_conflict_merge, then leave_slot → no MERGE_HEAD, clean tree, detached); `test_prepare_detached_at_integration_tip`; `test_start_conflict_merge_reports_paths`; `test_setup_changed_detects_input_change`; `test_merge_identity_args_fallback` (identity env vars removed with `mock.patch.dict` and no `user.email` → the `-c` pair; configured → `[]`); `test_setup_for_base_job_logs_under_base` (`task_id=None` → `logs/base/setup-1.log`, no `runs` row); `test_setup_on_start_reports_kind_setup`.
 
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Slots: worktree pool, prepare and detach, setup hash, branch effects"`
@@ -1662,8 +1781,10 @@ Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths 
 **Context for the writer:** Global Constraints + PD-9, PD-11, PD-20, PD-21, PD-27 + this task.
 
 **Files:**
-- Create: `artel/builtin_templates/vet.md`, `attack.md`, `write.md`, `review.md`, `review-closure.md`, `fix.md`, `unattended.md`; `artel/templates.py`; `tests/test_templates.py`
+- Create: `artel/builtin_templates/__init__.py`, `vet.md`, `attack.md`, `write.md`, `review.md`, `review-closure.md`, `fix.md`, `unattended.md`; `artel/templates.py`; `tests/test_templates.py`
 - Modify: `artel/cmd_config.py` (append template source lines)
+- Modify: `pyproject.toml` (the package list includes `artel.builtin_templates`; package data `builtin_templates/*.md`)
+- Modify: `tests/test_zipapp.py` (add `test_builtin_templates_load_from_pyz`; Task 28 touched this file before)
 - Create: `artel/cmd_agent.py`, `tests/test_cmd_agent.py`
 
 **Interfaces — templates:**
@@ -1698,7 +1819,8 @@ Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths 
   - `fix.md`: open findings `$findings`, or verify log `$verify_log`, or a merge in progress with conflicts in `$conflict_paths` (the runner started it; resolve the markers, `git add`, `git commit` to conclude the merge — you never start or abort merges yourself); commit fixes; `ready`.
 
 **Interfaces — commands:**
-- Consumes: `Repo` (T1), `platform.write_shim` (T3), `open_board` (T4), `journal.append`, `EntryTooLong` (T6), `transitions.create` (T7), `load_config` (T5), `procs.heavy_argv` (T8).
+- Consumes: `Repo` (T1), `platform.write_shim`, `platform.command_line` (T3), `open_board` (T4), `journal.append`, `EntryTooLong` (T6), `transitions.create` (T7), `load_config` (T5), `procs.heavy_argv` (T8).
+- argparse leaves unset options as `None` (T1 parser: `--body`, `--basis`), while the board columns are `NOT NULL` with `""` defaults: `run_add` passes `body=args.body or ""`, `run_note` passes `basis=args.basis or ""`.
 - Produces (`artel.cmd_agent`):
   ```python
   def run_add(args) -> int     # ARTEL_TASK set → create(board, "add_agent", created_by=f"agent:{task}") (proposed)
@@ -1710,8 +1832,8 @@ Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths 
   def run_heavy(args) -> int   # cmd must match a Bash(...) pattern in commands.project_tools
                                # (fnmatch.fnmatchcase on " ".join(argv) — no normcase, same on every OS);
                                # else UsageError (exit 2) naming the setting; runs
-                               # heavy_argv(list(cmd), heavy_lock, shell) (list → no shell) in the foreground,
-                               # inheriting stdio, returns its exit code
+                               # platform.command_line(heavy_argv(list(cmd), heavy_lock, shell)) (list → no shell)
+                               # in the foreground, inheriting stdio, returns its exit code
   def tool_pattern_matches(patterns: Sequence[str], argv: Sequence[str]) -> bool
       # "Bash(npx vitest *)" matches ["npx", "vitest", "run"]; non-Bash patterns ignored
   def ensure_shim(repo: Repo) -> Path
@@ -1726,7 +1848,7 @@ Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths 
 
 - [ ] **Step 1a: Write the failing template tests.** Full list: `test_all_builtins_exist_and_nonempty`; `test_templates_use_only_known_placeholders` (parse `$name` occurrences; all in `PLACEHOLDERS`); `test_vet_template_mentions_duplicates_and_risk` (contains `$open_tasks`, `$risk_signals`, `duplicate_of`, `risky`); `test_notice_contains_required_clauses` (substrings: "no human", "CLAUDE.md", "ask", "merge", "push", "switch", "artel heavy"); `test_load_prefers_project_file`; `test_template_source_strings`; `test_notice_path_builtin_copy_and_project_override`; `test_export_writes_all`; `test_export_keeps_edited_without_force`; `test_export_force_overwrites`; `test_export_only_missing_never_overwrites`; `test_config_command_lists_template_sources` (run `cmd_config.run` and check lines like `template write.md: built-in`); `test_notice_file_not_rewritten_when_unchanged` (mtime stable on the second call); `test_builtin_templates_load_from_pyz` (extend `tests/test_zipapp.py`: the built pyz runs `[sys.executable, pyz, "templates", "export"]` in a temp repo and writes all seven files).
 
-- [ ] **Step 1b: Write the failing command tests** (`RepoTestCase`, `os.chdir` into the repo; env patched with `unittest.mock.patch.dict(os.environ, …)`). Full list: `test_human_add_is_open_with_flags_and_deps`; `test_agent_add_is_proposed_with_creator`; `test_add_unknown_after_rejected`; `test_note_requires_agent_env`; `test_note_appends_with_stage_and_round`; `test_note_too_long_exit_2_with_hint`; `test_note_from_linked_worktree_reaches_same_board`; `test_heavy_refuses_unlisted_command`; `test_heavy_runs_under_prefix_and_returns_code` (heavy_lock = list `[sys.executable, <marker script>]`; command `[sys.executable, "-c", "import sys; sys.exit(4)"]` → 4; `project_tools = [f"Bash({sys.executable} *)"]`); `test_tool_pattern_matching` (incl. a Windows-style path with backslashes); `test_shim_runs_artel` (`platform.shim_invocation(bin) + ["--version"]` prints `0.1.0`); `test_agent_env_sets_vars_and_path` (uses `os.pathsep`).
+- [ ] **Step 1b: Write the failing command tests** (`RepoTestCase`, `os.chdir` into the repo; env patched with `unittest.mock.patch.dict(os.environ, …)`). Full list: `test_human_add_is_open_with_flags_and_deps`; `test_agent_add_is_proposed_with_creator`; `test_add_unknown_after_rejected`; `test_note_requires_agent_env`; `test_note_appends_with_stage_and_round`; `test_add_and_note_without_optional_flags_store_empty_strings` (no `--body` / `--basis` → `""` in the board, no `IntegrityError`); `test_note_too_long_exit_2_with_hint`; `test_note_from_linked_worktree_reaches_same_board`; `test_heavy_refuses_unlisted_command`; `test_heavy_runs_under_prefix_and_returns_code` (heavy_lock = list `[sys.executable, <marker script>]`; command `[sys.executable, "-c", "import sys; sys.exit(4)"]` → 4; `project_tools = [f"Bash({sys.executable} *)"]`); `test_tool_pattern_matching` (incl. a Windows-style path with backslashes); `test_shim_runs_artel` (`platform.shim_invocation(bin) + ["--version"]` prints `0.1.0`); `test_agent_env_sets_vars_and_path` (uses `os.pathsep`).
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_templates tests.test_cmd_agent tests.test_zipapp -v` — FAIL.
 - [ ] **Step 3: Implement** both parts. **Step 4: Whole suite** — PASS.
@@ -1765,12 +1887,14 @@ Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths 
   def tail_bytes(text: str, limit: int) -> str      # last ≤ limit UTF-8 bytes, cut at a line start, never mid code point
   @dataclass(frozen=True)
   class PromptInputs:
-      task: Task; history: Sequence[Entry]; findings: Sequence[Entry]; closure_list: Sequence[Entry]
+      task: Task; stage: str                 # "vet" | "attack" | "write" | "review" | "fix" → $stage
+      history: Sequence[Entry]; findings: Sequence[Entry]; closure_list: Sequence[Entry]
       context: Sequence[Entry]; verify_log: str = ""; conflict_paths: Sequence[str] = ()
       open_tasks: Sequence[tuple[int, str, str]] = ()   # (id, state, title) for vet duplicates
       risk_signals: Sequence[str] = (); diff_range: str = ""
   def render(template_text: str, inputs: PromptInputs, *, budget: int) -> str
-      # string.Template.safe_substitute with: $task_id $title $area $stage $round $branch $diff_range;
+      # string.Template.safe_substitute with: $task_id $title $area $stage (inputs.stage) $round $branch
+      # ("artel/<id>") $diff_range;
       # $body (fenced when task.created_by starts with "agent:"); $task_history (all entries, fenced,
       # never truncated); $findings (fenced); $closure_list (ids + text, fenced); $verify_log
       # (tail_bytes(…, budget), fenced — PD-20); $context (fenced); $conflict_paths; $open_tasks
@@ -1791,13 +1915,13 @@ Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths 
         mine = [entry(i, task_id=1, text="x" * 300) for i in range(30)]
         others = [entry(100 + i, task_id=2, text="y" * 300) for i in range(30)]
         ctx = prompts.select_context(task, others, {2: ("src",)}, budget=8000)
-        text = prompts.render("$task_history\n$context", PromptInputs(task=task, history=mine, findings=(),
-                              closure_list=(), context=ctx), budget=8000)
+        text = prompts.render("$task_history\n$context", PromptInputs(task=task, stage="write", history=mine,
+                              findings=(), closure_list=(), context=ctx), budget=8000)
         self.assertEqual(text.count("x" * 300), 30)
         self.assertLessEqual(text.count("y" * 300), 8000 // 300)
 ```
 
-Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence`; `test_agent_created_body_is_fenced_human_body_is_not`; `test_task_history_never_truncated_but_context_is`; `test_overlapping_area_facts_come_first_newest_first`; `test_context_whole_entries_only`; `test_template_name_rules` (round 1 → review.md; round 2 → review-closure.md; `review_closure` with round 1 → review-closure.md; vet → vet.md); `test_closure_list_has_open_ids`; `test_verify_log_tail_bounded_and_fenced` (20 KB log → ≤ budget bytes, starts at a line, fenced); `test_tail_bytes_never_splits_code_point`; `test_open_tasks_and_risk_signals_rendered_for_vet`; `test_conflict_paths_rendered`; `test_unknown_placeholders_left_intact`.
+Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence`; `test_agent_created_body_is_fenced_human_body_is_not`; `test_task_history_never_truncated_but_context_is`; `test_overlapping_area_facts_come_first_newest_first`; `test_context_whole_entries_only`; `test_template_name_rules` (round 1 → review.md; round 2 → review-closure.md; `review_closure` with round 1 → review-closure.md; vet → vet.md); `test_closure_list_has_open_ids`; `test_verify_log_tail_bounded_and_fenced` (20 KB log → ≤ budget bytes, starts at a line, fenced); `test_tail_bytes_never_splits_code_point`; `test_open_tasks_and_risk_signals_rendered_for_vet`; `test_conflict_paths_rendered`; `test_stage_and_branch_rendered`; `test_unknown_placeholders_left_intact`.
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_prompts -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Prompts: pure assembly with context budget and untrusted fencing"`
@@ -1808,71 +1932,86 @@ Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence
 
 ### Task 13: Stages — plan, run, classify, record — **RISKY (strong-model review)**
 
-**Spec:** §4 (stages, structured result, model escalation, minor findings, closure rounds), §5 steps 3–6 (slot, agent, usage events, outcome), §3.1 (events emitted, incl. `setup_failed` → same state + pause, `internal_error`, conflict fix → reviewing, leaving a slot, branchless stages detached at integration), §6 (profiles per stage, agent env), §10 (verdicts and escalations carry the setting), spike Q1/Q4/Q6, PD-3, PD-4, PD-5, PD-18, PD-21–PD-24, PD-29, PD-32. The vet stage is added by Task 21; this task leaves `vet` out of `SUPPORTED_STAGES`.
+**Spec:** §4 (stages, structured result, model escalation, minor findings, closure rounds), §5 steps 3–6 (slot, agent, usage events, outcome), §3.1 (events emitted, incl. `setup_failed` → same state + pause, `internal_error`, conflict fix → reviewing, leaving a slot, branchless stages detached at integration), §6 (profiles per stage, agent env), §10 (verdicts and escalations carry the setting), spike Q1/Q4/Q6, PD-3, PD-4, PD-5, PD-18, PD-21–PD-24, PD-29, PD-32, PD-35, PD-37, PD-40, PD-42, PD-43. The vet stage is added by Task 21; this task leaves `vet` out of `SUPPORTED_STAGES`.
 
-**Context for the writer:** Global Constraints + Spike facts + PD-3, PD-4, PD-5, PD-18, PD-21, PD-22, PD-23, PD-24, PD-29, PD-32 + this task.
+**Context for the writer:** Global Constraints + Spike facts + PD-3, PD-4, PD-5, PD-18, PD-21, PD-22, PD-23, PD-24, PD-29, PD-32, PD-35, PD-37, PD-40, PD-42, PD-43 + this task.
 
 **Files:**
 - Create: `artel/stages.py`, `tests/test_stages.py`
 
 **Interfaces:**
-- Consumes: `transitions.apply/Limits` (T7); `journal.*`, `pick.areas_overlap` (T6); `slots.prepare_slot/prepare_detached/start_conflict_merge/leave_slot/run_setup_if_needed/apply_git_effects` (T10); `procs.run_tree` (T8); `agent_claude.*` (T9); `templates.load_template/notice_path`, `cmd_agent.agent_env/ensure_shim` (T11); `prompts.*` (T12); `Board` (T4); `Config` (T5).
+- Consumes: `transitions.apply`, `Limits.from_cfg` (T7); `journal.*`, `pick.areas_overlap` (T6); `slots.prepare_slot/prepare_detached/start_conflict_merge/leave_slot/run_setup_if_needed/apply_git_effects` (T10); `procs.run_tree`, `procs.OnStart` (T8); `agent_claude.*` (T9); `templates.load_template/notice_path`, `cmd_agent.agent_env/ensure_shim` (T11); `prompts.*` (T12); `Board` (T4); `Config` (T5).
 - Produces (`artel.stages`):
   ```python
   STATE_TO_STAGE = {"vetting": "vet", "attacking": "attack", "writing": "write",
                     "reviewing": "review", "fixing": "fix"}
   SUPPORTED_STAGES = {"attack", "write", "review", "fix"}        # Task 21 adds "vet"
-  def limits_for(task: Task, cfg) -> Limits      # Limits.for_task with cfg values (shared with runner/requests)
+  # effective limits: transitions.Limits.from_cfg(task, cfg) (T7) — this module defines no limits helper
   def diff_lines(repo, task_id: int) -> int      # added+deleted of `git diff --numstat artel/integration...artel/<id>`
   def choose_model(cfg, task: Task, stage: str, diff: int) -> tuple[str, str]
       # attack → (models.strong, "attack stage always uses models.strong");
       # write/fix → (models.write, "models.write"); vet → (models.review, "vet uses models.review") (PD-32);
-      # review: task.strong → "task --strong"; task.attack → "task --attack";
-      # diff > strong_diff_lines → f"diff {diff} lines > strong_diff_lines {n}"; else (models.review, "models.review")
+      # review: task.strong → "task --strong"; task.attack → "task --attack"; task.risky → "task risky (vet)"
+      # (PD-37); diff > strong_diff_lines → f"diff {diff} lines > strong_diff_lines {n}";
+      # else (models.review, "models.review")
   def branchless(task: Task, stage: str) -> bool   # vet, or attack while task.then is set / no branch exists
   @dataclass(frozen=True)
   class StagePlan:
       task_id: int; stage: str; round: int; model: str; model_reason: str; profile: str  # "writer"|"reviewer"
-      prompt: str; argv: list[str]; env: dict[str, str]; log_path: Path; run_id: int
+      prompt: str; argv: list[str]; env: dict[str, str]; base_env: dict[str, str]; log_path: Path; run_id: int
       head_before: str; conflict_paths: tuple[str, ...]
+      # env = cmd_agent.agent_env(..., base_env=base_env) for the agent; base_env (the runner's environment)
+      # is what setup runs with
   @dataclass(frozen=True)
   class StageRun:
       result: dict | None; invalid_reason: str | None; usage: dict; exit_code: int | None
       timed_out: bool; stopped: bool; rate_limited: bool; new_commits: bool; merge_committed: bool
       setup: str                      # "skipped" | "ok" | "failed" | "timeout" | "stopped"
       denials: list[dict]; session_id: str | None; first_context: int | None; last_context: int | None
-  def plan_stage(repo, board, cfg, task: Task, slot_n: int) -> StagePlan
+  def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[str, str]) -> StagePlan
       # branchless → slots.prepare_detached, else slots.prepare_slot; fix with fix_kind "conflict" →
       # slots.start_conflict_merge (paths go to the prompt); gathers PromptInputs from the board
       # (history, open findings, closure list, context via prompts.select_context, latest verify log tail)
       # and renders templates.load_template(prompts.template_name(...)); profile: writer for write/fix,
-      # reviewer for vet/attack/review; build_argv; start_run with model and reason; log path
-      # logs/<id>/<stage>-<n>.jsonl
+      # reviewer for vet/attack/review; agent env = cmd_agent.agent_env(repo, ..., base_env=base_env);
+      # build_argv; start_run with model and reason; log path logs/<id>/<stage>-<n>.jsonl
   def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *,
-                on_start: Callable[[int, int, str | None], None],
+                on_start: OnStart,
                 on_rate_limit: Callable[[RateLimit], None],
                 stop_event: threading.Event) -> StageRun
-      # run_setup_if_needed first (failed/timeout → StageRun with that setup value, agent not started);
-      # run_tree(argv, stdin_text=prompt, timeout=stage_timeout, kill_grace) feeding StreamParser; every
-      # RateLimit → on_rate_limit; rank 2 → rate_limited=True (PD-22); result = validate_result(stage,
-      # parser.structured) unless parser.failed(); new_commits = HEAD != head_before; merge_committed =
-      # integration tip is an ancestor of HEAD and HEAD is a merge commit; slots.leave_slot always
-      # (finally); finish_run with usage, measurements and session id (PD-23)
+      # run_setup_if_needed(env=plan.base_env, on_start kind "setup") first — skipped for a fix with
+      # fix_kind "conflict" (PD-43: setup="skipped") — failed/timeout → StageRun with that setup value,
+      # agent not started; run_tree(argv, env=plan.env, stdin_text=prompt, timeout=stage_timeout, kill_grace,
+      # on_start kind "agent") feeding StreamParser; every RateLimit → on_rate_limit;
+      # rate_limited = parser.limit_hit() (PD-40); a limit hit seen only in the error result (no rank-2
+      # event) is also reported through on_rate_limit as RateLimit(status="error <api_error_status>",
+      # rank=2, resets_at=None, limit_type=None, utilization=None, windows={});
+      # result = validate_result(stage, parser.structured) unless parser.failed();
+      # new_commits (PD-35): write → `git rev-list --count artel/integration..HEAD` > 0; fix (review/verify)
+      # → HEAD != task.fix_base (fix_base None → compare with head_before); merge_committed = integration
+      # tip is an ancestor of HEAD and HEAD is a merge commit; slots.leave_slot always (finally);
+      # finish_run with usage, measurements and session id (PD-23)
   def classify(task: Task, stage: str, run: StageRun, board) -> str
-      # "requeue" if run.stopped or run.rate_limited; "setup_failed" if run.setup in (failed, timeout);
+      # "requeue" if run.stopped, or run.rate_limited and run.result is None (PD-40: a limit hit with a
+      # valid result is classified normally; the runner pauses either way through on_rate_limit);
+      # "setup_failed" if run.setup in (failed, timeout);
       # "stage_failed" if timed out, invalid/missing result, outcome "fail", write/fix "ready" without new
-      # commits, or a conflict fix "ready" without merge_committed; "ask" for outcome ask;
+      # commits (PD-35), or a conflict fix "ready" without merge_committed; "ask" for outcome ask;
       # attack: "attack_blocker" if any blocker finding else "attack_clear"; write/fix: "ready";
-      # review: after closures, "review_blocking" if any open blocker/major review finding (PD-3) else "review_clear"
+      # review: after valid closures (ids not open review findings of the task are ignored, PD-42),
+      # "review_blocking" if any open blocker/major review finding (PD-3) else "review_clear"
   def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) -> None
-      # findings (PD-4 downgrade in closure rounds or review_closure, PD-21 truncation), closures,
-      # ASK with the question, FAIL per denial (PD-24), VERDICT
+      # findings (PD-4 downgrade in closure rounds or review_closure, PD-21 truncation), closures (only ids
+      # that are open review findings of the task; each other id → runner FAIL entry
+      # "closed #<id> ignored: not an open finding of #<task>", PD-42 — close_finding is never called with
+      # them), ASK with the question, FAIL per denial (PD-24), VERDICT
       # "<PASS|FINDINGS|READY|FAIL> <stage> r<round> model=<model> (<model_reason>) …"
   def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun) -> Transition | None
-      # classify → record_stage → transitions.apply (None for requeue: board.clear_running) →
+      # classify → record_stage → transitions.apply(..., limits=Limits.from_cfg(task, cfg),
+      # tip=repo.rev(task_branch(task_id))) (None for requeue: board.clear_running) →
       # journal effects (ask_open_findings → ASK listing open findings, truncated) →
-      # slots.apply_git_effects; a VERDICT for a cap names Transition.cause. Effect
-      # "pause_setup_failed" is returned to the caller (the runner pauses the board).
+      # slots.apply_git_effects(repo, board, cfg, task_id, effects); a VERDICT for a cap names
+      # Transition.cause. Effect "pause_setup_failed" is returned to the caller (the runner pauses the board).
   def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Transition
       # FAIL entry "internal error: <tail, truncated>", clear running, event "internal_error"
   ```
@@ -1884,7 +2023,8 @@ Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence
     def test_setup_failure_keeps_work_and_pauses(self):
         self.write_config(commands={"setup": py_cmd("import sys; sys.exit(3)")})
         tid = self.task_in("fixing", fix_kind="review", with_commit=True)
-        plan = stages.plan_stage(self.repo, self.board, self.cfg, self.board.get_task(tid), 1)
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, self.board.get_task(tid), 1,
+                                 base_env=dict(os.environ))
         run = stages.run_stage(self.repo, self.board, self.cfg, plan, 1, on_start=noop,
                                on_rate_limit=noop, stop_event=threading.Event())
         tr = stages.finish_stage(self.repo, self.board, self.cfg, tid, plan, run)
@@ -1895,7 +2035,7 @@ Full test list: `test_fence_wraps_with_note`; `test_injection_cannot_close_fence
         self.assertEqual(self.calls(), [])                          # agent never started
 ```
 
-Full test list: `test_choose_model_rules` (subTests: attack, write, fix, vet, review default, `--strong`, `--attack`, big diff, reason strings); `test_diff_lines`; `test_plan_uses_writer_profile_for_write_and_reviewer_for_review`; `test_agent_gets_task_env_and_shim` (fake `note` action → entry with `author="agent:write"`); `test_write_ready_with_commit_goes_to_reviewing` (plan → run → finish; reviewing, round 1, VERDICT READY, slot left detached and clean, branch has the commit); `test_ready_without_commit_fails_and_resets`; `test_invalid_result_is_failure`; `test_error_result_is_failure`; `test_timeout_is_failure` (scenario `sleep` 30, `stage_timeout = "1s"`, `kill_grace = "1s"`; usage partial); `test_ask_blocks_and_records_question` (cause `ask`); `test_review_findings_then_closure_round`; `test_review_pass_without_closing_earlier_finding_blocks` (PD-3); `test_closure_round_new_major_downgraded` (PD-4); `test_attack_blocker_blocks_and_clear_goes_to_writing`; `test_attack_findings_not_in_review_accounting` (PD-5); `test_branchless_attack_runs_detached_at_integration` (task with `then` set; slot HEAD == integration tip, no branch created); `test_review_cap_blocks_with_ask_listing_findings` (cause `cap`; VERDICT names `review_rounds`); `test_rate_limited_requeues_without_counter`; `test_stopped_requeues_without_counter`; `test_setup_failure_keeps_work_and_pauses`; `test_conflict_fix_starts_with_markers_and_commit_goes_to_closure_review` (conflicting commit on integration; fake agent sees `<<<<<<<` in its cwd, resolves, `git add`, `git commit` → reviewing with `review_closure`, round unchanged); `test_conflict_fix_without_merge_commit_fails`; `test_leave_slot_runs_even_when_agent_crashes` (fake `exit 9` mid-merge → slot clean, no MERGE_HEAD); `test_permission_denial_recorded_as_fail_entry` (PD-24); `test_usage_and_measurements_stored` (PD-23: summed usage, first/last context, turns, session id); `test_reviewer_uses_strong_model_for_big_diff_with_reason_in_run_row`; `test_internal_error_counts_attempt_and_records_tail`.
+Full test list: `test_severities_match_journal` (`agent_claude.SEVERITIES == journal.SEVERITIES`; owned here because T6 and T9 run in parallel); `test_choose_model_rules` (subTests: attack, write, fix, vet, review default, `--strong`, `--attack`, risky (PD-37), big diff, reason strings); `test_diff_lines`; `test_plan_uses_writer_profile_for_write_and_reviewer_for_review`; `test_agent_gets_task_env_and_shim` (fake `note` action → entry with `author="agent:write"`); `test_base_env_reaches_agent_and_setup` (a marker variable in `base_env` is visible to the fake agent and to the setup command — catches `Runner(env=…)` never reaching agents); `test_write_ready_with_commit_goes_to_reviewing` (plan → run → finish; reviewing, round 1, VERDICT READY, slot left detached and clean, branch has the commit); `test_ready_without_commit_fails_and_resets`; `test_writer_ready_after_requeue_with_earlier_commits` (PD-35: the branch already has the writer's commit from a stopped run; a new run returns `ready` without committing → reviewing, no attempt); `test_fix_ready_after_answer_counts_commits_since_fix_base` (fixer commits, asks, is answered, returns `ready` without a new commit → reviewing); `test_fix_ready_with_no_commit_since_fix_base_fails`; `test_invalid_result_is_failure`; `test_error_result_is_failure`; `test_timeout_is_failure` (scenario `sleep` 30, `stage_timeout = "1s"`, `kill_grace = "1s"`; usage partial); `test_ask_blocks_and_records_question` (cause `ask`); `test_review_findings_then_closure_round`; `test_review_pass_without_closing_earlier_finding_blocks` (PD-3); `test_closure_round_new_major_downgraded` (PD-4); `test_attack_blocker_blocks_and_clear_goes_to_writing`; `test_attack_findings_not_in_review_accounting` (PD-5); `test_branchless_attack_runs_detached_at_integration` (task with `then` set; slot HEAD == integration tip, no branch created); `test_review_cap_blocks_with_ask_listing_findings` (cause `cap`; VERDICT names `review_rounds`); `test_rate_limited_requeues_without_counter`; `test_limit_error_result_requeues_without_counter` (fake `result_error: 429` → requeue, attempts 0, branch kept — PD-40); `test_limit_hit_with_valid_result_is_applied` (rank-2 event then a valid `ready` result → reviewing; `on_rate_limit` was called); `test_unknown_closed_id_dropped_with_fail_entry` (reviewer closes `#999` → FAIL entry, stage classified on the remaining data, no attempt — PD-42); `test_stopped_requeues_without_counter`; `test_setup_failure_keeps_work_and_pauses`; `test_conflict_fix_starts_with_markers_and_commit_goes_to_closure_review` (conflicting commit on integration; fake agent sees `<<<<<<<` in its cwd, resolves, `git add`, `git commit` → reviewing with `review_closure`, round unchanged); `test_conflict_fix_without_merge_commit_fails`; `test_conflict_fix_skips_setup` (setup that would fail on the markers is not run; `setup == "skipped"` — PD-43); `test_leave_slot_runs_even_when_agent_crashes` (fake `exit 9` mid-merge → slot clean, no MERGE_HEAD); `test_permission_denial_recorded_as_fail_entry` (PD-24); `test_usage_and_measurements_stored` (PD-23: summed usage, first/last context, turns, session id); `test_reviewer_uses_strong_model_for_big_diff_with_reason_in_run_row`; `test_internal_error_counts_attempt_and_records_tail`.
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_stages -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Stages: plan, run, classify and record with escalation, setup pause, conflict fixes"`
@@ -1906,33 +2046,38 @@ Full test list: `test_choose_model_rules` (subTests: attack, write, fix, vet, re
 
 ### Task 14: Verify and integrate — **RISKY (strong-model review)**
 
-**Spec:** §5 steps 7–8 (merge integration into the task branch, recheck `setup_inputs`, `verify` under `heavy_lock` with `verify_timeout`, own process groups, fast-forward with `git update-ref` old-value guard, re-verify when integration moved, DONE with usage, delete branch), §5 "Base moved", §3.1 (base-conflict pause, empty verify, leaving a slot, rows R31–R37 of Task 7: green, red/timeout → fix_kind=verify, conflict → fix_kind=conflict, caps, accept, ff), §9 (heavy lock not nested), §12 (string/list commands, configured shell), PD-13, PD-14, PD-16.
+**Spec:** §5 steps 7–8 (merge integration into the task branch, recheck `setup_inputs`, `verify` under `heavy_lock` with `verify_timeout`, own process groups, fast-forward with `git update-ref` old-value guard, re-verify when integration moved, DONE with usage, delete branch), §5 "Base moved", §3.1 (base-conflict pause, empty verify, leaving a slot, rows R31–R37 of Task 7: green, red/timeout → fix_kind=verify, conflict → fix_kind=conflict, caps, accept, ff), §9 (heavy lock not nested), §12 (string/list commands, configured shell), PD-13, PD-14, PD-16, PD-34, PD-35, PD-36.
 
-**Context for the writer:** Global Constraints + PD-13, PD-14, PD-16 + this task.
+**Context for the writer:** Global Constraints + PD-13, PD-14, PD-16, PD-34, PD-35, PD-36 + this task.
 
 **Files:**
 - Create: `artel/integrate.py`, `tests/test_integrate.py`
 
 **Interfaces:**
-- Consumes: T1–T10 (`stages` is not required; `stages.limits_for` may be imported if Task 13 is merged, else build `Limits` from cfg here), `transitions.apply`, `journal.append`, `slots.prepare_slot/prepare_detached/leave_slot/run_setup_if_needed`, `procs.run_tree`, `procs.heavy_argv`.
+- Consumes: T1–T10 (`stages` is not required), `transitions.apply`, `transitions.Limits.from_cfg` (T7), `journal.append`, `slots.prepare_slot/prepare_detached/leave_slot/run_setup_if_needed/merge_identity_args` (T10), `procs.run_tree`, `procs.heavy_argv`, `procs.OnStart` (T8).
 - Produces (`artel.integrate`):
   ```python
   def ensure_integration_branch(repo: Repo, base: str) -> str     # creates artel/integration at base if missing; returns sha
-  def merge_identity_args(repo: Repo) -> list[str]                # [] if user.email configured else ["-c","user.name=artel","-c","user.email=artel@localhost"] (PD-16; also used by slots.start_conflict_merge)
+  # runner merges use slots.merge_identity_args(repo) (PD-16; defined in T10, not here)
   @dataclass(frozen=True)
   class VerifyResult:
       kind: str            # "green" | "red" | "conflict" | "timeout" | "stopped" | "setup_failed"
       commit: str | None   # task branch tip after the merge (green only)
       log_path: Path; detail: str     # e.g. "exit 1", "conflict in a.py, b.py", "verify not configured"
-  def verify_task(repo, board, cfg, task: Task, slot_n: int, *, on_start, stop_event) -> VerifyResult
-      # slots.prepare_slot (resume branch); git merge --no-edit artel/integration (identity args);
+  def verify_task(repo, board, cfg, task: Task, slot_n: int, *, on_start: OnStart, stop_event,
+                  env: Mapping[str, str] | None = None) -> VerifyResult
+      # slots.prepare_slot (resume branch); git merge --no-edit artel/integration (merge_identity_args);
       # conflict → collect `git diff --name-only --diff-filter=U`, then "conflict" (leave_slot aborts the
       # merge; the conflict fix re-creates it with slots.start_conflict_merge);
       # run_setup_if_needed (failed/timeout → "setup_failed"); verify "" → green (PD-14);
       # else run_tree(heavy_argv(verify, heavy_lock, shell), timeout=verify_timeout, merged stderr,
-      # log logs/<id>/verify-<n>.log as a run of stage "verify"); slots.leave_slot in finally
+      # log logs/<id>/verify-<n>.log as a run of stage "verify"; on_start kind "setup"/"verify"; env passed
+      # to setup and verify); slots.leave_slot in finally
   def finish_verify(repo, board, cfg, task_id: int, result: VerifyResult) -> Transition | None
-      # "stopped" → clear_running, None; green → verify_green; red/timeout → verify_red;
+      # transitions.apply(..., Limits.from_cfg(task, cfg), tip=repo.rev(task_branch(task_id))) — the tip
+      # after the verify merge becomes fix_base for a verify fix (PD-35);
+      # "stopped" → clear_running, None; green → verify_green (R31a also when task.accepted, PD-36);
+      # red/timeout → verify_red;
       # conflict → verify_conflict; setup_failed → setup_failed (same state, effect pause_setup_failed,
       # returned to the runner); sets last_verify; VERDICT names verify_timeout / max_verify_fixes /
       # merge as applicable; FAIL entry with log path for red
@@ -1948,11 +2093,13 @@ Full test list: `test_choose_model_rules` (subTests: attack, write, fix, vet, re
       kind: str            # "unchanged" | "fast_forward" | "merged" | "conflict" | "red" | "timeout" | "stopped"
       old: str; new: str | None; log_path: Path | None; detail: str
   def base_needs_update(repo, cfg) -> bool                 # base tip not an ancestor of artel/integration
-  def base_update(repo, board, cfg, slot_n: int, *, on_start, stop_event) -> BaseUpdate
+  def base_update(repo, board, cfg, slot_n: int, *, on_start: OnStart, stop_event,
+                  env: Mapping[str, str] | None = None) -> BaseUpdate
       # integration ancestor of base → "fast_forward" (new = base tip, no verify);
-      # else in the slot: slots.prepare_detached; merge --no-edit <base>; conflict → "conflict";
-      # else verify as above (heavy lock, verify_timeout) → "merged" (new = HEAD) or red/timeout;
-      # slots.leave_slot in finally
+      # else in the slot: slots.prepare_detached; merge --no-edit <base> (merge_identity_args); conflict →
+      # "conflict"; else run_setup_if_needed(task_id=None) and verify as above (heavy lock, verify_timeout)
+      # → "merged" (new = HEAD) or red/timeout. No task: logs logs/base/<setup|verify>-<n>.log, no runs
+      # row (PD-34); slots.leave_slot in finally
   def finish_base_update(repo, board, cfg, bu: BaseUpdate) -> str
       # fast_forward/merged → update-ref with old guard ("applied" or "retry" if guard failed, or "held" PD-13);
       # conflict/red/timeout → board meta pause_reason="base_conflict", pause_detail="<kind>: <detail>"
@@ -1982,7 +2129,7 @@ Full test list: `test_choose_model_rules` (subTests: attack, write, fix, vet, re
         self.assertEqual(self.board.get_task(tid).state, "verified")
 ```
 
-Full test list: `test_ensure_integration_branch_idempotent`; `test_verify_green_merges_integration_into_task_branch` (integration has a new non-conflicting commit; after verify the task branch contains both; `commit` is the merge); `test_verify_red_goes_to_fix_with_counter` (R33; fix_kind verify; FAIL entry with log path; `last_verify="red"`); `test_verify_red_at_cap_blocks` (R34a; VERDICT names `max_verify_fixes`); `test_verify_conflict_goes_to_conflict_fix` (R32; fix_kind conflict; slot clean afterwards, no MERGE_HEAD; detail lists files); `test_verify_conflict_at_cap_blocks` (R34b); `test_verify_setup_failure_pauses_without_counter` (state stays verifying, `verify_fixes` unchanged, effect `pause_setup_failed`); `test_verify_timeout_counts_as_red` (`verify_timeout = "1s"`, verify `py_cmd("import time; time.sleep(30)")`; process tree gone); `test_verify_runs_under_heavy_prefix_not_nested` (heavy_lock script appends one line per invocation to a marker; exactly one line per verify); `test_verify_rechecks_setup_inputs` (change `package-lock.json` analog on integration → setup runs again in verify); `test_empty_verify_is_green_with_note` (PD-14); `test_merge_ask_goes_to_awaiting_accept` (R31b); `test_integrate_fast_forwards_and_deletes_branch` (R36; DONE entry ≤ 400 B with sha; branch gone); `test_fast_forward_impossible_reverifies` (R37); `test_update_ref_guard_refuses_concurrent_move`; `test_integration_checked_out_is_held` (PD-13); `test_accept_then_integration_moved_reverifies_then_done` (awaiting_accept → accept (via `transitions.apply`) → integrate "reverify" → verify green → integrate "done"); `test_base_unchanged`; `test_base_fast_forward_when_integration_behind`; `test_base_merged_and_verified` (integration has a task commit, base gets a commit → merged, update-ref applied); `test_base_conflict_pauses_board` (meta `pause_reason == "base_conflict"`; integration unchanged; slot clean); `test_base_red_verify_pauses_board`; `test_runner_merge_identity_fallback` (remove the identity env vars with `mock.patch.dict` → merge commit author `artel`); `test_verify_string_command_uses_configured_shell` (verify `"exit 1"` with `shell = "auto"` → red; runs `sh` on POSIX, Git Bash on Windows CI).
+Full test list: `test_ensure_integration_branch_idempotent`; `test_verify_green_merges_integration_into_task_branch` (integration has a new non-conflicting commit; after verify the task branch contains both; `commit` is the merge); `test_verify_red_goes_to_fix_with_counter` (R33; fix_kind verify; FAIL entry with log path; `last_verify="red"`); `test_verify_red_at_cap_blocks` (R34a; VERDICT names `max_verify_fixes`); `test_verify_conflict_goes_to_conflict_fix` (R32; fix_kind conflict; slot clean afterwards, no MERGE_HEAD; detail lists files); `test_verify_conflict_at_cap_blocks` (R34b); `test_verify_setup_failure_pauses_without_counter` (state stays verifying, `verify_fixes` unchanged, effect `pause_setup_failed`); `test_verify_timeout_counts_as_red` (`verify_timeout = "1s"`, verify `py_cmd("import time; time.sleep(30)")`; process tree gone); `test_verify_runs_under_heavy_prefix_not_nested` (heavy_lock script appends one line per invocation to a marker; exactly one line per verify); `test_verify_rechecks_setup_inputs` (change `package-lock.json` analog on integration → setup runs again in verify); `test_empty_verify_is_green_with_note` (PD-14); `test_merge_ask_goes_to_awaiting_accept` (R31b); `test_integrate_fast_forwards_and_deletes_branch` (R36; DONE entry ≤ 400 B with sha; branch gone); `test_fast_forward_impossible_reverifies` (R37); `test_update_ref_guard_refuses_concurrent_move`; `test_integration_checked_out_is_held` (PD-13); `test_accept_then_integration_moved_reverifies_then_done` (`merge=ask`: awaiting_accept → accept (via `transitions.apply`) → integrate "reverify" → verify green → `verified` because `accepted` (PD-36), not `awaiting_accept` again → integrate "done"); `test_base_unchanged`; `test_base_fast_forward_when_integration_behind`; `test_base_merged_and_verified` (integration has a task commit, base gets a commit → merged, update-ref applied); `test_base_conflict_pauses_board` (meta `pause_reason == "base_conflict"`; integration unchanged; slot clean); `test_base_red_verify_pauses_board`; `test_base_verify_logs_under_base_without_run_row` (PD-34); `test_verify_red_records_fix_base` (after R33 `fix_base` = the task-branch tip including the verify merge — PD-35); `test_runner_merge_identity_fallback` (remove the identity env vars with `mock.patch.dict` → merge commit author `artel`); `test_verify_string_command_uses_configured_shell` (verify `"exit 1"` with `shell = "auto"` → red; runs `sh` on POSIX, Git Bash on Windows CI).
 
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Integrate: verify on merged tree, guarded fast-forward, base moved"`
@@ -1993,19 +2140,19 @@ Full test list: `test_ensure_integration_branch_idempotent`; `test_verify_green_
 
 ### Task 15: Runner core and happy-path e2e — the vertical slice — **RISKY (strong-model review)**
 
-**Spec:** §5 (lock, loop steps 2–8 for one or more slots, base moved before the next pick), §3.1 (requeue clears only `running`; internal error row; setup failure pauses; leaving a slot), §13 (runner lock: a second runner exits; real git repos; fake agent), PD-6, PD-8, PD-13. Limits, disk guard, stop/signals, full reconcile, notifier wiring and log retention are Task 22; request handling is Task 18; vetting is Task 21.
+**Spec:** §5 (lock, loop steps 2–8 for one or more slots, base moved before the next pick), §3.1 (requeue clears only `running`; internal error row; setup failure pauses; leaving a slot), §13 (runner lock: a second runner exits; real git repos; fake agent), PD-6, PD-8, PD-13, PD-34, PD-38, PD-41. Limits, disk guard, stop/signals, full reconcile, notifier wiring and log retention are Task 22; request handling is Task 18; vetting is Task 21.
 
-**Context for the writer:** Global Constraints + PD-6, PD-8, PD-13 + this task.
+**Context for the writer:** Global Constraints + PD-6 (amended), PD-8, PD-13, PD-34, PD-38, PD-41 + this task.
 
 **Files:**
 - Create: `artel/runner.py`, `artel/events.py`, `tests/e2e.py`, `tests/test_runner_core.py`
 
 **Interfaces:**
-- Consumes: T1–T14 — `platform.FileLock`, `platform.resolve_argv` (T3); `Board` (T4); `Config`, `load_config` (T5); `pick.select` (T6); `transitions.apply` (T7); `slots.ensure_slots/reconcile_slots/apply_git_effects`, `SlotBusy` (T10); `cmd_agent.ensure_shim` (T11); `stages.*` (T13); `integrate.*` (T14).
+- Consumes: T1–T14 — `platform.FileLock` (T3); `Board` (T4); `Config`, `load_config` (T5); `pick.select` (T6); `transitions.apply`, `Limits.from_cfg` (T7); `agent_claude.agent_argv` (T9); `slots.ensure_slots/reconcile_slots/apply_git_effects/checked_out_elsewhere`, `SlotBusy` (T10); `cmd_agent.ensure_shim` (T11); `stages.*` (T13); `integrate.*` (T14).
 - Produces:
   - `artel.events`:
     ```python
-    EVENT_KINDS = ("blocked", "stuck", "paused", "resumed", "done", "runner_stopped")
+    EVENT_KINDS = ("blocked", "stuck", "paused", "resumed", "done", "runner_stopped", "error")   # error: PD-38
     @dataclass(frozen=True)
     class Event:
         kind: str; task_id: int | None = None; title: str | None = None; state: str | None = None
@@ -2022,33 +2169,48 @@ Full test list: `test_ensure_integration_branch_idempotent`; `test_verify_green_
         task_id: int | None; slot: int; thread: threading.Thread; stop: threading.Event
         result: object = None     # (StagePlan, StageRun) | VerifyResult | BaseUpdate
         error: str | None = None  # traceback tail if the job raised
+        busy: Path | None = None  # SlotBusy.where if the branch turned out to be checked out elsewhere (PD-8)
     class Runner:
         def __init__(self, repo: Repo, cfg: Config, *, env: Mapping[str, str] | None = None,
                      clock: Callable[[], float] = time.time, notify: Notify = null_notify)
         def start(self) -> None
             # platform.FileLock(repo.lock_path).acquire() or ArtelError("another artel runner holds <path>");
-            # meta runner_pid; ensure shim; platform.resolve_argv(agent_command) (fail fast, naming it);
-            # integrate.ensure_integration_branch; slots.ensure_slots(max_agents); self.reconcile()
+            # meta runner_pid; ensure shim; agent_claude.agent_argv(cfg) (fail fast, naming agent_command;
+            # unwraps a .cmd, PD-41); integrate.ensure_integration_branch; slots.ensure_slots(max_agents);
+            # self.reconcile()
         def reconcile(self) -> None
-            # core version: board.clear_running on every task (requeue, no counter); slots.reconcile_slots.
-            # Task 22 extends it with process-tree termination and heavy_lock_check.
+            # core version: board.clear_running on every task (requeue, no counter); meta base_running
+            # deleted; slots.reconcile_slots. Task 22 extends it with process-tree termination (incl. the
+            # base job's tree from base_running, PD-34) and heavy_lock_check.
         def tick(self) -> None
             # 1. collect finished jobs: stage → stages.finish_stage; verify → integrate.finish_verify;
-            #    base → integrate.finish_base_update; a job with `error` → stages.finish_internal_error;
-            #    effect pause_setup_failed → meta pause_reason="setup_failed", pause_detail; notify blocked/stuck
+            #    base → integrate.finish_base_update, then meta base_running deleted;
+            #    a stage/verify job with `error` → stages.finish_internal_error + notify `error` (PD-38);
+            #    a base job with `error` → runner FAIL entry (task_id NULL) + pause base_conflict with
+            #    pause_detail "internal error: <tail>" + notify paused (PD-34);
+            #    a job with `busy` → board.clear_running, no counter, no transition (PD-8: skipped);
+            #    effect pause_setup_failed → meta pause_reason="setup_failed", pause_detail + notify paused;
+            #    notify blocked/stuck for transitions into those states
             # 2. integrate every verified, non-running task (integrate.integrate_task); notify done
             # 3. if meta pause_reason is set or stopping: no new jobs (Task 22 adds pause expiry)
-            # 4. base moved: integrate.base_needs_update and no verify/base job and a free slot → base job
-            # 5. pick.select(tasks, deps, free_slots, verify_busy), dropping proposed/vetting tasks while
-            #    "vet" is not in stages.SUPPORTED_STAGES (they wait until Task 21); for open tasks apply `pick`;
-            #    clear `answered`; start a worker thread per task; SlotBusy → skip (PD-8)
+            # 4. base moved (§5 "before the next pick"): if a base job is running, or
+            #    integrate.base_needs_update — start the base job when no verify/base job runs and a slot is
+            #    free (its pid/group/fingerprint/slot go to meta base_running from on_start, PD-34) — and in
+            #    every case pick nothing new this tick while the base update is pending or running
+            # 5. busy = ids of tasks with a live Job; pick.select(tasks, deps, free_slots=..., verify_busy=...,
+            #    busy=busy) — so a task whose job has not yet set `running` is never dispatched twice;
+            #    drop proposed tasks while "vet" is not in stages.SUPPORTED_STAGES (they wait until Task 21);
+            #    for each selected task that has a branch, slots.checked_out_elsewhere(repo, task_branch(id))
+            #    → skip it before any transition (PD-8; nothing applied, no attempt);
+            #    apply `pick` for open tasks (R10a/b) and, when "vet" is in SUPPORTED_STAGES, for proposed
+            #    tasks (R03 → vetting); clear `answered`; start a worker thread per task with the next free slot
         def wait(self, timeout: float) -> None     # until a job finishes or timeout (poll_interval)
         def run_forever(self) -> int               # start; loop tick + wait until stopping and no jobs; release lock
         def request_stop(self, now: bool) -> None  # soft: no new jobs; now: set every job's stop event
         def shutdown(self) -> None                 # request_stop(now=True), join jobs, release lock
     def run_command(args) -> int                   # load_config(cli={"max_agents": (args.n, "flag -n")} if args.n)
     ```
-    Worker threads open their own `Board`, call `board.set_running(...)` from `on_start`, run `plan_stage` + `run_stage` (or `verify_task` / `base_update`), store the result and never call `transitions.apply`; the main thread applies every transition. Any exception in a worker is caught and stored as `Job.error`.
+    Worker threads open their own `Board`, call `board.set_running(task_id, kind=<OnStart kind>, ...)` from `on_start` (the base job writes meta `base_running` instead, PD-34), run `plan_stage(..., base_env=self.env)` + `run_stage` (or `verify_task(..., env=self.env)` / `base_update(..., env=self.env)`), store the result and never call `transitions.apply`; the main thread applies every transition. `self.env` defaults to `os.environ`; tests pass `ARTEL_FAKE_DIR` through it. `SlotBusy` raised in a worker (the branch was checked out elsewhere after the tick's check) is stored as `Job.busy`; any other exception is caught and stored as `Job.error`.
   - `tests/e2e.py`: `class E2ECase(RepoTestCase)` — creates `artel/integration`, writes `artel.toml` (`poll_interval = "100ms"`, `agent_command = [sys.executable, "<repo>/tests/fake_agent.py"]`, list-form `commands.verify`), sets `ARTEL_FAKE_DIR`; attributes `repo`, `board`, `cfg`, `fake_dir`; `FakeClock` (callable, `advance(seconds)`); helpers `wait_until(predicate, timeout)`, `scenario(dict)`, `calls() -> list[dict]`, `add_task(title, **flags) -> int` (via `transitions.create`), `commit_of(message) -> str`, `assertSlotsCleanAndDetached()`, `runner(**config_overrides) -> Runner`, `drive(runner, until: Callable[[], bool], timeout=30)` (tick + wait until the predicate holds or fail with the board state), and a `tearDown` that asserts every pid recorded in the board and in `calls.jsonl` is dead (`platform.pid_alive`).
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_runner_core.py`, all on `E2ECase`).
@@ -2071,7 +2233,7 @@ Full test list: `test_ensure_integration_branch_idempotent`; `test_verify_green_
         self.assertSlotsCleanAndDetached()
 ```
 
-Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`; `test_verify_red_fix_then_done`; `test_two_tasks_two_slots_disjoint_areas`; `test_second_runner_exits_with_error` (subprocess `python -m artel run` with `subprocess_env()` → non-zero, "another artel runner"); `test_missing_agent_cli_fails_fast`; `test_job_exception_counts_attempt_and_records_fail` (patch `stages.run_stage` to raise once → FAIL entry with the traceback tail, `running` cleared, `attempts == 1`, the stage runs again next tick); `test_setup_failure_pauses_and_keeps_branch` (no new picks while `pause_reason == "setup_failed"`); `test_proposed_tasks_wait_without_vet_support`; `test_base_moved_merged_before_next_pick`; `test_requeue_after_restart_has_no_counter` (stop a runner mid-stage with `shutdown`, start a new one: same state, attempts 0).
+Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`; `test_verify_red_fix_then_done`; `test_two_tasks_two_slots_disjoint_areas`; `test_second_runner_exits_with_error` (subprocess `python -m artel run` with `subprocess_env()` → non-zero, "another artel runner"); `test_missing_agent_cli_fails_fast`; `test_job_exception_counts_attempt_and_records_fail` (patch `stages.run_stage` to raise once → FAIL entry with the traceback tail, `running` cleared, `attempts == 1`, an `error` event to a recording notify, the stage runs again next tick); `test_setup_failure_pauses_and_keeps_branch` (no new picks while `pause_reason == "setup_failed"`; a `paused` event was emitted); `test_proposed_tasks_wait_without_vet_support`; `test_proposed_task_picked_into_vetting_when_vet_supported` (patch `stages.SUPPORTED_STAGES` to include `vet` → the proposed task reaches `vetting` through R03 — catches a runner that only applies `pick` to open tasks); `test_base_moved_merged_before_next_pick` (an open task is not picked in the tick that starts the base job, nor while it runs); `test_base_job_error_pauses_without_task` (patch `integrate.base_update` to raise → FAIL entry with no task, pause `base_conflict`, no task attempt changed — PD-34); `test_task_dispatched_once_until_running` (patch the worker so `on_start` is delayed 1 s; call `tick` repeatedly; the fake agent is called once — catches dispatching a task twice before `running` is set); `test_branch_checked_out_elsewhere_skipped` (PD-8: `git worktree add` of `artel/<id>` outside the slots; the task is not dispatched, attempts stay 0, no transition; after the worktree is removed it runs); `test_runner_env_reaches_fake_agent` (only `Runner(env=…)` carries `ARTEL_FAKE_DIR`; the agent records its call); `test_requeue_after_restart_has_no_counter` (stop a runner mid-stage with `shutdown`, start a new one: same state, attempts 0).
 
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_runner_core -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** three times in a row — PASS (flakiness check).
 - [ ] **Step 5: Commit** — `git commit -m "Runner core: lock, tick, workers, happy-path e2e"`
@@ -2094,7 +2256,7 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
 **Steps:**
 - [ ] Create a toy repo in the scratchpad: `calc.py` with one function, `test_calc.py`, `commands.verify = [python, "-m", "unittest"]`, `project_tools = ["Bash(python -m unittest *)"]`, all three `models.*` = `haiku`, `max_agents = 1`; `artel.toml` written from `config.render_toml()` with those edits (init is Task 23).
 - [ ] `artel add "Add a subtract function with a test"`; `artel run -n 1` until the task is `done` or blocked/stuck; then stop the runner.
-- [ ] Record: final state; the stream logs' record types and the fields the adapter reads (`structured_output`, `rate_limit_info`, `assistant.message.usage`, `permission_denials`, `session_id`) — any mismatch with `agent_claude` constants; per-run usage and first/last context; wall time per stage; denials; whether the writer used only allowed commands; whether `leave_slot` left the slot clean; the integration commit.
+- [ ] Record: final state; the stream logs' record types and the fields the adapter reads (`structured_output`, `rate_limit_info`, `assistant.message.usage`, `permission_denials`, `session_id`, `api_error_status`) — any mismatch with `agent_claude` constants; whether several `assistant` lines share one `message.id` (PD-23); any error result's `api_error_status` value (PD-40 assumes 429 for a limit hit); per-run usage and first/last context; wall time per stage; denials; whether the writer used only allowed commands; whether `leave_slot` left the slot clean; the integration commit.
 - [ ] Every mismatch becomes a fix task for the adapter or stages before Wave 7 starts; list them at the end of the document.
 
 **Acceptance:** the document shows the task reaching `done` with a real agent, or names the exact failure and the fix that follows.
@@ -2103,19 +2265,20 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
 
 ### Task 17: Notifier — Telegram send-only, command notifier, `artel notify test`
 
-**Spec:** §7 (events, `on`, two notifiers, send-only Telegram with `getMe`/`sendMessage` only, token/chat sources and lookup order, install-time check, message content rules), §13 (fake HTTP endpoint, `getMe` failure disables, no `getUpdates`), §14a (`done` sent immediately or not at all), §12 (command string-or-list, UTF-8), PD-10.
+**Spec:** §7 (events, `on`, two notifiers, send-only Telegram with `getMe`/`sendMessage` only, token/chat sources and lookup order, install-time check, message content rules), §13 (fake HTTP endpoint, `getMe` failure disables, no `getUpdates`), §14a (`done` sent immediately or not at all), §12 (command string-or-list, UTF-8), PD-10, PD-38.
 
-**Context for the writer:** Global Constraints + PD-10 + this task.
+**Context for the writer:** Global Constraints + PD-10, PD-38 + this task.
 
 **Files:**
-- Create: `artel/notify.py`, `tests/test_notify.py`, `tests/fake_telegram.py` (the fake server class `FakeTelegram`, reused by Task 23), `tests/fake_telegram.py` (the fake server class `FakeTelegram`, reused by Task 23)
+- Create: `artel/notify.py`, `tests/test_notify.py`, `tests/fake_telegram.py` (the fake server class `FakeTelegram`, reused by Task 23)
 
 **Interfaces:**
 - Consumes: `Config` (`notify.*`), `Repo`, `config.set_value` (to enable after a successful check), `artel.events.Event` (T15), `procs.command_argv` (T8). Wiring the dispatcher into `artel run` is done by Task 22 (it owns `runner.py` in the next wave).
 - Produces (`artel.notify`):
   ```python
   from artel.events import EVENT_KINDS, Event      # defined by Task 15
-  def format_event(e: Event) -> str      # "artel: #12 blocked — <title>\n<question>"; never includes tokens or file contents
+  def format_event(e: Event) -> str      # "artel: #12 blocked — <title>\n<question>"; "error" → "artel: #12 internal error in
+                                         # <stage> — <title>\nsee artel show 12" (PD-38); never includes tokens or file contents
   @dataclass(frozen=True)
   class TelegramCredentials: token: str; chat: str; source: str   # source like "env ARTEL_TELEGRAM_TOKEN"
   def find_telegram_credentials(cfg, env: Mapping[str, str]) -> TelegramCredentials | None
@@ -2139,8 +2302,9 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
       # getMe fails → prints error, False (notifier stays disabled);
       # sends "artel: notifier test from <repo name>"; accepted → prints "Telegram: @<username>" and,
       # if enable, set_value(cfg.path, "notify.telegram_enabled", "true"); never prints the token
-  def run_command(args) -> int                    # `artel notify test`: check_and_enable(enable=False) for
-                                                  # Telegram + test event through the command notifier
+  def run_command(args) -> int                    # `artel notify test`: check_and_enable(enable=True) for
+                                                  # Telegram (§7: `notify test` enables the notifier only if the
+                                                  # message was accepted) + test event through the command notifier
   ```
 
 - [ ] **Step 1: Write the failing tests.** A fake Telegram server: `http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)` in a thread, recording every request path and body; configurable responses (`getMe` ok/fail, `sendMessage` ok/fail). `api_base = f"http://127.0.0.1:{port}"`.
@@ -2156,7 +2320,7 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
         self.assertFalse(any("getUpdates" in p for p in self.server.paths))
 ```
 
-Full test list: `test_credentials_lookup_order` (subTests for each source; file sources read the file and strip); `test_missing_credentials_explains`; `test_get_me_failure_disables_and_never_calls_get_updates`; `test_successful_check_enables_and_prints_username_not_token`; `test_send_rejected_does_not_enable`; `test_dispatcher_filters_by_on` (`done` not in default `on` → not sent); `test_done_sent_immediately_when_selected`; `test_command_notifier_receives_json` (command = list `[sys.executable, "-c", "import sys; open(sys.argv[1], 'w', encoding='utf-8').write(sys.stdin.read())", <file>]`; a title with non-ASCII text arrives intact); `test_emit_never_raises_on_http_error` (server down); `test_format_event_has_no_secrets` (event text with a token-like string is not added; only id/title/state/question); `test_no_getupdates_in_source` (read `notify.py` source; `"getUpdates"` absent except in a comment stating it is never called — assert not present in any string literal via `ast`); `test_notify_test_command`.
+Full test list: `test_credentials_lookup_order` (subTests for each source; file sources read the file and strip); `test_missing_credentials_explains`; `test_get_me_failure_disables_and_never_calls_get_updates`; `test_successful_check_enables_and_prints_username_not_token`; `test_send_rejected_does_not_enable`; `test_dispatcher_filters_by_on` (`done` not in default `on` → not sent); `test_done_sent_immediately_when_selected`; `test_command_notifier_receives_json` (command = list `[sys.executable, "-c", "import sys; open(sys.argv[1], 'w', encoding='utf-8').write(sys.stdin.read())", <file>]`; a title with non-ASCII text arrives intact); `test_emit_never_raises_on_http_error` (server down); `test_format_event_has_no_secrets` (event text with a token-like string is not added; only id/title/state/question); `test_no_getupdates_in_source` (read `notify.py` source; `"getUpdates"` absent except in a comment stating it is never called — assert not present in any string literal via `ast`); `test_notify_test_command` (a successful check sets `notify.telegram_enabled = true` in `artel.toml`); `test_error_event_text_has_no_traceback` (PD-38).
 
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement** (urllib only; `Request(..., method="POST", headers={"Content-Type": "application/json"})`). **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Notify: send-only Telegram, command notifier, notify test"`
@@ -2169,14 +2333,15 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
 
 **Spec:** §3.1 "Single writer" (human commands append to `requests`; the runner applies them on its next tick through the table; without a runner they wait; `resume` clears only manual and `base_conflict` pauses, `resume --force` clears any), §8 (answer, approve, reject, accept, rework, pause, resume, stop), §5 (`stop`, `stop --now`), §12 (stop file), PD-19, PD-26, PD-30.
 
-**Context for the writer:** Global Constraints + PD-19, PD-26, PD-30 + this task.
+**Context for the writer:** Global Constraints + PD-19, PD-26 (amended), PD-30, PD-35 + this task.
 
 **Files:**
 - Create: `artel/requests.py`, `tests/test_requests.py`
-- Modify: `artel/runner.py` (tick step 0: `requests.apply_pending(...)`; the `terminate_running` effect; stop requests)
+- Modify: `artel/runner.py` (tick step 0: `requests.apply_pending(...)`; the `terminate_running` effect; stop requests; stale stop file and stop requests cleared in `start`)
 
 **Interfaces:**
-- Consumes: `Board.add_request/pending_requests/finish_request` (T4); `transitions.apply` (T7); `stages.limits_for` (T13); `journal.append` (T6); `slots.task_branch_exists/apply_git_effects` (T10); `platform.FileLock` (T3, to tell whether a runner is running); `Runner` (T15).
+- Consumes: `Board.add_request/pending_requests/finish_request` (T4); `transitions.apply`, `Limits.from_cfg` (T7); `journal.append` (T6); `slots.task_branch_exists/apply_git_effects` (T10); `platform.FileLock` (T3, to tell whether a runner is running); `Runner` (T15).
+- argparse leaves `reject --reason` as `None`: the payload stores `args.reason or ""`.
 - Produces (`artel.requests`):
   ```python
   COMMANDS = ("answer", "approve", "reject", "accept", "rework", "pause", "resume", "stop")
@@ -2188,24 +2353,28 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
   def run_answer(args) -> int; def run_approve(args) -> int; def run_reject(args) -> int
   def run_accept(args) -> int; def run_rework(args) -> int; def run_pause(args) -> int
   def run_resume(args) -> int               # payload {"force": args.force}
-  def run_stop(args) -> int                 # payload {"now": args.now}; also writes repo.stop_path ("soft"/"now") (PD-26)
+  def run_stop(args) -> int                 # runner running → payload {"now": args.now}; also writes repo.stop_path
+                                            # ("soft"/"now") (PD-26); no runner → prints "no runner is running",
+                                            # enqueues nothing, writes no stop file, returns 0 (PD-26 amended)
   @dataclass(frozen=True)
   class Applied: request: Request; error: str | None; transition: Transition | None
   class RunnerHooks(Protocol):
       def terminate(self, task_id: int) -> None     # stop the task's job and wait for it (PD-30)
       def stop(self, now: bool) -> None
   def apply_pending(repo, board, cfg, hooks: RunnerHooks) -> list[Applied]
-      # in id order: answer → ANSWER entry (ref = latest ASK) + event "answer"; approve; reject →
-      # ANSWER "reject: <reason>" (PD-19) + hooks.terminate if running + event "reject" + git effects;
+      # in id order, every transitions.apply with Limits.from_cfg(task, cfg) and tip=repo.rev(task branch)
+      # (PD-35: answer/rework rows into fixing record fix_base): answer → ANSWER entry (ref = latest ASK) +
+      # event "answer"; approve; reject → ANSWER "reject: <reason>" (PD-19) + hooks.terminate if running +
+      # event "reject" + slots.apply_git_effects(repo, board, cfg, task_id, effects);
       # accept; rework → ANSWER "rework: <note>" + event "rework" with has_branch=task_branch_exists;
       # pause → meta pause_reason="manual"; resume → clears pause only if reason in {manual, base_conflict}
       # unless force (error text otherwise: "pause <reason> ends by itself; use resume --force");
       # stop → hooks.stop(now) and delete the stop file. TransitionError → finish_request(error=…).
   ```
-  Runner change: `tick()` starts with `requests.apply_pending(self.repo, self.board, self.cfg, self)` and also reads/clears the stop file (PD-26); `Runner.terminate(task_id)` sets the job's stop event, joins it, and clears `running` without a counter.
+  Runner change: `tick()` starts with `requests.apply_pending(self.repo, self.board, self.cfg, self)` and also reads/clears the stop file (PD-26); `Runner.start` (after taking the lock) deletes a stale stop file and finishes pending `stop` requests with error `stale: no runner` (PD-26 amended); `Runner.terminate(task_id)` sets the job's stop event, joins it, and clears `running` without a counter.
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_requests.py` on `E2ECase` from `tests/e2e.py`).
-  Full list: `test_commands_only_enqueue` (no runner: state unchanged, request pending, message says no runner); `test_runner_applies_on_next_tick`; `test_answer_writes_answer_entry_and_resumes` (blocked/write → writing, answered); `test_answer_reviewer_question_returns_to_review` (R25 through a request); `test_invalid_request_recorded_as_error` (answer on an open task → request error, state unchanged); `test_approve_rejected_by_vet_only`; `test_reject_while_running_terminates_first` (fake agent sleeping → reject → job terminated, pid dead, state rejected, branch deleted, attempts unchanged); `test_reject_reason_recorded` (PD-19); `test_rework_stuck_with_and_without_branch`; `test_accept_moves_to_verified_then_done`; `test_pause_manual_then_resume`; `test_resume_does_not_clear_limit_pause_without_force`; `test_stop_request_and_stop_file` (either one stops picking; `now` terminates and requeues without counting).
+  Full list: `test_commands_only_enqueue` (no runner: state unchanged, request pending, message says no runner); `test_runner_applies_on_next_tick`; `test_answer_writes_answer_entry_and_resumes` (blocked/write → writing, answered); `test_answer_reviewer_question_returns_to_review` (R25 through a request); `test_invalid_request_recorded_as_error` (answer on an open task → request error, state unchanged); `test_approve_rejected_by_vet_only`; `test_reject_while_running_terminates_first` (fake agent sleeping → reject → job terminated, pid dead, state rejected, branch deleted, attempts unchanged); `test_reject_reason_recorded` (PD-19); `test_rework_stuck_with_and_without_branch`; `test_accept_moves_to_verified_then_done`; `test_pause_manual_then_resume`; `test_resume_does_not_clear_limit_pause_without_force`; `test_stop_request_and_stop_file` (either one stops picking; `now` terminates and requeues without counting); `test_stop_without_runner_leaves_nothing` (no request, no stop file; a runner started afterwards keeps running); `test_stale_stop_file_cleared_at_start` (a stop file and a pending stop request left from before → the new runner does not exit; the request is finished with `stale: no runner`); `test_reject_without_reason_stores_empty_string`.
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_requests -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Requests: human steering through the single writer"`
 
@@ -2223,7 +2392,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
 - Create: `artel/cmd_human.py`, `tests/test_cmd_human.py`
 
 **Interfaces:**
-- Consumes: `Board` (T4), `journal` (T6), `load_config` (T5), `stages.limits_for/choose_model` (T13), `pick.waiting_reason` (T6), `platform.FileLock` (T3) for the runner-running check (Task 18 runs in parallel; do not import `requests`).
+- Consumes: `Board` (T4), `journal` (T6), `load_config` (T5), `transitions.Limits.from_cfg` (T7), `stages.choose_model` (T13), `pick.waiting_reason` (T6), `platform.FileLock` (T3) for the runner-running check (Task 18 runs in parallel; do not import `requests`). Meta values (`pause_until`, `limit:<type>`, `heavy_lock_stale`, `base_running`) are parsed in the formats pinned in Task 4.
 - Produces (`artel.cmd_human`):
   ```python
   def policy_summary(cfg) -> str
@@ -2304,13 +2473,13 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
 **Interfaces:**
 - Consumes: `stages.plan_stage/run_stage/finish_stage` (T13), `prompts.PromptInputs` (T12), `agent_claude.validate_result` with vet fields (T9), `transitions` rows R03–R08 (T7), `Runner` (T15), `requests` (T18, for `approve` in tests).
 - Produces:
-  - `stages.SUPPORTED_STAGES` gains `"vet"`; the runner (unchanged) then picks `proposed` tasks (`pick` → `vetting`) and runs them.
+  - `stages.SUPPORTED_STAGES` gains `"vet"`; the runner (unchanged: Task 15's tick applies R03 to proposed tasks once `vet` is supported) then picks `proposed` tasks (`pick` → `vetting`) and runs them.
   - `plan_stage` for `vet`: `prepare_detached`; `PromptInputs.open_tasks` = (id, state, title) of tasks in open, in-flight, awaiting states and the last 50 done tasks; `risk_signals` from config; reviewer profile; model `models.review` with reason "vet uses models.review".
   - `classify` for `vet`: invalid/fail/timeout → `stage_failed`; `ask` → `ask`; `findings` → `vet_inadequate`; `pass` and (`risky` or non-empty `risk_signals`) → `vet_risky`; `pass` → `vet_ok`.
   - `record_stage` for `vet`: VERDICT `"PASS vet (adequate, risky: quotas or money) …"` or `"FINDINGS vet (inadequate: <summary>)"`; `duplicate_of` recorded as a FACT entry `duplicate of #<id>`; for `vet_inadequate` the reason is in the VERDICT (approve stays possible, R08).
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_vet.py` on `E2ECase`; agent-added tasks are created with `transitions.create(board, "add_agent", …)`).
-  Full list: `test_proposed_is_picked_for_vetting_in_a_detached_slot` (slot HEAD == integration tip, no task branch); `test_adequate_non_risky_opens_with_default_autoapprove` (then written, reviewed, done); `test_adequate_with_autoapprove_none_awaits_approval_then_approve_opens`; `test_risky_goes_to_attack_then_awaiting_approval` (strong model on the attack; `then` cleared afterwards; show lists vet and attack summaries); `test_risky_with_autoapprove_all_opens_after_attack`; `test_inadequate_rejected_with_reason_and_approve_reopens`; `test_vet_fail_counts_and_sticks_then_rework_returns_to_vetting` (R06 then R30); `test_vet_ask_blocks_then_answer_returns_to_vetting` (R27); `test_vet_prompt_lists_open_tasks_and_risk_signals` (fake agent's recorded prompt); `test_vet_uses_reviewer_profile_and_review_model`.
+  Full list: `test_proposed_is_picked_for_vetting_in_a_detached_slot` (slot HEAD == integration tip, no task branch); `test_adequate_non_risky_opens_with_default_autoapprove` (then written, reviewed, done); `test_adequate_with_autoapprove_none_awaits_approval_then_approve_opens`; `test_risky_goes_to_attack_then_awaiting_approval` (strong model on the attack; `then` cleared afterwards; `risky` set; show lists vet and attack summaries; after approve, the review runs on `models.strong` with reason `task risky (vet)` — PD-37); `test_risky_with_autoapprove_all_opens_after_attack`; `test_inadequate_rejected_with_reason_and_approve_reopens`; `test_vet_fail_counts_and_sticks_then_rework_returns_to_vetting` (R06 then R30); `test_vet_ask_blocks_then_answer_returns_to_vetting` (R27); `test_vet_prompt_lists_open_tasks_and_risk_signals` (fake agent's recorded prompt); `test_vet_uses_reviewer_profile_and_review_model`.
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_vet -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Vet: adequacy and risk check for proposed tasks"`
 
@@ -2320,9 +2489,9 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
 
 ### Task 22: Runner — limits, disk guard, pauses, stop and signals, full reconcile, notifier wiring, log retention — **RISKY (strong-model review)**
 
-**Spec:** §5 (reconcile: terminate recorded process trees with start-time check, `worktree prune`, detach slots, requeue, `heavy_lock_check`; loop step 1 limits and disk; step 5 usage events; SIGINT/SIGTERM; `stop --now`; log retention), §3.1 (pause kinds and how they end; recorded processes carry their start time), §7 events, §12 (stop file, Ctrl+C/Ctrl+Break), §10 (pauses carry the setting), §13 (reconcile after a hard kill terminates orphans), PD-22, PD-26, PD-31.
+**Spec:** §5 (reconcile: terminate recorded process trees with start-time check, `worktree prune`, detach slots, requeue, `heavy_lock_check`; loop step 1 limits and disk; step 5 usage events; SIGINT/SIGTERM; `stop --now`; log retention), §3.1 (pause kinds and how they end; recorded processes carry their start time), §7 events, §12 (stop file, Ctrl+C/Ctrl+Break), §10 (pauses carry the setting), §13 (reconcile after a hard kill terminates orphans), PD-22, PD-26, PD-31, PD-34, PD-40.
 
-**Context for the writer:** Global Constraints + Spike facts + PD-22, PD-26, PD-31 + this task.
+**Context for the writer:** Global Constraints + Spike facts + PD-22, PD-26 (amended), PD-31, PD-34, PD-40 + this task.
 
 **Files:**
 - Modify: `artel/runner.py`
@@ -2334,13 +2503,16 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
   ```python
   class Runner:
       def reconcile(self) -> ReconcileReport
-          # for tasks with running=1: platform.terminate_tree(running_pid, running_group, kill_grace,
-          # running_fingerprint) — skipped when the start time no longer matches (pid reuse);
-          # board.clear_running (state unchanged); slots.reconcile_slots; commands.heavy_lock_check (if set)
-          # run once: exit 1 → warning printed and stored in meta "heavy_lock_stale"; never waits on the lock
+          # for tasks with running=1, and for meta base_running (PD-34): platform.terminate_tree(pid, group,
+          # kill_grace, fingerprint) — it never signals a reused pid, and sweeps a group/job whose leader is
+          # gone (T3); board.clear_running (state unchanged); meta base_running deleted;
+          # slots.reconcile_slots; commands.heavy_lock_check (if set) run once: exit 1 → warning printed and
+          # stored in meta "heavy_lock_stale" (format: Task 4); never waits on the lock
       def on_rate_limit(self, ev: RateLimit) -> None    # thread-safe (queued to the main thread):
-          # ev.rank >= status_rank(limit_stop) (PD-22) → pause_reason "limit", pause_until = resets_at,
-          # pause_detail "<limit_type> utilization <u> (limit_stop=<v>)", meta "limit:<type>", notify paused
+          # meta "limit:<type>" updated (JSON, Task 4) whenever limit_type is set;
+          # ev.rank >= status_rank(limit_stop) (PD-22) → pause_reason "limit", pause_until = resets_at
+          # (resets_at None, PD-40: the latest future resets_at in meta limit:*, else no pause_until),
+          # pause_detail "<limit_type> utilization <u> (limit_stop=<v>)", notify paused
       def update_pauses(self) -> None                   # called every tick before picking:
           # limit: lifts at pause_until (injected clock) → notify resumed;
           # disk: platform.free_bytes(common_dir) and of slots_dir below min_free_disk → pause "disk" +
@@ -2348,7 +2520,8 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
           # setup_failed: lifts when slots.setup_changed or after setup_retry (PD-31);
           # manual / base_conflict: only via requests (resume)
       def run_forever(self) -> int
-          # platform.install_stop_handlers(soft stop); stop file / stop requests (PD-26); exits when stopping
+          # stop = platform.install_stop_handlers() (the handler only counts signals, T3); every tick checks
+          # stop.requested() → request_stop(now=False); stop file / stop requests (PD-26); exits when stopping
           # and no jobs; notify runner_stopped; release lock; exit code 0
       def prune_logs(self) -> None   # keep logs of the newest log_keep_tasks tasks; only done/rejected pruned
   @dataclass(frozen=True)
@@ -2377,7 +2550,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
             r.shutdown()
 ```
 
-Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows the Job Object may already have killed the agent; the assertions hold either way); `test_reconcile_skips_reused_pid` (fingerprint mismatch → not signalled); `test_heavy_lock_check_reports_stale_lock`; `test_rate_limit_warning_pauses_new_picks_until_reset` (fake emits a rank-1 status with `resets_at = clock + 2`; running stage finishes; no new pick until the fake clock passes it; `paused` then `resumed` via a recording notify); `test_unknown_status_treated_as_warning` (PD-22); `test_rate_limit_rejected_requeues_without_counter`; `test_limit_stop_rejected_ignores_warning`; `test_disk_guard_pauses_and_auto_resumes` (patch `artel.platform.free_bytes`); `test_setup_pause_lifts_when_inputs_change`; `test_setup_pause_lifts_after_setup_retry` (fake clock); `test_stop_file_soft_waits_for_running_stage`; `test_stop_now_terminates_and_requeues`; `test_signal_soft_stop_and_runner_stopped_notification` (runner subprocess started with `**platform.popen_kwargs()` and `subprocess_env()`, then `platform.soft_terminate(proc.pid, platform.group_of(proc))`; exit code 0; a list-form command notifier receives `runner_stopped`); `test_stage_timeout_counts_attempt`; `test_branch_checked_out_elsewhere_skipped` (PD-8); `test_log_retention_keeps_last_n` (`log_keep_tasks = 2`); `test_base_conflict_pauses_and_notifies`; `test_run_command_wires_dispatcher`.
+Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows the Job Object may already have killed the agent; the assertions hold either way); `test_reconcile_skips_reused_pid` (fingerprint mismatch → not signalled); `test_heavy_lock_check_reports_stale_lock`; `test_rate_limit_warning_pauses_new_picks_until_reset` (fake emits a rank-1 status with `resets_at = clock + 2`; running stage finishes; no new pick until the fake clock passes it; `paused` then `resumed` via a recording notify); `test_unknown_status_treated_as_warning` (PD-22); `test_rate_limit_rejected_requeues_without_counter`; `test_limit_stop_rejected_ignores_warning`; `test_disk_guard_pauses_and_auto_resumes` (patch `artel.platform.free_bytes`); `test_setup_pause_lifts_when_inputs_change`; `test_setup_pause_lifts_after_setup_retry` (fake clock); `test_stop_file_soft_waits_for_running_stage`; `test_stop_now_terminates_and_requeues`; `test_signal_soft_stop_and_runner_stopped_notification` (runner subprocess started with `**platform.popen_kwargs()` and `subprocess_env()`, then `platform.soft_terminate(proc.pid, platform.group_of(proc))`; exit code 0; a list-form command notifier receives `runner_stopped`); `test_stage_timeout_counts_attempt`; `test_log_retention_keeps_last_n` (`log_keep_tasks = 2`); `test_base_conflict_pauses_and_notifies`; `test_setup_failed_pause_notifies` (§3.1: `paused` with the setup detail); `test_reconcile_terminates_orphaned_base_job` (meta `base_running` of a killed runner → its tree terminated, key deleted — PD-34); `test_limit_error_result_pauses_without_reset_time` (fake `result_error: 429` → requeue without counter, pause `limit` with no `pause_until`, `paused` text names `resume --force`; with a future `limit:five_hour` in meta → paused until it — PD-40); `test_rate_limit_meta_is_json` (Task 4 format); `test_second_signal_still_soft` (two soft signals → still waits for the running stage; the handler never prints). (PD-8 "branch checked out elsewhere" is tested in Task 15, which implements it.)
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_runner_ops -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** three times — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Runner: limits, disk guard, pauses, stop, reconcile, notifications"`
 
@@ -2450,7 +2623,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 - Produces: no new interfaces.
 
 - [ ] **Step 1: Write the tests** (all on `E2ECase`, `poll_interval = "100ms"`, injected clock where time matters, `subprocess_env()` for any `python -m artel` child).
-  Full list: `test_review_fix_closure_loop_then_done`; `test_review_cap_blocks_then_answer_adds_round_and_finishes` (R22b → R26 via a request); `test_reviewer_question_answer_returns_to_review` (R18 → R25); `test_verify_red_fix_loop_with_cap_blocks` (R33 ×2 → R34a); `test_verify_conflict_fix_resolves_markers_then_closure_review_then_done` (R32 → R16 → closure template → R21 → done); `test_merge_ask_waits_then_accept_after_integration_moved_reverifies` (R31b → R35 → R37 → done); `test_writer_fail_twice_goes_stuck_then_rework_rewrites` (R17 ×2 → stuck_from writing → R30); `test_resume_after_ask_keeps_branch_commits`; `test_slot_reuse_across_tasks_leaves_slots_clean`; `test_branch_held_by_human_worktree_is_skipped_then_picked_after_release`; `test_agent_proposed_task_vetted_and_finished` (agent `artel add` from inside a writer stage → proposed → vetting → open → done); `test_risky_proposal_waits_for_approve`; `test_reject_running_task_from_another_process` (`artel reject` CLI subprocess while the writer runs); `test_two_tasks_parallel_overlapping_areas_serialized`; `test_base_moved_during_run_merged_and_verified`.
+  Full list: `test_review_fix_closure_loop_then_done`; `test_review_cap_blocks_then_answer_adds_round_and_finishes` (R22b → R26 via a request); `test_reviewer_question_answer_returns_to_review` (R18 → R25); `test_verify_red_fix_loop_with_cap_blocks` (R33 ×2 → R34a); `test_verify_conflict_fix_resolves_markers_then_closure_review_then_done` (R32 → R16 → closure template → R21 → done); `test_merge_ask_waits_then_accept_after_integration_moved_reverifies` (R31b → R35 → R37 → R31a because `accepted` (PD-36) → done, no second `awaiting_accept`); `test_writer_fail_twice_goes_stuck_then_rework_rewrites` (R17 ×2 → stuck_from writing → R30); `test_resume_after_ask_keeps_branch_commits`; `test_slot_reuse_across_tasks_leaves_slots_clean`; `test_branch_held_by_human_worktree_is_skipped_then_picked_after_release`; `test_agent_proposed_task_vetted_and_finished` (agent `artel add` from inside a writer stage → proposed → vetting → open → done); `test_risky_proposal_waits_for_approve`; `test_reject_running_task_from_another_process` (`artel reject` CLI subprocess while the writer runs); `test_two_tasks_parallel_overlapping_areas_serialized`; `test_base_moved_during_run_merged_and_verified`.
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_runner_e2e -v`; fix what fails (smallest change, in the module that owns the behavior); re-run.
 - [ ] **Step 3: Whole suite** three times — PASS; CI matrix green once pushed.
 - [ ] **Step 4: Commit** — `git commit -m "Runner e2e: review, verify, conflict, accept, stuck and vetting loops"`
@@ -2486,7 +2659,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 
 **Spec:** §4 "Session rotation (writers only)" (writer_max_context unset by default), §9 `[rotation]`, §10 (every continuation/rotation recorded with its reason, shown by `artel show`), Task 25's findings.
 
-**Skip this task** if Task 25 concluded "resume usable for rotation: no". It is self-contained: its table and logic are added here (the settings exist from Task 5), so v0.1 without it is fresh-only and complete.
+**Skip this task** if Task 25 concluded "resume usable for rotation: no" (on the board: `python3 dev/board.py done 26 --note skipped`). It is self-contained: its table and logic are added here (the settings exist from Task 5), so v0.1 without it is fresh-only and complete.
 
 **Context for the writer:** Global Constraints + PD-6 + this task.
 
@@ -2539,6 +2712,10 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 
 **Spec:** §11 (all eight sections, reviewed like code), §10 (defaults visible), §6 (safety statements that the README must make), §7 (what Telegram sends), §12 (install per platform, Windows needs Git for Windows, `core.longpaths`, list-form commands), §14a.
 
+**Depends on:** Task 24
+
+(Task 26 may be skipped, so this task depends on the last task that always runs; the README describes rotation only if Task 26 is done.)
+
 **Context for the writer:** Global Constraints + this task.
 
 **Files:**
@@ -2549,13 +2726,57 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 - Consumes: `config_schema.SETTINGS`, `defaults_markdown()`.
 - Produces: `README.md` with exactly these `##` headings in order: `What artel is`, `How it works`, `Quick start`, `Defaults`, `Steering`, `Cost and quota`, `Safety`, `Troubleshooting`. The defaults table sits between `<!-- defaults:start -->` and `<!-- defaults:end -->` and is byte-identical to `python3 -m artel.config_schema --markdown`. Table columns: `Setting | Default | Controls | Quota cost | Change with` (last column: `artel.toml [table] key`, `artel config set <key> <value>`, plus the CLI flag where one exists: `-n` for `max_agents`, `--review N`, `--merge`, `--strong`, `--attack` per task).
 
-Content requirements per section (§11): (1) three sentences + "when not to use it" (single-shot edits, repos where agents may not run project scripts); (2) one ASCII diagram: `open → [attack] → write → review ⇄ fix → verify (merged tree) → integrate → done`, with blocked/stuck/awaiting_accept branches and the runner/slots; (3) install, `artel init` questions (agents, review model, rotation, auto-approval, verify) and `--yes`, (`pipx install artel-agents` / `uv tool install artel-agents`, or `python artel.pyz` from a release; on Windows: Git for Windows required, `git config core.longpaths true`), `artel init` including the Telegram check, `artel add`, `artel run`, reading `artel status` and `artel show`; (5) one example command and its effect for answer, accept, rework, reject, approve, pause, stop; (6) default cost: 1 writer + up to 2 reviewers + up to 2 fixes (+1 attacker with `--attack`), escalation rules, vetting of agent-proposed tasks (one `vet` run each; risky ones add a strong-model attack), writer session rotation (`[rotation]`: fixes resume the writer by default, reviewers always fresh — only if Task 26 shipped), how to measure before tuning (`artel stats`), limit pause behavior with `limit_stop`; (7) permission model per stage (explicit `--permission-mode`; why: `-p` inherits the user's `defaultMode`), never `bypassPermissions`, the notice is best effort against `CLAUDE.md` (spike Q7 open), allowing `npm run *` lets agents run code they edited, `CLAUDE.md` approval rules vs the unattended notice, what Telegram sends (task id, title, state, question — no secrets, no file contents), send-only bot; (8) stuck tasks (`show`, `rework`), stale heavy lock (`heavy_lock_check`), disk guard (`min_free_disk`), second runner error, reading logs (`artel logs`, log location), base conflict (`resume` after resolving on `artel/integration`), Windows specifics (Git Bash not found → `shell` / `CLAUDE_CODE_GIT_BASH_PATH`; string commands vs list form; long paths).
+Content requirements per section (§11): (1) three sentences + "when not to use it" (single-shot edits, repos where agents may not run project scripts); (2) one ASCII diagram: `open → [attack] → write → review ⇄ fix → verify (merged tree) → integrate → done`, with blocked/stuck/awaiting_accept branches and the runner/slots; (3) install, `artel init` questions (agents, review model, rotation, auto-approval, verify) and `--yes`, (`pipx install artel-agents` / `uv tool install artel-agents`, or `python artel.pyz` from a release; on Windows: Git for Windows required, `git config core.longpaths true`), `artel init` including the Telegram check, `artel add`, `artel run`, reading `artel status` and `artel show`; (5) one example command and its effect for answer, accept, rework, reject, approve, pause, stop; (6) default cost, with the arithmetic named: `review_rounds = 2` means at most 2 reviews and so at most 1 review fix (review fixes ≤ `review_rounds` − 1); verify fixes ≤ `max_verify_fixes` (2); so one task costs 1 writer + ≤ 2 reviewers + ≤ 1 review fix + ≤ 2 verify fixes (+1 attacker with `--attack`), each failed stage retried up to `max_attempts`; spec §11.6 says "up to 2 fixes" — see Spec gaps; escalation rules, vetting of agent-proposed tasks (one `vet` run each; risky ones add a strong-model attack), writer session rotation (`[rotation]`: fixes resume the writer by default, reviewers always fresh — only if Task 26 shipped), how to measure before tuning (`artel stats`), limit pause behavior with `limit_stop`; (7) permission model per stage (explicit `--permission-mode`; why: `-p` inherits the user's `defaultMode`), never `bypassPermissions`, the notice is best effort against `CLAUDE.md` (spike Q7 open), allowing `npm run *` lets agents run code they edited, `CLAUDE.md` approval rules vs the unattended notice, what Telegram sends (task id, title, state, question — no secrets, no file contents), send-only bot; (8) stuck tasks (`show`, `rework`), stale heavy lock (`heavy_lock_check`), disk guard (`min_free_disk`), second runner error, reading logs (`artel logs`, log location), base conflict (`resume` after resolving on `artel/integration`), Windows specifics (Git Bash not found → `shell` / `CLAUDE_CODE_GIT_BASH_PATH`; string commands vs list form; long paths).
 
 - [ ] **Step 1: Write the failing tests.** Full list: `test_sections_in_order`; `test_defaults_table_matches_generator` (extract between markers, compare with `defaults_markdown()`); `test_every_setting_in_table`; `test_safety_mentions_required_points` (substrings: `bypassPermissions`, `npm run`, `CLAUDE.md`, `getUpdates` or "send-only"); `test_quick_start_commands_exist` (every `artel <cmd>` in fenced code blocks is a key of `cli.COMMANDS`); `test_no_out_of_scope_features_documented` (`propose_minors`, `done_digest`, `integration = "base"` absent).
 - [ ] **Step 2: Run** — FAIL. **Step 3: Write the README**; generate the table with `python3 -m artel.config_schema --markdown`. **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** (docs commit, separate from code) — `git commit -m "README: user guide with generated defaults table"`
 
 **Acceptance:** a new user can go from install to a first finished task by following Quick start; the defaults table cannot drift (test).
+
+---
+
+### Task 28: T2 follow-up — CI child-process encoding check, lint gaps, pyz smoke, T1 test gaps
+
+**Spec:** §12 (UTF-8 on every `open` and `subprocess` call, never the locale default; OS-specific code in one module; `artel.pyz`; CI matrix), §13 (whole suite on every OS), §8 (command surface — T1 tests), Global Constraints (portability lint, portable tests). Source: controller review T2-1 (all majors, minors 3–7). Runs after Task 3 in wave 2 because both modify `tests/test_portability_lint.py`.
+
+**Context for the writer:** Global Constraints + this task. Every test added here names, in its docstring, the mutation of production code (or CI config) it catches.
+
+**Files:**
+- Modify: `.github/workflows/ci.yml` (job-level encoding env; richer pyz smoke)
+- Modify: `tests/test_portability_lint.py` (rule gaps; lint `tools/` too; Task 3 already exempted `tests/test_platform.py` from the `os.name`/`sys.platform` rule)
+- Create: `tests/test_ci_env.py`
+- Modify: `tests/test_zipapp.py`, `tools/build_pyz.py`
+- Modify: `artel/gitutil.py`, `tests/test_gitutil.py`, `tests/test_cli.py`
+
+**Interfaces:**
+- Consumes: T1 (`cli`, `gitutil`, `errors`), T2 (`lint_source`, `lint_tree`, `build`), T3 (`artel.platform` exists; the lint keeps it the only OS module).
+- Produces / changes:
+  - `.github/workflows/ci.yml`: the `test` job gets a job-level `env:` with `PYTHONWARNDEFAULTENCODING: "1"` and `PYTHONWARNINGS: "error::EncodingWarning"`, so every Python child a test starts (e.g. `python -m artel run` in e2e tests) also turns a missing `encoding=` into an error — today only the test process gets `-X warn_default_encoding -W error::EncodingWarning`. The smoke step becomes: build; `python dist/artel.pyz --version`; `python dist/artel.pyz status` and `python -m artel status` run in a directory outside any git repository, each must exit 1 or 3 with stderr starting `artel` and no `Traceback` (stable across waves: 3 while `status` is not built, 1 "not inside a git repository" after Task 19).
+  - `tests/helpers.subprocess_env()` is unchanged: it copies `os.environ`, so the two variables reach children; a test guards that.
+  - `tests/test_portability_lint.py` new rules (same `"<file>:<line>: <rule>"` messages):
+    1. `os.kill` outside `artel/platform.py` (on Windows `os.kill(pid, 0)` terminates the process);
+    2. a method call `<expr>.open(...)` with no arguments, or whose first positional / `mode=` argument is a string constant made only of mode letters (`rwxabt+`) without `b`, and no `encoding=` (`Path.open("w")`); `zf.open("name")`-style calls with a non-mode first argument are not flagged;
+    3. `subprocess.run/Popen/check_output/check_call` with `errors=` but no `encoding=` (`errors=` switches to text mode with the locale encoding);
+    4. `from`-imports that bypass the attribute rules: `from os import <any of kill, killpg, setsid, getpgid, fork, chmod, symlink, name>`, `from sys import platform`, `from subprocess import <run, Popen, check_output, check_call>` (use `subprocess.<f>` so rule 2 of Task 2 applies), and in `artel/` `from tempfile import <anything>`;
+    5. the stdlib `platform` module (`import platform`, `from platform import …`) outside `artel/platform.py` — artel code uses `from artel import platform`;
+    6. aliases: `import os as o` / `import sys as s` / `import subprocess as sp` / `import tempfile as t` are resolved, so `o.killpg`, `s.platform`, `sp.run(text=True)` and `t.mkdtemp()` are caught like the unaliased forms;
+    7. `lint_tree` also walks `tools/` (as non-test code).
+  - `tools/build_pyz.py`: `build(out, staging)` writes a marker file `.artel-pyz-staging` into the staging directory it creates and only ever deletes a staging directory that contains that marker; an existing non-empty directory without the marker → `SystemExit` with exit 2 and a message naming it (`--staging .` can no longer delete the checkout); an empty one is reused. Defaults: `--out` = `<repo root>/dist/artel.pyz`, `--staging` = `<repo root>/build/pyz-staging`; relative values are resolved against the repo root, not the current directory.
+  - `artel/gitutil.py`: when the `git` executable is missing (`FileNotFoundError` from `subprocess.run`), `Repo.discover` and `Repo.git` raise `ArtelError("git not found on PATH")` instead of "not inside a git repository" / a leaked `FileNotFoundError`.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `tests/test_ci_env.py`: `test_ci_workflow_sets_encoding_env_for_children` (reads `.github/workflows/ci.yml` as text; the `test` job has an `env:` block containing both variables — catches deleting the job env); `test_child_open_without_encoding_fails` (`skipUnless` both variables are set in `os.environ`; a child `py_cmd` doing `open(<tmp file>, "w")` with `subprocess_env()` exits non-zero with `EncodingWarning` in stderr — catches `subprocess_env` dropping the variables); `test_subprocess_env_keeps_encoding_vars` (with the variables patched into `os.environ`, `subprocess_env()` returns them — runs everywhere).
+  - `tests/test_portability_lint.py` (`LintRulesTest`): `test_os_kill_only_in_platform`; `test_path_open_text_without_encoding` (`p.open()`, `p.open("w")`, `p.open(mode="r")` flagged; `p.open("rb")`, `p.open("w", encoding="utf-8")`, `zf.open("name")` not); `test_subprocess_errors_without_encoding`; `test_from_imports_bypass` (each listed `from` form flagged; `from os import path` not); `test_stdlib_platform_module` (`import platform` in `artel/x.py` flagged; `from artel import platform` not; `artel/platform.py` itself exempt); `test_aliases_resolved` (`import os as o; o.killpg(1, 9)`, `import sys as s; s.platform`, `import subprocess as sp; sp.run([], text=True)` flagged); `test_tempfile_from_import_in_artel` (flagged in `artel/`, allowed in `tests/`); `test_sys_platform_allowed_in_test_platform_skips` (a `skipUnless(sys.platform == "darwin", …)` in `tests/test_platform.py` is clean — keeps Task 3's exemption); `TreeTest.test_tools_are_linted` (`lint_tree` reports a seeded violation in a temporary `tools/x.py` under a copied tree root — catches dropping `tools/`). Each test seeds the snippet and asserts the exact rule text, so removing the rule fails it.
+  - `tests/test_zipapp.py`: `test_pyz_has_shebang_and_no_pycache` (first line `#!/usr/bin/env python3`; `zipfile.ZipFile(pyz).namelist()` has no `__pycache__` / `.pyc` entry — catches dropping the ignore patterns); `test_pyz_dispatches_a_command` (`[sys.executable, pyz, "status"]` in a temp dir outside any repository → exit 1 or 3, stderr starts with `artel`, no `Traceback` — catches a `__main__.py` that never reaches `cli.main`'s error handling); `test_build_refuses_foreign_nonempty_staging` (a staging dir with an unrelated file → exit 2, the file still exists — catches an unconditional `rmtree`); `test_build_reuses_own_staging` (two builds into the same staging succeed); `test_relative_out_is_under_repo_root` (call `main(["--out", "dist/x.pyz"])` with `cwd` elsewhere → the file appears under the repo root; clean it up).
+  - `tests/test_gitutil.py`: `test_paths_under_artel_dir` (`artel_dir == common_dir / "artel"`, `lock_path`, `logs_dir`, `board_path`, `stop_path`, `tmp_dir` exact values); `test_git_passes_cwd_input_env` (`git("hash-object", "--stdin", input="x")` equals the known sha; `cwd=` a linked worktree reports that worktree's HEAD; `env=` with `GIT_AUTHOR_NAME` changes a commit's author); `test_rev_peels_to_commit` (an annotated tag → the commit sha; a tree sha → None); `test_git_missing_raises_artel_error` (`mock.patch("subprocess.run", side_effect=FileNotFoundError)` → `discover` and `Repo.git` raise `ArtelError` with "git not found on PATH").
+  - `tests/test_cli.py`: split the merged `test_simple_commands` into the six plan-named tests `test_run_n`, `test_stop_now`, `test_resume_force`, `test_init_yes`, `test_stats_json`, `test_notify_test`; add `test_init_force`, `test_status_json`, `test_ids_are_int` (`show x`, `logs x`, `approve x`, `accept x` → exit 2); `test_broken_handler_import_is_not_hidden` (a temporary module on `sys.path`, set as a `COMMANDS` target, imports a missing module → `cli.main` lets the `ModuleNotFoundError` propagate instead of returning 3 "not available"; a missing target module itself still returns 3 — catches `_resolve` swallowing every `ModuleNotFoundError`); `test_output_survives_legacy_console_encoding` (child `python -m artel note FACT "привет ✓"` with `subprocess_env(PYTHONIOENCODING="cp1252")` → no `UnicodeEncodeError` in stderr — catches removing the `reconfigure` loop).
+- [ ] **Step 2: Run** `python3 -m unittest tests.test_ci_env tests.test_portability_lint tests.test_zipapp tests.test_gitutil tests.test_cli -v` — the new tests FAIL (or skip, for the env-dependent one).
+- [ ] **Step 3: Implement** the lint rules (keep one AST walk; an alias map built from `Import`/`ImportFrom` nodes first), the workflow change, `build_pyz.py` safety and defaults, and the `gitutil` error; fix any new lint finding in `artel/`, `tests/`, `tools/` (no exemptions beyond those listed).
+- [ ] **Step 4: Whole suite** — PASS locally, also with `PYTHONWARNDEFAULTENCODING=1 PYTHONWARNINGS=error::EncodingWarning python3 -m unittest discover -s tests -t . -v`. If a stdlib module (not artel) raises `EncodingWarning` in a child, narrow `PYTHONWARNINGS` with a module filter and say so in the commit message.
+- [ ] **Step 5: Commit** — `T28: CI child encoding env, lint gaps, pyz smoke, T1 test gaps`
+
+**Acceptance:** every rule and test listed above exists and fails on its seeded mutation; the lint is green on `artel/`, `tests/` and `tools/`; `--staging .` cannot delete files; CI green on all six jobs once pushed (link in the report), with the child-encoding test actually running (not skipped) there.
 
 ---
 
@@ -2582,7 +2803,7 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 
 | Spec | Tasks |
 |---|---|
-| §1–§2 | goals 7–8 → T1, T2, T3 |
+| §1–§2 | goals 7–8 → T1, T2, T3, T28 |
 | §3 concepts | T1 (paths), T4 (board), T6 (area), T10 (slots) |
 | §3.1 table | T7 (rows); T13, T14, T15, T18, T21, T22 (events); single writer T18; slots without a branch T10/T13; leaving a slot T10; recorded processes T3/T22; empty verify T14/T19/T23; base conflict T14/T22 |
 | §3.2 journal | T6 |
@@ -2598,7 +2819,7 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 | §9 config | T5 |
 | §10 visibility | T5, T11, T13, T19, T23 |
 | §11 README | T27 |
-| §12 platforms | T2, T3, T8, T11, T18, T22, T23, Global Constraints |
+| §12 platforms | T2, T3, T8, T11, T18, T22, T23, T28, Global Constraints |
 | §13 testing | every task; T7 rows; T9 fake agent; T15/T22 lock and reconcile; T17 Telegram; T24 loops |
 | §14 roadmap, §14a scope | Global Constraints (out of scope) |
 | §15 spike | "Spike facts"; T9; T16 (live slice); T25 (Q8) |
@@ -2607,16 +2828,16 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 
 1. Reject: the §3.1 row lists seven source states, but says "a running stage is terminated first" and the commit says "reject anywhere"; the plan allows every live state (R09) — confirm.
 2. `setup_failed` pause "ends by itself" with no stated condition: plan lifts it when the setup hash changes or after a new setting `setup_retry` (PD-31).
-3. Answer after a conflict cap goes to `fix_kind=verify` per the table, so no merge is left in progress; the next verify conflicts again and costs one more run.
+3. Answer after a conflict cap goes to `fix_kind=verify` per the table, so no merge is left in progress; the next verify conflicts again and costs one more run. The conflict-at-cap row itself (R34b) is PD-39.
 4. Fields the table needs but §3.1 does not name: `stuck_from` (where a branchless rework returns; writer-stuck after a reset returns to `writing`, PD-28) and `review_closure` (closure review after a conflict fix, PD-29).
 5. Vet result fields (`risky`, `risk_signals`, `duplicate_of`) and which tasks count as "open or done" for duplicates are not specified (PD-27).
 6. Unclosed earlier findings with a `pass` review (PD-3); non-blocker findings in closure rounds (PD-4); attack findings vs closure (PD-5).
-7. Area holding and prefix rule (PD-6); priority direction (PD-7); branch checked out elsewhere (PD-8); `artel heavy` with an unlisted command (PD-9); integration branch checked out by a human (PD-13); runner merge identity (PD-16).
+7. Area holding and prefix rule (PD-6, amended: answered/due tasks also wait for overlapping running tasks); priority direction (PD-7); branch checked out elsewhere (PD-8); `artel heavy` with an unlisted command (PD-9); integration branch checked out by a human (PD-13); runner merge identity (PD-16).
 8. Settings §10/§12 require but §9 lacks: profiles, `shell`, `poll_interval`, `setup_retry`, `templates_dir`, `agent_command`, Telegram file/base-URL/enabled keys (PD-10).
-9. Rate-limit statuses other than `allowed` are unobserved (PD-22); §5 "store usage from the final result" is a sum over calls (PD-23); `permission_denials` has no place in the spec (PD-24).
+9. Rate-limit statuses other than `allowed` are unobserved (PD-22); a limit hit may arrive only as an error result (PD-40, assumes `api_error_status` 429); §5 "store usage from the final result" is a sum over calls, partial usage deduplicated by `message.id` (PD-23); `permission_denials` has no place in the spec (PD-24).
 10. String-form `heavy_lock` prefix and `pwsh`/`cmd` shells (PD-25).
-11. `artel stop`: request (single writer) and stop file (§12) both exist; plan writes both (PD-26).
-12. Windows: inline JSON through `claude.cmd` is untested (T9 test will show it); a Job Object is assigned just after spawn (tiny race); `CTRL_BREAK_EVENT` needs a shared console; the spike ran on Linux only.
+11. `artel stop`: request (single writer) and stop file (§12) both exist; plan writes both when a runner runs and nothing when none does (PD-26, amended).
+12. Windows: a `.cmd` agent command is unwrapped to the program it runs so inline JSON never passes cmd.exe (PD-41); `.cmd` launchers carry a code-page preamble, an exception to "UTF-8 everywhere" (PD-33); a Job Object is assigned just after spawn (tiny race); `CTRL_BREAK_EVENT` needs a shared console; the spike ran on Linux only.
 13. Release: GitHub release assets only; PyPI publishing (for `pipx install artel-agents`) needs owner setup.
 14. Rotation: §9 says "review fixes" resume, §4 says any `fix`; "same area" undefined (plan: overlap); session after a branch reset (plan: retired); defaults assume Q8 succeeds.
 15. `artel stats` "continued vs fresh" comparison has no formula; v0.1 prints medians/p90 only.
@@ -2624,3 +2845,17 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 17. `artel logs --stage` in §8 vs "log filters" out of scope in §14a (plan: no `--stage`).
 18. Pauses and human notes have no journal kind (PD-19); §10 says pauses are explained in the journal — plan records them in board meta and status.
 19. A task whose `--after` dependency is rejected waits forever; the minimum Claude Code version is not checked at runtime.
+20. Controller amendments of 2026-10-20 (owner to confirm): PD-6, PD-22, PD-23, PD-26 amended; new PD-33 (`.cmd` code page), PD-34 (base job without a task), PD-35 ("new commits" reference), PD-36 (`accepted` flag ends the accept loop of §3.1 rows 118/122/124), PD-37 (risky tasks reviewed on the strong model), PD-38 (`error` notification event; `notify.on` default gains it — §9 lists no such event), PD-39 (conflict at cap), PD-40 (limit hit in the result), PD-41 (`.cmd` agent command), PD-42 (unknown closure ids), PD-43 (conflict fix skips setup), PD-44 (string `agent_command` never split).
+21. §11.6 says a task costs "up to 2 fixes"; with the defaults it is ≤ 1 review fix (`review_rounds` − 1) plus ≤ 2 verify fixes. Recommended: reword §11.6 to that arithmetic (Task 27 already writes it so).
+22. `[rotation]` settings exist from Task 5 even if Task 26 is skipped. Recommended: keep them, with `explain` saying they take effect only when rotation is built (Task 5 does so); remove them in a later plan change only if the owner prefers.
+
+Spec-level questions from the independent spec attack (`<git-common-dir>/artel-dev/reviews/spec-1.md`; not implemented in any task until the owner decides):
+
+23. **Protected paths.** The branch under review can change what reviews and verifies it (`.claude/settings.json`, `CLAUDE.md`, hooks, `package.json` scripts, CI config). Recommended: a `protected_paths` setting (default `.claude/`, `CLAUDE.md`, `artel.toml`, `.artel/`, hook dirs, CI config, the verify entry points); a diff touching one → `merge = ask` and a strong-model review; reviewers and verify read protected files from the integration tip; the README states that tool profiles stop accidents, not a hostile agent.
+24. **Verify-fix review.** `fixing (verify)` → `verifying` has no review, so a writer can weaken a flaky test and auto-merge. Recommended: a closure review after every verify fix; rerun a red verify once before blaming the task; a fix that only touches tests → `merge = ask`.
+25. **`autoapprove` default.** Agent-proposed tasks run unattended by default (`non_risky`). Recommended: default `"none"` in v0.1, plus a cap on proposals per task.
+26. **`fix_resumes_writer` default.** `true` rests on the open spike Q8. Recommended: default `false` until Task 25 shows resume works.
+27. **Success metrics.** Nothing measures whether artel pays off. Recommended: `artel stats` reports merged tasks per % of weekly quota and human minutes per task; a per-task summary for the human merge; `artel revert ID`.
+28. **Acceptance criteria.** Tasks have none, and reviewers fed the writer's notes share its framing. Recommended: `artel add --accept CRITERIA` stored on the task and given to every stage; round-1 reviewers do not get the writer's notes.
+29. **v0.1 scope.** Recommended cuts: vetting/proposals/autoapprove, rotation/resume, the `stats` counterfactual, `config set`; recommended additions: protected paths, verify-fix review, utilization pause + per-task budget, acceptance criteria, revert. Decide before wave 8 (Tasks 21–23), which is where most of the cut work sits.
+30. Other spec-attack items for the owner (details in spec-1.md): empty area serializes everything and the diff is never checked against the area; pausing on utilization thresholds (0.8 five-hour / 0.6 weekly) and a per-task cost cap; sticky permission denials (init derives `project_tools` from `verify`; denials become reviewer findings); and its minor list (WIP commit on ask, one attempts counter, notify events for awaiting_accept/approval, unfiltered agent questions to Telegram, logs containing `.env`).
