@@ -298,7 +298,9 @@ def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None =
         # POSIX: a pgid cannot be reused while the group has members, so the group is still ours.
         # Windows: the job object outlives the leader.
         if IS_WINDOWS:
-            return _close_job(pid, terminate=True)
+            alive = tree_alive(pid, group)
+            _close_job(pid, terminate=alive)   # always release the handle
+            return alive
         if not tree_alive(pid, group):
             return False
     soft_terminate(pid, group)
