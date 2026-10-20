@@ -121,12 +121,21 @@ def guard(repo: Repo, board, cfg, n: int) -> Path:
         raise SlotGuardError(f"{expected} is not the top level of a git worktree")
     if common != repo.common_dir.resolve():
         raise SlotGuardError(f"{expected} belongs to another repository")
-    if git_dir == common or not _inside(git_dir, common):
+    if git_dir.parent != common / "worktrees":
         raise SlotGuardError(f"{expected} is not a linked worktree of this repository")
+    try:   # the admin directory must belong to THIS directory: a copied or re-pointed .git file names another one
+        owner = Path((git_dir / "gitdir").read_text(encoding="utf-8").strip())
+        if not owner.is_absolute():
+            owner = git_dir / owner
+    except OSError:
+        raise SlotGuardError(f"{expected}: the worktree administration data is unreadable") from None
+    if owner.resolve() != (expected / ".git").resolve():
+        raise SlotGuardError(f"{expected} uses the worktree data of {owner.parent}")
     return expected
 
 
-_STATE_PATHS = ("rebase-merge", "rebase-apply", "BISECT_LOG", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_HEAD")
+_STATE_PATHS = ("rebase-merge", "rebase-apply", "BISECT_LOG", "CHERRY_PICK_HEAD", "REVERT_HEAD", "MERGE_HEAD",
+                "index.lock")
 
 
 def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
@@ -134,6 +143,13 @@ def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
     asked = _git(repo, "rev-parse", "--path-format=absolute", *[a for name in _STATE_PATHS
                                                                for a in ("--git-path", name)], cwd=path)
     state = {name: Path(line).exists() for name, line in zip(_STATE_PATHS, asked.stdout.splitlines())}
+    if state["index.lock"]:   # a writer killed during `git add`/`git commit` leaves it; no process of the slot is alive
+        for name, line in zip(_STATE_PATHS, asked.stdout.splitlines()):
+            if name == "index.lock":
+                try:
+                    Path(line).unlink()
+                except OSError:
+                    pass
     if state["rebase-merge"] or state["rebase-apply"]:   # a writer killed mid-rebase or mid-am wedges the slot
         _git(repo, "rebase", "--abort", cwd=path, check=False)
         _git(repo, "am", "--abort", cwd=path, check=False)

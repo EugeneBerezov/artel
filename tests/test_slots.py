@@ -347,6 +347,44 @@ class HardeningTest(SlotsCase):
                 call()
         self.assertEqual((path / "theirs.txt").read_text(encoding="utf-8"), "keep")
 
+    def test_guard_refuses_a_copied_slot_directory(self):
+        # catches: checking only that the git dir lies in this repository, not that it belongs to this directory
+        import shutil
+        self.slot(2)
+        one, two = (slots.slot_path(self.repo, self.cfg, n) for n in (1, 2))
+        shutil.rmtree(two)
+        shutil.copytree(one, two)   # its .git file still names slot 1's administration directory
+        with self.assertRaises(slots.SlotGuardError):
+            slots.guard(self.repo, self.board, self.cfg, 2)
+        slots.prepare_slot(self.repo, self.board, self.cfg, 1, 5)
+        with self.assertRaises(slots.SlotGuardError):
+            slots.prepare_slot(self.repo, self.board, self.cfg, 2, 7)
+        self.assertEqual(self.branch_of(one), "artel/5")   # slot 1 was not moved to another branch
+
+    def test_guard_refuses_a_git_file_pointing_at_a_users_worktree(self):
+        self.slot(1)
+        user = self.tmp / "userwork"
+        git(self.repo_path, "worktree", "add", "-q", "-b", "user", str(user))
+        (user / "wip.txt").write_text("precious", encoding="utf-8")
+        admin = git(user, "rev-parse", "--path-format=absolute", "--git-dir")
+        slot = slots.slot_path(self.repo, self.cfg, 1)
+        (slot / ".git").write_text(f"gitdir: {admin}\n", encoding="utf-8", newline="\n")
+        with self.assertRaises(slots.SlotGuardError):
+            slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        self.assertEqual((user / "wip.txt").read_text(encoding="utf-8"), "precious")
+        self.assertEqual(self.branch_of(user), "user")
+
+    def test_leave_removes_a_stale_index_lock(self):
+        [n] = self.slot()
+        self.commit_on_branch(n, 5)
+        path = slots.slot_path(self.repo, self.cfg, n)
+        lock = Path(git(path, "rev-parse", "--path-format=absolute", "--git-path", "index.lock"))
+        lock.write_text("", encoding="utf-8")   # left by a writer killed during `git add`
+        slots.leave_slot(self.repo, self.board, self.cfg, n)
+        self.assertFalse(lock.exists())
+        slots.delete_task_branch(self.repo, self.board, self.cfg, 5)
+        self.assertFalse(slots.task_branch_exists(self.repo, 5))
+
     def test_inherited_git_dir_does_not_redirect_slot_commands(self):
         [n] = self.slot()
         env = {"GIT_DIR": str(self.repo.common_dir), "GIT_WORK_TREE": str(self.repo_path)}
