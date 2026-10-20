@@ -8,7 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from artel import board as B, config as C, integrate, platform as P, slots, transitions as T
-from artel.errors import ArtelError
+from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 from tests.helpers import RepoTestCase, git, py_cmd
 
@@ -246,6 +246,42 @@ class VerifyTest(IntegrateCase):
         after = self.board.get_task(tid)
         self.assertEqual((after.version, after.last_verify), (before.version, before.last_verify))
         self.assertEqual(self.entries(), [])
+
+    def test_verify_that_cannot_start_pauses_instead_of_burning_fixes(self):
+        """Mutation caught: an environment error (missing lock/verify binary) counted as a red tree."""
+        for override in ({"commands.heavy_lock": ["no-such-lock-binary-xyz", "x"]},
+                         {"commands.verify": ["no-such-verify-binary-xyz"]}):
+            with self.subTest(override=override):
+                self.configure(**override)
+                tid = self.task_with_commit("verifying", "a.txt")
+                result = self.verify(tid)
+                self.assertEqual(result.kind, "setup_failed")
+                self.assertIn("could not start", result.detail)
+                tr = self.finish(tid, result)
+                task = self.board.get_task(tid)
+                self.assertEqual((task.state, task.verify_fixes, task.attempts), ("verifying", 0, 0))
+                self.assertEqual(tr.effects, ("pause_setup_failed",))
+                self.assertEqual(self.entries("FAIL"), [])
+                self.slot_clean()
+
+    def test_verify_refuses_a_missing_task_branch(self):
+        """Mutation caught: prepare_slot re-creating artel/<id> empty, then 'green' and integrated as done."""
+        tid = self.task_with_commit("verifying", "a.txt")
+        git(self.repo_path, "branch", "-D", task_branch(tid))
+        with self.assertRaises(ArtelError) as cm:
+            self.verify(tid)
+        self.assertIn(task_branch(tid), str(cm.exception))
+        self.assertFalse(self.repo.branch_exists(task_branch(tid)))   # nothing was re-created
+
+    def test_merge_failure_without_conflict_raises_and_leaves_the_slot_clean(self):
+        """Unrelated histories: git refuses (rc 128), no conflict files; leave_slot still runs."""
+        tid = self.board.insert_task(title="t", state="verifying", created_by="human")
+        tree = git(self.repo_path, "rev-parse", "main^{tree}")
+        root = git(self.repo_path, "commit-tree", tree, "-m", "unrelated root")
+        git(self.repo_path, "branch", task_branch(tid), root)
+        with self.assertRaises(GitError):
+            self.verify(tid)
+        self.slot_clean()
 
     def test_verify_stopped_requeues_without_a_transition(self):
         stop = threading.Event()
@@ -533,6 +569,20 @@ class BaseTest(IntegrateCase):
         (fail,) = self.entries("FAIL")
         self.assertIn("setup-1.log", fail["basis"])
         self.slot_clean()
+
+    def test_base_verify_timeout_pauses_the_board(self):
+        """Mutation caught: finish_base_update ignoring a timed-out base verify."""
+        self.configure(**{"commands.verify": py_cmd("import time; time.sleep(30)"), "verify_timeout": "1s",
+                          "kill_grace": "1s"})
+        self.commit_on_integration("task.txt")
+        self.commit_on_base("b.txt")
+        before = git(self.repo_path, "rev-parse", INTEGRATION)
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(bu.kind, "timeout")
+        self.assertIn("verify_timeout", bu.detail)
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu), "paused")
+        self.assertTrue(self.board.get_meta("pause_detail").startswith("timeout:"))
+        self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
 
     def test_base_with_empty_verify_merges(self):
         self.configure(**{"commands.verify": ""})

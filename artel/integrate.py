@@ -79,7 +79,7 @@ def _verify_command(cfg, repo: Repo, path: Path, *, log_path: Path, env, on_star
         log_path.parent.mkdir(parents=True, exist_ok=True)
         with open(log_path, "a", encoding="utf-8", newline="\n") as fh:
             fh.write(f"artel: verify could not start: {exc}\n")
-        return "red", f"could not start: {exc}", None
+        return "not_started", f"verify could not start: {exc}", None   # an environment error, not a red tree
     if result.stopped:
         return "stopped", "stopped", result.returncode
     if result.timed_out:
@@ -93,6 +93,8 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
                 stop_event=None, env: Mapping[str, str] | None = None) -> VerifyResult:
     n = 1 + sum(1 for r in board.list_runs(task.id) if r.stage == "verify")
     log_path = repo.logs_dir / str(task.id) / f"verify-{n}.log"
+    if not repo.branch_exists(task_branch(task.id)):   # prepare_slot would re-create it empty: green on nothing
+        raise ArtelError(f"cannot verify task {task.id}: {task_branch(task.id)} does not exist (internal error)")
     slots.prepare_slot(repo, board, cfg, slot_n, task.id)
     path = slots.slot_path(repo, cfg, slot_n)
     try:
@@ -121,8 +123,11 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
             kind, detail, code = _verify_command(cfg, repo, path, log_path=log_path, env=env, on_start=on_start,
                                                  stop_event=stop_event)
         finally:
-            board.finish_run(run.id, outcome={"green": "ok", "red": "failed"}.get(kind, kind), usage={},
+            board.finish_run(run.id, outcome={"green": "ok", "red": "failed", "not_started": "failed"}.get(kind, kind),
+                             usage={},
                              exit_code=code, timed_out=kind == "timeout", killed=kind in ("timeout", "stopped"))
+        if kind == "not_started":   # like a failing setup: pause the board, burn no fix and no agent
+            return VerifyResult("setup_failed", None, log_path, detail)
         return VerifyResult(kind, commit if kind == "green" else None, log_path, detail)
     finally:
         slots.leave_slot(repo, board, cfg, slot_n)
@@ -271,7 +276,7 @@ def base_update(repo: Repo, board, cfg, slot_n: int, *, on_start: OnStart | None
                                           stop_event=stop_event)
         if kind == "green":
             return BaseUpdate("merged", old, new, log_path, detail)
-        return BaseUpdate(kind, old, None, log_path, detail)
+        return BaseUpdate("red" if kind == "not_started" else kind, old, None, log_path, detail)
     finally:
         slots.leave_slot(repo, board, cfg, slot_n)
 
