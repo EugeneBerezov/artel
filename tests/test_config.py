@@ -51,6 +51,17 @@ class SchemaTest(unittest.TestCase):
         self.assertEqual({s.key: s.default for s in S.SETTINGS}, EXPECTED_DEFAULTS)
         self.assertEqual(len(S.SETTINGS), len(EXPECTED_DEFAULTS))   # no duplicate keys
 
+    def test_kinds_match_plan(self):
+        kinds = {"base": "str", "max_agents": "int", "merge": "enum", "stage_timeout": "duration",
+                 "limit_stop": "enum", "min_free_disk": "size", "slot_keep": "str_list",
+                 "autoapprove": "enum", "rotation.same_area_only": "bool", "agent_command": "argv",
+                 "shell": "enum", "commands.verify": "command", "commands.setup_inputs": "str_list",
+                 "profiles.writer": "str_list", "notify.on": "enum_list", "notify.telegram_enabled": "bool"}
+        for key, kind in kinds.items():
+            self.assertEqual(setting(key).kind, kind, key)
+        self.assertEqual(setting("rotation.writer_max_tasks").minimum, 1)
+        self.assertEqual(setting("rotation.writer_max_context").minimum, 0)
+
     def test_profile_defaults_match_plan(self):
         common = setting("profiles.common").default
         self.assertIn("{schema}", common)
@@ -129,7 +140,7 @@ class ParseTest(unittest.TestCase):
                  45: 45.0, 2.5: 2.5}
         for raw, want in cases.items():
             self.assertEqual(C.parse_duration(raw), want, raw)
-        for bad in ("5x", "", "m", True, -1, "abc"):
+        for bad in ("5x", "", "m", True, -1, "abc", "inf", "nan", "1_0", float("inf"), float("nan")):
             with self.assertRaises(UsageError, msg=repr(bad)):
                 C.parse_duration(bad)
 
@@ -145,7 +156,7 @@ class ParseTest(unittest.TestCase):
 
     def test_coerce_int(self):
         self.assertEqual(C.coerce(setting("max_agents"), "3"), 3)
-        for bad in ("x", "0", 0, True, 1.5):
+        for bad in ("x", "0", 0, True, 1.5, "1_0", "\u0663"):
             with self.assertRaises(UsageError, msg=repr(bad)):
                 C.coerce(setting("max_agents"), bad)   # minimum is 1
         self.assertEqual(C.coerce(setting("rotation.writer_max_context"), "0"), 0)
@@ -336,6 +347,27 @@ class SetTest(RepoTestCase):
         self.write("max_agents = 2\r\nmerge = \"auto\"\r\n")
         C.set_value(self.path, "max_agents", "3")
         self.assertEqual(self.read(), "max_agents = 3\r\nmerge = \"auto\"\r\n")
+
+    def test_set_crlf_file_keeps_crlf_on_insert(self):
+        self.write("max_agents = 2\r\n[models]\r\nreview = \"sonnet\"\r\n")
+        C.set_value(self.path, "models.write", "haiku")
+        C.set_value(self.path, "base", "trunk")
+        C.set_value(self.path, "notify.command", "x")
+        text = self.read()
+        self.assertEqual(text.count("\n"), text.count("\r\n"))
+        self.assertEqual(tomllib.loads(text)["models"]["write"], "haiku")
+
+    def test_bom_file_is_read_and_kept(self):
+        self.path.write_bytes(b"\xef\xbb\xbfmax_agents = 2\n")
+        self.assertEqual(C.load_config(Repo.discover(self.repo_path), env={})["max_agents"], 2)
+        C.set_value(self.path, "max_agents", "3")
+        self.assertEqual(self.path.read_bytes(), b"\xef\xbb\xbfmax_agents = 3\n")
+
+    def test_set_ignores_header_lookalike_inside_multiline_value(self):
+        self.write("slot_keep = [\n  [\"x\"]\n]\n[models]\nreview = \"a\"\n")
+        # nested array is not a str_list, but the scan must not take its middle line for a table header
+        C.set_value(self.path, "models.write", "haiku")
+        self.assertEqual(tomllib.loads(self.read())["models"], {"review": "a", "write": "haiku"})
 
     def test_set_invalid_value_leaves_file_unchanged(self):
         self.write("max_agents = 2\n")

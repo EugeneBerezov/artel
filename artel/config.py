@@ -1,4 +1,5 @@
 """Loading, validating and editing artel.toml (spec §9, §10)."""
+import math
 import os
 import re
 import tomllib
@@ -23,7 +24,7 @@ def parse_duration(s: str | int | float) -> float:
     if isinstance(s, bool):
         raise UsageError(f"invalid duration: {s!r}")
     if isinstance(s, (int, float)):
-        if s < 0:
+        if not math.isfinite(s) or s < 0:
             raise UsageError(f"invalid duration: {s!r}")
         return float(s)
     if isinstance(s, str):
@@ -32,11 +33,8 @@ def parse_duration(s: str | int | float) -> float:
             unit = m.group(2)
             number = float(m.group(1))
             return number / 1000 if unit == "ms" else number * _DURATION_UNITS[unit]
-        try:
-            if float(s) >= 0:
-                return float(s)
-        except ValueError:
-            pass
+        if re.fullmatch(r"\s*\d+(?:\.\d+)?\s*", s):
+            return float(s)
     raise UsageError(f"invalid duration: {s!r} (use e.g. 500ms, 30s, 90m, 2h, 1d)")
 
 
@@ -86,10 +84,9 @@ def _normalize(setting: Setting, raw: object) -> object:
     key, kind = setting.key, setting.kind
     if kind == "int":
         if isinstance(raw, str):
-            try:
-                raw = int(raw.strip())
-            except ValueError:
-                raise UsageError(f"{key}: expected an integer, got {raw!r}") from None
+            if not re.fullmatch(r"-?[0-9]+", raw.strip()):
+                raise UsageError(f"{key}: expected an integer, got {raw!r}")
+            raw = int(raw.strip())
         if isinstance(raw, bool) or not isinstance(raw, int):
             raise UsageError(f"{key}: expected an integer, got {raw!r}")
         if setting.minimum is not None and raw < setting.minimum:
@@ -139,6 +136,10 @@ def _normalize(setting: Setting, raw: object) -> object:
             return items
         raise UsageError(f"{key}: expected a string or a list of strings, got {raw!r}")
     raise AssertionError(f"unknown setting kind {kind!r}")   # pragma: no cover
+
+
+def _copy(value: object) -> object:
+    return list(value) if isinstance(value, list) else value
 
 
 def _runtime(setting: Setting, value: object) -> object:
@@ -199,11 +200,11 @@ def load_config(repo: Repo, *, env: Mapping[str, str] | None = None,
                 cli: Mapping[str, tuple[object, str]] | None = None) -> Config:
     path = repo.root / "artel.toml"
     env = os.environ if env is None else env
-    raw: dict[str, object] = {s.key: s.default for s in SETTINGS}
+    raw: dict[str, object] = {s.key: _copy(s.default) for s in SETTINGS}
     sources = {s.key: "default" for s in SETTINGS}
     if path.is_file():
         try:
-            data = tomllib.loads(path.read_bytes().decode("utf-8"))
+            data = tomllib.loads(path.read_bytes().decode("utf-8-sig"))
         except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
             raise UsageError(f"cannot parse {path}: {e}") from None
         for key, value in _flatten(data, path).items():
@@ -301,12 +302,16 @@ def _value_end(lines: list[str], idx: int, col: int) -> tuple[int, int]:
 
 def _edit(text: str, key: str, literal: str) -> str:
     lines = text.splitlines(keepends=True)
+    eol = "\r\n" if "\r\n" in text else "\n"
     table, _, name = key.rpartition(".")
     current = ""
     section_last = None            # last non-blank line index inside the wanted table
     first_header = None
     table_seen = False
+    skip_to = -1
     for i, line in enumerate(lines):
+        if i <= skip_to:
+            continue            # continuation line of a multi-line value
         header = _HEADER.match(line)
         if header:
             if first_header is None:
@@ -319,31 +324,32 @@ def _edit(text: str, key: str, literal: str) -> str:
             full = _clean_key(km.group(2))
             if current:
                 full = current + "." + full
+            end_line, end_col = _value_end(lines, i, km.end())
+            skip_to = end_line
             if full == key:
-                end_line, end_col = _value_end(lines, i, km.end())
                 tail = lines[end_line][end_col:]
                 lines[i:end_line + 1] = [lines[i][:km.end()] + literal + tail]
                 return "".join(lines)
         if current == table and line.strip() and not line.lstrip().startswith("#"):
             section_last = i
-    new_line = f"{name} = {literal}\n"
+    new_line = f"{name} = {literal}{eol}"
     if table == "":
         at = first_header if first_header is not None else len(lines)
         if at == len(lines) and lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
+            lines[-1] += eol
         lines.insert(at, new_line)
         return "".join(lines)
     if table_seen:
         at = (section_last if section_last is not None else _header_index(lines, table)) + 1
         if not lines[at - 1].endswith("\n"):
-            lines[at - 1] += "\n"
+            lines[at - 1] += eol
         lines.insert(at, new_line)
         return "".join(lines)
     if lines and not lines[-1].endswith("\n"):
-        lines[-1] += "\n"
+        lines[-1] += eol
     if lines and lines[-1].strip():
-        lines.append("\n")
-    lines += [f"[{table}]\n", new_line]
+        lines.append(eol)
+    lines += [f"[{table}]{eol}", new_line]
     return "".join(lines)
 
 
@@ -361,7 +367,12 @@ def set_value(path: Path, key: str, raw: str) -> None:
     value = _normalize(setting, raw)
     literal = toml_literal(value)
     path = Path(path)
-    original = path.read_bytes().decode("utf-8") if path.is_file() else ""
+    bom = ""
+    original = ""
+    if path.is_file():
+        original = path.read_bytes().decode("utf-8")
+        if original.startswith("\ufeff"):
+            bom, original = "\ufeff", original[1:]
     updated = _edit(original, key, literal)
     try:
         parsed = _flatten(tomllib.loads(updated), path)
@@ -370,4 +381,4 @@ def set_value(path: Path, key: str, raw: str) -> None:
     if parsed.get(key) != value:
         raise UsageError(f"cannot set {key}: {path.name} would not read back the new value; file left unchanged")
     with open(path, "w", encoding="utf-8", newline="") as f:
-        f.write(updated)
+        f.write(bom + updated)
