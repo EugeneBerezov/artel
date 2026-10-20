@@ -448,6 +448,38 @@ class CrossReview(TmpCase):
         self.merged_by(1, "A")
         self.assertIn("review(-)", cli(self.repo, "status", expect=0).stdout)
 
+    def test_release_frees_a_review_held_by_a_dead_session(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        cli(self.repo, "claim", "--session", "B", expect=0)
+        cli(self.repo, "release", "1", "--reason", "B died", expect=0)
+        t = self.tasks()[1]
+        self.assertEqual((t["state"], t["review"], t["reviewer"]),
+                         ("done", "pending", None))
+        r = cli(self.repo, "claim", "--session", "main", "--review-only",
+                expect=0)
+        self.assertIn("id: 1", r.stdout)
+
+    def test_nothing_claimable_names_pending_reviews(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        r = cli(self.repo, "claim", "--session", "A", expect=3)
+        self.assertIn("pending cross-reviews: T1 by A", r.stderr)
+        self.assertIn("--review-only", r.stderr)
+        self.assertIn("review 1", cli(self.repo, "status", expect=0).stdout)
+
+    def test_repeated_review_fails_make_stuck(self):
+        self.init()
+        for n in range(3):
+            cli(self.repo, "claim", "--session", "A", expect=0)
+            self.merged_by(1, "A")
+            cli(self.repo, "claim", "--session", "B", expect=0)
+            cli(self.repo, "review", "1", "--verdict", "fail", "--reason",
+                "bad %d" % n, "--session", "B", expect=0)
+        self.assertEqual(self.tasks()[1]["state"], "stuck")
+
     def test_reopen_clears_pending_review(self):
         self.init()
         cli(self.repo, "claim", "--session", "A", expect=0)

@@ -74,6 +74,9 @@ task; you never review your own. Do not edit code.
   fail --reason "<≤400 B summary; see reviews/T<id>-<n>.md>" --session <S>`
   (the task reopens). Otherwise `--verdict pass`; put the minors in the file
   and in a FACT note.
+- Cannot finish a held review (context full, restart) → `python3
+  dev/board.py release <id> --reason "…"` returns it to the pool. If your
+  peer is gone, your merges wait for the controller's review.
 
 **The controller (`main`)** checks CI on every merge and reopens red tasks,
 attacks the plan and the spec with independent read-only agents, takes a

@@ -367,7 +367,12 @@ def cmd_review(args):
         else:
             t["state"], t["merge_sha"], t["review"] = "open", None, None
             t["reviewer"] = None
-            store.journal(session, "REVIEW-FAIL", args.id, args.reason)
+            t["fails"] += 1
+            text = args.reason
+            if t["fails"] >= MAX_FAILS + 1:
+                t["state"] = "stuck"
+                text += " (stuck after %d fails)" % t["fails"]
+            store.journal(session, "REVIEW-FAIL", args.id, text)
         store.save(board)
     print("T%d review %s" % (args.id, args.verdict))
 
@@ -498,10 +503,19 @@ def _nothing_claimable(tasks, by_id):
     if ctrl:
         parts.append("controller tasks (not claimable by peers, mark with "
                      "'done'): %s" % ", ".join("T%d" % i for i in ctrl))
+    pending = [t for t in tasks if t["state"] == "done"
+               and t.get("review") == "pending"]
+    if pending:
+        parts.append("pending cross-reviews: %s (a session never reviews its "
+                     "own merge; the controller can take one with: claim "
+                     "--session main --review-only)" % ", ".join(
+                         "T%d by %s, reviewer %s" % (
+                             t["id"], t.get("author", "-"),
+                             t.get("reviewer") or "-") for t in pending))
     stuck = [t["id"] for t in tasks if t["state"] == "stuck"]
     if stuck:
         parts.append("stuck: %s" % ", ".join("T%d" % i for i in stuck))
-    if not open_ and not held:
+    if not open_ and not held and not pending:
         parts.append("no open tasks left")
     return "; ".join(parts)
 
@@ -526,9 +540,28 @@ def _reopen(store, tid, kind, reason, session_arg, count_fail):
 
 
 def cmd_release(args):
-    state = _reopen(Store(args.repo), args.id, "RELEASE",
+    store = Store(args.repo)
+    with store.lock():
+        t = find_task(store.load(), args.id)
+        held_review = t["state"] == "done" and t.get("review") == "pending"
+    if held_review:
+        return _release_review(store, args.id, args.reason)
+    state = _reopen(store, args.id, "RELEASE",
                     args.reason or "released", None, False)
     print("T%d -> %s" % (args.id, state))
+
+
+def _release_review(store, tid, reason):
+    """A done task's pending cross-review goes back to the pool."""
+    with store.lock():
+        board = store.load()
+        t = find_task(board, tid)
+        who = t.get("reviewer") or "-"
+        t["reviewer"] = None
+        store.save(board)
+        store.journal(who, "RELEASE", tid,
+                      "review released: %s" % (reason or "released"))
+    print("T%d review -> unheld" % tid)
 
 
 def cmd_fail(args):
@@ -619,11 +652,15 @@ def cmd_status(args):
         print("  ".join(c.ljust(w) for c, w in zip(r, widths)).rstrip())
     counts = {}
     for t in board["tasks"]:
-        counts[t["state"]] = counts.get(t["state"], 0) + 1
+        key = t["state"]
+        if key == "done" and t.get("review") == "pending":
+            key = "review"
+        counts[key] = counts.get(key, 0) + 1
     print()
     print("%s (%d total)" % (", ".join(
         "%s %d" % (s, counts.get(s, 0))
-        for s in ("open", "claimed", "done", "stuck")), len(board["tasks"])))
+        for s in ("open", "claimed", "review", "done", "stuck")),
+        len(board["tasks"])))
 
 
 def main_worktree(repo):
