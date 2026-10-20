@@ -107,13 +107,14 @@ def _is_closed(conn, finding_id: int) -> bool:
     return row is not None
 
 
-def close_finding(board, finding_id: int, *, task_id: int, round: int, basis: str, author: str) -> int:
+def close_finding(board, finding_id: int, *, task_id: int, round: int, basis: str, author: str,
+                  text: str | None = None) -> int:
     with board.tx() as conn:
         row = conn.execute("SELECT * FROM entries WHERE id = ?", (finding_id,)).fetchone()
         if (row is None or row["kind"] != "FINDING" or row["status"] != "open" or row["task_id"] != task_id
                 or _is_closed(conn, finding_id)):
             raise ArtelError(f"#{finding_id} is not an open finding of task {task_id}")
-        return append(board, "FINDING", f"closed #{finding_id}", author=author, task_id=task_id,
+        return append(board, "FINDING", text if text is not None else f"closed #{finding_id}", author=author, task_id=task_id,
                       stage=row["stage"], round=round, basis=basis, severity=row["severity"],
                       status="closed", ref=finding_id)
 
