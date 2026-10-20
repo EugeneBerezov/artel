@@ -264,6 +264,28 @@ def _is_zombie(pid: int) -> bool:
     return out.stdout.strip().startswith("Z")
 
 
+def _group_has_live_member(group: int) -> bool:
+    """POSIX: is any non-zombie process still in the process group?"""
+    if sys.platform.startswith("linux"):
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit():
+                continue
+            try:
+                rest = (entry / "stat").read_text(encoding="utf-8", errors="replace").rpartition(")")[2].split()
+            except OSError:
+                continue
+            if rest[2] == str(group) and rest[0] != "Z":   # fields 3 (state), 5 (pgrp)
+                return True
+        return False
+    out = subprocess.run(["ps", "-ax", "-o", "pgid=,stat="], capture_output=True, encoding="utf-8",
+                         errors="replace", env={**os.environ, "LC_ALL": "C"})
+    for line in out.stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == str(group) and not parts[1].startswith("Z"):
+            return True
+    return False
+
+
 def process_fingerprint(pid: int) -> str | None:
     if IS_WINDOWS:
         if not pid_alive(pid):   # an open handle keeps an exited process queryable
@@ -314,8 +336,8 @@ def terminate_tree(pid: int, group: int, grace: float, fingerprint: str | None =
     while time.monotonic() < deadline:
         if not tree_alive(pid, group):
             break
-        if not IS_WINDOWS and _is_zombie(pid):
-            break   # unreaped leader (the caller's own child): killpg(0) would keep succeeding
+        if not IS_WINDOWS and _is_zombie(pid) and not _group_has_live_member(group):
+            break   # unreaped leader alone (the caller's own child): killpg(0) would keep succeeding
         time.sleep(0.05)
     # Finish with a hard kill: it sweeps stragglers that ignored the soft stop (POSIX group, Windows job)
     # and releases the job handle; it is harmless when nothing is left.
@@ -380,7 +402,7 @@ def find_git_bash() -> str:
             return str(candidate)
     found = which("bash")
     system32 = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32"
-    if found and system32 not in Path(found).parents:
+    if found and system32 not in Path(found).parents and "WindowsApps" not in Path(found).parts:
         return found
     raise ArtelError("cannot find bash; install Git for Windows (https://gitforwindows.org)")
 
@@ -424,7 +446,7 @@ def _cmd_script(command: str) -> str:
     lines = [
         "@echo off",
         "setlocal",
-        "for /f \"tokens=2 delims=:\" %%a in ('chcp') do set \"ARTEL_CP=%%a\"",
+        "for /f \"tokens=2 delims=:.\" %%a in ('chcp') do set \"ARTEL_CP=%%a\"",
         "chcp 65001 >nul",
         command,
         "set \"ARTEL_RC=%ERRORLEVEL%\"",

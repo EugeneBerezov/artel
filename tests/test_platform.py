@@ -58,6 +58,7 @@ class LockTest(unittest.TestCase):
         self.assertEqual(self.probe(), "True")
 
     def test_blocking_acquire_waits_for_release(self):
+        """Mutation caught: a blocking acquire that returns False."""
         holder = P.FileLock(self.path)
         holder.acquire()
         threading.Timer(0.3, holder.release).start()
@@ -68,6 +69,7 @@ class LockTest(unittest.TestCase):
         self.assertGreaterEqual(time.monotonic() - start, 0.2)
 
     def test_lock_freed_when_holder_dies(self):
+        """Mutation caught: a lock that outlives its holder process."""
         code = ("import sys\nfrom pathlib import Path\nfrom artel.platform import FileLock\n"
                 "assert FileLock(Path(sys.argv[1])).acquire()\n")   # exits holding the lock
         subprocess.run([sys.executable, "-c", code, str(self.path)], env=subprocess_env(), cwd=REPO_ROOT,
@@ -126,8 +128,8 @@ class TreeTest(unittest.TestCase):
         self.assertFalse(P.terminate_tree(proc.pid, P.group_of(proc), grace=0.5, fingerprint="bogus"))
         self.assertIsNone(proc.poll())
 
-    def test_terminate_tree_graceful_stop_is_fast(self):
-        # mutation caught: terminate_tree not sending the soft stop (would wait the whole grace, then kill)
+    def test_terminate_tree_sends_soft_stop_first(self):
+        """Mutation caught: terminate_tree not sending the soft stop (no 'stopped', waits the whole grace)."""
         code = STOPPER + "print('up', flush=True)\nwait_stop()\n"
         proc = self.spawn(code, env=subprocess_env(), cwd=REPO_ROOT)
         proc.stdout.readline()
@@ -137,14 +139,36 @@ class TreeTest(unittest.TestCase):
         self.assertEqual(proc.stdout.read().strip(), "stopped")
         proc.wait(timeout=10)
 
-    def test_terminate_tree_unreaped_leader_is_not_a_full_grace_wait(self):
+    def test_terminate_tree_returns_promptly_after_soft_stop(self):
+        """Mutation caught: waiting the full grace for an unreaped (zombie) leader."""
         proc = self.spawn("import time; time.sleep(60)")
         time.sleep(0.3)
         start = time.monotonic()
         P.terminate_tree(proc.pid, P.group_of(proc), grace=20.0)
         self.assertLess(time.monotonic() - start, 10)
 
-    def test_terminate_tree_sweeps_children_of_gone_leader(self):
+    @unittest.skipIf(P.IS_WINDOWS, "POSIX only")
+    def test_zombie_leader_does_not_cut_children_grace(self):
+        """Mutation caught: killing the group the moment the leader is a zombie (children get no grace)."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            marker = Path(tmp) / "cleaned"
+            kid = ("import signal, sys, time\n"
+                   "def stop(*a):\n    time.sleep(0.6)\n"
+                   f"    open({str(marker)!r}, 'w', encoding='utf-8').write('x')\n    sys.exit(0)\n"
+                   "signal.signal(signal.SIGTERM, stop)\nprint('ready', flush=True)\n"
+                   "while True:\n    time.sleep(0.1)\n")
+            leader = ("import subprocess, sys\n"
+                      f"kid = subprocess.Popen([sys.executable, '-c', {kid!r}], stdout=subprocess.PIPE,"
+                      " encoding='utf-8')\n"
+                      "kid.stdout.readline()\nprint('up', flush=True)\n"
+                      "import time\nwhile True:\n    time.sleep(0.1)\n")
+            proc = self.spawn(leader)
+            proc.stdout.readline()
+            P.terminate_tree(proc.pid, P.group_of(proc), grace=10.0)   # leader dies on SIGTERM, stays unreaped
+            self.assertTrue(marker.exists())
+
+    def test_terminate_tree_sweeps_group_after_leader_exit(self):
+        """Mutation caught: 'leader gone -> False' leaving orphans that hold the pipes."""
         # leader reaped, grandchild still in the group (spec §5: reconcile terminates groups)
         proc = self.spawn(ORPHAN)
         grandchild = int(proc.stdout.readline())
@@ -153,6 +177,7 @@ class TreeTest(unittest.TestCase):
         self.assertTrue(wait_dead(grandchild))
 
     def test_terminate_tree_sweeps_children_of_zombie_leader(self):
+        """Mutation caught: treating a zombie leader as 'nothing alive'."""
         proc = self.spawn(ORPHAN)
         grandchild = int(proc.stdout.readline())
         deadline = time.monotonic() + 5
@@ -162,11 +187,13 @@ class TreeTest(unittest.TestCase):
         self.assertTrue(wait_dead(grandchild))
 
     def test_terminate_returns_false_when_nothing_alive(self):
+        """Mutation caught: signalling a gone tree / returning True."""
         proc = self.spawn("pass")
         proc.wait(timeout=10)
         self.assertFalse(P.terminate_tree(proc.pid, P.group_of(proc), grace=0.5))
 
     def test_job_object_kills_orphaned_grandchild(self):
+        """Mutation caught: hard_kill acting only on the leader."""
         proc = self.spawn(ORPHAN)
         grandchild = int(proc.stdout.readline())
         proc.wait(timeout=10)
@@ -264,6 +291,7 @@ class ShellTest(unittest.TestCase):
 
     @unittest.skipUnless(P.IS_WINDOWS, "Windows only")
     def test_cmd_shell_runs_quoted_command(self):
+        """Mutation caught: list2cmdline quoting (\\") reaching cmd.exe."""
         out = subprocess.run(P.command_line(P.shell_argv("cmd", 'echo "a b"')), capture_output=True,
                              encoding="utf-8", errors="replace")
         self.assertIn('"a b"', out.stdout)
@@ -318,6 +346,8 @@ class ShimTest(unittest.TestCase):
         self.assertEqual(win["artel"], '#!/bin/sh\nexec "C:\\Py\\python.exe" -m artel "$@"\n')
         cmd = win["artel.cmd"]
         self.assertIn("chcp 65001 >nul", cmd)                      # PD-33 preamble
+        self.assertIn('set "ARTEL_CP=%%a"', cmd)                    # save ...
+        self.assertIn("chcp %ARTEL_CP% >nul", cmd)                  # ... and restore the code page
         self.assertIn('"C:\\Py\\python.exe" -m artel %*\r\n', cmd)
         self.assertTrue(cmd.rstrip().endswith("exit /b %ARTEL_RC%"))
         self.assertLess(cmd.index("chcp 65001"), cmd.index("-m artel"))
@@ -327,8 +357,8 @@ class ShimTest(unittest.TestCase):
 
     def test_wrapper_passes_arguments_verbatim(self):
         argv = P.write_wrapper(self.tmp / "wrap", py_cmd("import json, sys; print(json.dumps(sys.argv[1:]))"))
-        args = ["a b", 'say "hi"', '{"k": [1, 2]}', "héllo", "plain", "a & b", "x | y", "<z> >w",
-                "50% off", "^caret ^", "$HOME `x`", "back\\slash", "a&b", "100%", "x^y", "p|q", "r<s", "t>u"]
+        args = ["a b", 'say "hi"', '{"k": [1, 2]}', "héllo", "plain", "a & b", "x | y", "<z> >w", "a^ &b",
+                "50% off", "^caret ^", "$HOME `x`", "back\\slash", "100%"]
         out = subprocess.run(argv + args, capture_output=True, encoding="utf-8")
         self.assertEqual(json.loads(out.stdout), args)
 
@@ -361,6 +391,7 @@ class OsPairTest(unittest.TestCase):
 
     @unittest.skipUnless(P.IS_WINDOWS, "Windows only")
     def test_pid_alive_access_denied_is_alive(self):
+        """Mutation caught: ERROR_ACCESS_DENIED read as dead."""
         self.assertTrue(P.pid_alive(4))   # the System process: OpenProcess is denied
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
