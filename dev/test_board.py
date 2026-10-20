@@ -365,6 +365,129 @@ class ReopenRefresh(TmpCase):
             "--refresh", expect=2)
 
 
+class CrossReview(TmpCase):
+    def merged_by(self, tid, session):
+        """Simulate integrate's bookkeeping for a merge by `session`."""
+        path = self.store() / "board.json"
+        data = json.loads(path.read_text())
+        for t in data["tasks"]:
+            if t["id"] == tid:
+                t.update(state="done", merge_sha="m%d" % tid, session=None,
+                         author=session, review="pending", reviewer=None)
+        path.write_text(json.dumps(data))
+
+    def test_dependents_wait_for_cross_review_by_the_other_session(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        r = cli(self.repo, "claim", "--session", "A", expect=3)
+        self.assertIn("review by", r.stderr)
+        r = cli(self.repo, "claim", "--session", "B", expect=0)
+        self.assertIn("kind: review", r.stdout)
+        self.assertIn("id: 1", r.stdout)
+        self.assertIn("merge: m1", r.stdout)
+        r = cli(self.repo, "claim", "--session", "B", expect=0)
+        self.assertIn("kind: review", r.stdout)  # held review is reprinted
+        cli(self.repo, "review", "1", "--verdict", "pass", "--reason", "ok",
+            "--session", "A", expect=1)  # not the holder
+        cli(self.repo, "review", "1", "--verdict", "pass", "--reason", "ok",
+            "--session", "B", expect=0)
+        self.assertEqual(self.tasks()[1]["review"], "pass")
+        r = cli(self.repo, "claim", "--session", "A", expect=0)
+        self.assertIn("id: 2", r.stdout)
+        j = (self.store() / "journal.md").read_text()
+        self.assertIn("B REVIEW T1", j)
+        self.assertIn("B REVIEW-PASS T1: ok", j)
+
+    def test_fail_verdict_reopens_task(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        cli(self.repo, "claim", "--session", "B", expect=0)
+        cli(self.repo, "review", "1", "--verdict", "fail", "--reason",
+            "lock leak", "--session", "B", expect=0)
+        t = self.tasks()[1]
+        self.assertEqual((t["state"], t["merge_sha"], t["review"]),
+                         ("open", None, None))
+        self.assertIn("B REVIEW-FAIL T1: lock leak",
+                      (self.store() / "journal.md").read_text())
+
+    def test_session_with_a_claimed_task_finishes_it_first(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        cli(self.repo, "claim", "--session", "B", expect=0)  # review T1
+        cli(self.repo, "review", "1", "--verdict", "pass", "--reason", "ok",
+            "--session", "B", expect=0)
+        cli(self.repo, "claim", "--session", "A", expect=0)  # T2
+        cli(self.repo, "claim", "--session", "B", expect=0)  # T3
+        self.merged_by(2, "A")
+        r = cli(self.repo, "claim", "--session", "B", expect=0)
+        self.assertIn("id: 3", r.stdout)
+        self.assertNotIn("kind: review", r.stdout)
+        r = cli(self.repo, "claim", "--session", "main", "--review-only",
+                expect=0)
+        self.assertIn("kind: review", r.stdout)
+        self.assertIn("id: 2", r.stdout)
+
+    def test_review_only_with_nothing_pending(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "main", "--review-only",
+            expect=3)
+
+    def test_old_done_tasks_without_review_field_satisfy_deps(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        cli(self.repo, "done", "1", expect=0)
+        r = cli(self.repo, "claim", "--session", "A", expect=0)
+        self.assertIn("id: 2", r.stdout)
+
+    def test_status_shows_review_state(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        self.assertIn("review(-)", cli(self.repo, "status", expect=0).stdout)
+
+    def test_release_frees_a_review_held_by_a_dead_session(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        cli(self.repo, "claim", "--session", "B", expect=0)
+        cli(self.repo, "release", "1", "--reason", "B died", expect=0)
+        t = self.tasks()[1]
+        self.assertEqual((t["state"], t["review"], t["reviewer"]),
+                         ("done", "pending", None))
+        r = cli(self.repo, "claim", "--session", "main", "--review-only",
+                expect=0)
+        self.assertIn("id: 1", r.stdout)
+
+    def test_nothing_claimable_names_pending_reviews(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        r = cli(self.repo, "claim", "--session", "A", expect=3)
+        self.assertIn("pending cross-reviews: T1 by A", r.stderr)
+        self.assertIn("--review-only", r.stderr)
+        self.assertIn("review 1", cli(self.repo, "status", expect=0).stdout)
+
+    def test_repeated_review_fails_make_stuck(self):
+        self.init()
+        for n in range(3):
+            cli(self.repo, "claim", "--session", "A", expect=0)
+            self.merged_by(1, "A")
+            cli(self.repo, "claim", "--session", "B", expect=0)
+            cli(self.repo, "review", "1", "--verdict", "fail", "--reason",
+                "bad %d" % n, "--session", "B", expect=0)
+        self.assertEqual(self.tasks()[1]["state"], "stuck")
+
+    def test_reopen_clears_pending_review(self):
+        self.init()
+        cli(self.repo, "claim", "--session", "A", expect=0)
+        self.merged_by(1, "A")
+        cli(self.repo, "reopen", "1", "--reason", "red", expect=0)
+        self.assertIsNone(self.tasks()[1]["review"])
+
+
 class Notes(TmpCase):
     def test_note_format_and_limits(self):
         self.init()
@@ -441,6 +564,7 @@ class Integrate(TmpCase):
         t = self.tasks()[1]
         self.assertEqual((t["state"], t["merge_sha"]), ("done", sha))
         self.assertIn("DONE T1", (self.store() / "journal.md").read_text())
+        self.assertEqual((t["author"], t["review"]), ("A", "pending"))
 
     def test_conflict_rolls_back(self):
         self.start()
