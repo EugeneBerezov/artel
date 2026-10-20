@@ -6,6 +6,7 @@ from unittest import mock
 
 from artel import journal, slots, stages
 from artel.gitutil import INTEGRATION
+from tests.factories import make_task
 from tests.helpers import git, py_cmd
 from tests.test_stages import READY, StagesCase, noop
 
@@ -286,6 +287,152 @@ class HardeningTest(StagesCase):
         self.commit_file("int-only.txt", "1\n2\n3\n4\n5\n6\n7\n", "integration moved on")
         git(self.repo_path, "checkout", "-q", "main")
         self.assertEqual(stages.diff_lines(self.repo, tid), 3)
+
+
+class Round2Test(StagesCase):
+    """Controller review of T13 (PD-46, merge_committed, minors)."""
+
+    def conflict_task(self):
+        tid = self.task_in("fixing", fix_kind="conflict")
+        self.make_branch(tid, name="shared.txt", content="mine\n")
+        git(self.repo_path, "checkout", "-q", INTEGRATION)
+        self.commit_file("shared.txt", "theirs\n", "integration edit")
+        git(self.repo_path, "checkout", "-q", "main")
+        return tid
+
+    def test_reset_branch_closes_open_review_findings_as_superseded(self):
+        # PD-46: write -> review major -> fix ready without a commit -> R17 -> write -> review pass -> verifying
+        tid = self.task_in("reviewing", round=1, with_commit=True)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "bug in deleted code", "basis": ""}]}}]})
+        self.go(tid)
+        self.assertEqual(self.task(tid).state, "fixing")
+        attack = journal.add_finding(self.board, task_id=tid, stage="attack", round=0, severity="major",
+                                     text="about the task", basis="", author="agent:attack")
+        self.scenario({f"{tid}:fix": [{"result": READY}]})   # ready without a commit -> R17: branch reset
+        self.go(tid)
+        task = self.task(tid)
+        self.assertEqual(task.state, "open")
+        self.assertFalse(self.repo.branch_exists(f"artel/{tid}"))
+        self.assertEqual(journal.open_findings(self.board, tid), [])   # review findings superseded
+        closing = [e for e in self.entries(tid, "FINDING") if e.status == "closed"]
+        self.assertEqual([(e.text, e.author, e.basis) for e in closing],
+                         [("superseded: branch reset (R17)", "artel", "superseded: branch reset (R17)")])
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid, stages=("attack",))], [attack])
+        # the fresh write and the fresh review go through without the stale finding
+        self.board.update_task(tid, expect_state="open", expect_version=task.version, state="writing")
+        self.scenario({f"{tid}:write": [*self.commit_action(), {"result": READY}]})
+        self.go(tid)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "pass", "summary": "fine"}}]})
+        self.go(tid)
+        self.assertEqual(self.task(tid).state, "verifying")
+
+    def test_no_supersede_without_a_reset(self):
+        tid = self.task_in("reviewing", round=1, with_commit=True)
+        self.configure(review_rounds=5)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "real", "basis": ""}]}}]})
+        self.go(tid)
+        self.assertEqual(len(journal.open_findings(self.board, tid)), 1)
+
+    def test_reset_hard_to_integration_is_not_a_committed_merge(self):
+        tid = self.conflict_task()
+        self.scenario({f"{tid}:fix": [{"git": ["merge", "--abort"]}, {"git": ["reset", "--hard", INTEGRATION]},
+                                     {"result": READY}]})
+        plan, run, tr = self.go(tid)
+        self.assertFalse(run.merge_committed)   # the merged commit is in the branch but the work was dropped
+        self.assertEqual(self.task(tid).state, "open")
+
+    def test_denials_of_a_requeued_run_are_recorded(self):
+        tid = self.task_in("writing", with_commit=True)
+        self.scenario({f"{tid}:write": [{"denied": ["Bash", {"command": "curl evil"}]}, {"result_error": 429}]})
+        plan, run, tr = self.go(tid)
+        self.assertIsNone(tr)
+        (fail,) = self.entries(tid, "FAIL")
+        self.assertTrue(fail.text.startswith("denied: Bash "))
+        self.assertEqual(fail.stage, "write")
+
+    def test_a_lost_cas_leaves_no_entries_behind(self):
+        # retry after an apply error must not duplicate FINDINGs
+        tid = self.task_in("reviewing", round=1, with_commit=True)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "a bug", "basis": ""}]}}]})
+        with mock.patch.object(stages.transitions, "apply", side_effect=stages.transitions.StaleTask("lost")):
+            with self.assertRaises(stages.transitions.StaleTask):
+                self.go(tid)
+        self.assertEqual(self.entries(tid), [])
+        self.go(tid)   # the retry records the finding once
+        self.assertEqual(len(self.entries(tid, "FINDING")), 1)
+
+    def test_blocking_review_below_the_cap_names_review_rounds(self):
+        tid = self.task_in("reviewing", round=1, with_commit=True)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "a bug", "basis": ""}]}}]})
+        self.go(tid)
+        verdicts = [e.text for e in self.entries(tid, "VERDICT")]
+        self.assertTrue(any(v.startswith("FIX review r1") and "review_rounds 2" in v for v in verdicts), verdicts)
+
+    def test_attack_with_an_existing_branch_and_no_then_runs_in_the_branch(self):
+        self.assertTrue(stages.branchless(make_task(then=None), "attack"))
+        self.assertTrue(stages.branchless(make_task(then=None), "attack", False))
+        self.assertTrue(stages.branchless(make_task(then="open"), "attack", True))
+        self.assertFalse(stages.branchless(make_task(then=None), "attack", True))
+        self.assertTrue(stages.branchless(make_task(), "vet", True))
+
+    def test_prepare_failure_leaves_the_slot(self):
+        tid = self.task_in("writing")
+        (self.slot_dir() / "junk.txt").write_text("x", encoding="utf-8")
+        real = slots.prepare_slot
+
+        def broken(repo, board, cfg, n, task_id):
+            real(repo, board, cfg, n, task_id)
+            raise slots.GitError(["switch"], "boom")
+
+        with mock.patch.object(slots, "prepare_slot", broken):
+            with self.assertRaises(slots.GitError):
+                stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+        self.assert_slot_left()
+
+    def test_stopped_run_row_is_killed_and_rate_limited_outcome_is_named(self):
+        tid = self.task_in("writing", with_commit=True)
+        self.scenario({f"{tid}:write": [{"sleep": 30}]})
+        stop = threading.Event()
+        threading.Timer(1.0, stop.set).start()
+        self.go(tid, stop=stop)
+        (row,) = self.board.list_runs(tid)
+        self.assertEqual((row.outcome, row.killed, row.timed_out), ("stopped", True, False))
+        self.scenario({f"{tid}:write": [{"result_error": 429}]})
+        self.go(tid)
+        self.assertEqual(self.board.list_runs(tid)[-1].outcome, "rate_limited")
+
+    def test_kill_grace_and_timeout_come_from_the_config(self):
+        self.configure(stage_timeout="77s", kill_grace="3s")
+        tid = self.task_in("writing")
+        seen = {}
+        real = stages.procs.run_tree
+
+        def spy(argv, **kw):
+            seen.update(timeout=kw["timeout"], kill_grace=kw["kill_grace"])
+            return real(argv, **kw)
+
+        self.scenario({f"{tid}:write": [{"result": {"outcome": "fail", "summary": "x"}}]})
+        with mock.patch.object(stages.procs, "run_tree", spy):
+            self.go(tid)
+        self.assertEqual(seen, {"timeout": 77.0, "kill_grace": 3.0})
+
+    def test_multibyte_finding_basis_is_cut_on_a_character_boundary(self):
+        tid = self.task_in("reviewing", round=1, with_commit=True)
+        self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
+            {"severity": "major", "text": "t", "basis": "я" * 150}]}}]})
+        self.go(tid)
+        (e,) = journal.open_findings(self.board, tid)
+        self.assertLessEqual(journal.utf8_len(e.basis), journal.BASIS_LIMIT)
+        e.basis.encode("utf-8")
+        self.assertTrue(e.basis.endswith("…"))
+
+    def test_attack_beats_risky_in_the_model_reason(self):
+        self.assertEqual(stages.choose_model(self.cfg, make_task(attack=True, risky=True), "review", 0),
+                         ("opus", "task --attack"))
 
 
 if __name__ == "__main__":
