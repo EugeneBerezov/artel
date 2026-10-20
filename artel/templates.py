@@ -3,6 +3,7 @@ import importlib.resources
 from pathlib import Path
 
 from artel.config import Config, load_config
+from artel.errors import ArtelError
 from artel.gitutil import Repo
 
 TEMPLATE_NAMES = ("vet.md", "attack.md", "write.md", "review.md", "review-closure.md", "fix.md")
@@ -31,10 +32,17 @@ def template_source(repo: Repo, cfg: Config, name: str) -> str:
     return "built-in"
 
 
+def _read(path: Path) -> str:
+    try:
+        return _normalize(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError as exc:
+        raise ArtelError(f"{path}: not valid UTF-8 ({exc.reason}); fix or delete the file") from exc
+
+
 def load_template(repo: Repo, cfg: Config, name: str) -> str:
     path = project_path(repo, cfg, name)
     if path.is_file():
-        return _normalize(path.read_text(encoding="utf-8"))
+        return _read(path)
     return builtin_text(name)
 
 
@@ -61,12 +69,14 @@ def export(repo: Repo, cfg: Config, *, force: bool = False, only_missing: bool =
     for name in (*TEMPLATE_NAMES, NOTICE_NAME):
         path = project_path(repo, cfg, name)
         text = builtin_text(name)
-        if not path.is_file():
+        if path.exists() and not path.is_file():
+            results.append((name, "kept (not a file)"))
+        elif not path.is_file():
             _write(path, text)
             results.append((name, "written"))
         elif only_missing:
             results.append((name, "kept (exists)"))
-        elif _normalize(path.read_text(encoding="utf-8")) == text:
+        elif _read(path) == text:
             results.append((name, "unchanged"))
         elif force:
             _write(path, text)

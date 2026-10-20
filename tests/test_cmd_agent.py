@@ -59,6 +59,28 @@ class CmdAgentTest(RepoTestCase):
                          ("second", "details ✓", ("src/a", "docs"), 3, True, True, 4, "ask", "human"))
         self.assertEqual(self.board().deps(2), [1])
 
+    def test_area_spellings_are_normalized_and_escapes_rejected(self):
+        """Mutation caught: storing --area as typed (src\\a and src/a would never overlap on Windows)."""
+        good = {"src/a": "src/a", "src\\a": "src/a", "./src//a/": "src/a", "src/x/../a": "src/a",
+                "src\\sub\\..\\a": "src/a", ".": "", "docs": "docs"}
+        for raw, want in good.items():
+            with self.subTest(raw=raw):
+                self.run_cmd(CA.run_add, "add", "t", "--area", raw)
+                self.assertEqual(self.board().list_tasks()[-1].area, (want,))
+        before = len(self.board().list_tasks())
+        for bad in ("", "  ", "../x", "a/../../x", "/etc", "C:\\x", "C:x", "\\\\server\\share"):
+            with self.subTest(raw=bad):
+                with self.assertRaises(UsageError):
+                    self.run_cmd(CA.run_add, "add", "t", "--area", bad)
+        self.assertEqual(len(self.board().list_tasks()), before)   # nothing stored for a rejected area
+        from artel import pick
+        self.assertTrue(pick.areas_overlap((CA.clean_area("src\\a"),), (CA.clean_area("src/a/b"),)))
+
+    def test_empty_title_rejected(self):
+        with self.assertRaises(UsageError):
+            self.run_cmd(CA.run_add, "add", "   ")
+        self.assertEqual(self.board().list_tasks(), [])
+
     def test_agent_add_is_proposed_with_creator(self):
         os.environ["ARTEL_TASK"] = "5"
         code, out, _ = self.run_cmd(CA.run_add, "add", "idea")
