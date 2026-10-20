@@ -21,7 +21,7 @@
 - Command settings (`commands.setup`, `commands.verify`, `commands.heavy_lock`, `commands.heavy_lock_check`, `notify.command`) accept a string (run through the configured `shell`) or a list (run directly); lists are the portable form (§12).
 - No listening sockets; the only network traffic is outbound HTTPS to the configured notifier (§2).
 - Never `bypassPermissions`; every tool profile passes `--permission-mode` explicitly (writer `acceptEdits`, reviewer/attacker/vet `default`); the prompt goes on stdin (§6, spike Q4).
-- Paths: board `<git-common-dir>/artel/board.db`; runner lock `<git-common-dir>/artel/runner.lock`; stop file `<git-common-dir>/artel/stop`; logs `<git-common-dir>/artel/logs/<id>/<stage>-<n>.jsonl`; slots `<main-worktree>/<slots_dir>/artel-<n>` (default `.claude/worktrees`), never inside `.git` (§3, §5, §12).
+- Paths: board `<git-common-dir>/artel/board.db`; runner lock `<git-common-dir>/artel/runner.lock`; stop file `<git-common-dir>/artel/stop`; logs `<git-common-dir>/artel/logs/<id>/<stage>-<n>.jsonl`; slots `<main-worktree>/<slots_dir>/artel-<n>` (default `.artel/slots` — owner 2026-10-20, PD-52, Task 30), never inside `.git` (§3, §5, §12).
 - Integration branch `artel/integration`; task branch `artel/<id>` (§3).
 - Journal limits: `text` ≤ 400 bytes UTF-8, `basis` ≤ 200 bytes; entries never edited, corrections are new entries naming the old id (§3.2).
 - SQLite: `isolation_level=None`, explicit `BEGIN IMMEDIATE`, `busy_timeout`, WAL with fallback to `journal_mode=DELETE` (§8).
@@ -44,7 +44,7 @@
 - `--append-system-prompt-file` works in `-p` (Q3).
 - Reviewer read-only only with `--permission-mode default`; denials in `result.permission_denials[]` (`tool_name`, `tool_use_id`, `tool_input`) (Q4).
 - Variadic `--allowedTools` / `--disallowedTools` swallow a positional prompt: prompt on stdin, stdin always attached (Q4).
-- Writer under `acceptEdits` edits and commits in `.claude/worktrees/artel-<n>` (Q5).
+- Writer under `acceptEdits` edits and commits in `.claude/worktrees/artel-<n>` (Q5). Slots now default to `.artel/slots` (PD-52); Task 16 re-checks Q5 there.
 - Final `usage` is a sum over all API calls (a schema run has ≥ 2); per-call usage is `assistant.message.usage` (Q6).
 - Open: Q7 (notice vs `CLAUDE.md`, best effort; `--setting-sources project,local` is a user knob via `profiles.common`), Q8 (`--resume` in `-p`; Task 25). The spike ran on Linux only.
 
@@ -55,7 +55,7 @@ Each is listed again under "Spec gaps" for the owner. Tasks cite them as **PD-n*
 - **PD-3 Unclosed earlier findings.** A review's blocking decision is computed from open findings after applying `closed`: unclosed blocker/major findings of earlier rounds stay open and block even if the reviewer returned `pass`.
 - **PD-4 Closure rounds** (round ≥ 2 or a conflict-resolution review): new findings other than `blocker` are recorded as `minor` with the prefix `[downgraded: closure round] `.
 - **PD-5 Attack findings** are FINDING entries with `stage='attack'`; given to the writer, excluded from review closure accounting.
-- **PD-6 Area holding.** A task holds its area in `attacking, writing, reviewing, fixing, verifying, verified`; overlap is path-component prefix; empty area overlaps everything. Vet and the attack of a vet-triggered risky task (`then` set, no branch) hold no area; a human `--attack` task holds its area from `attacking` on. *Amended (controller, 2026-10-20, owner to confirm):* `pick.select` steps 1–3 (answered, due stages, verifying) skip a task whose area overlaps a running task (a live job or `running = 1`) or a task already selected in the same call, so two overlapping tasks never run at once (§3 area, §5 step 2).
+- **PD-6 Area holding.** A task holds its area in `attacking, writing, reviewing, fixing, verifying, verified`; overlap is path-component prefix; empty area overlaps everything. Vet and the attack of a vet-triggered risky task (`then` set, no branch) hold no area; a human `--attack` task holds its area from `attacking` on. *Amended (controller, 2026-10-20, confirmed by owner):* `pick.select` steps 1–3 (answered, due stages, verifying) skip a task whose area overlaps a running task (a live job or `running = 1`) or a task already selected in the same call, so two overlapping tasks never run at once (§3 area, §5 step 2). *Confirmed (owner, 2026-10-20):* `blocked` and `awaiting_accept` hold no area.
 - **PD-7 Priority:** higher integer first, then lower id; default 0.
 - **PD-8 Branch checked out elsewhere:** the task is skipped this tick; status shows `held: artel/<id> checked out at <path>`.
 - **PD-9 `artel heavy -- CMD`** with a CMD matching no `project_tools` pattern is refused (exit 2).
@@ -68,11 +68,11 @@ Each is listed again under "Spec gaps" for the owner. Tasks cite them as **PD-n*
 - **PD-19 Human notes.** Rework notes and reject reasons are `ANSWER` entries by `human` with prefixes `rework: ` / `reject: `.
 - **PD-20 Verify log in the fix prompt:** tail of the latest verify log, ≤ `context_budget` bytes, fenced as untrusted.
 - **PD-21 Over-long agent text** in a structured result is truncated with `…` by the runner; over-long `artel note` is refused with a hint to commit a file.
-- **PD-22 Rate-limit statuses.** Rank: `"allowed"` 0, `"rejected"` 2, any other string 1. `limit_stop = "allowed_warning"` pauses new picks at rank ≥ 1; `"rejected"` at rank 2; rank 2 requeues the stage with no counter unless the run delivered a valid structured result (PD-40, amended by the controller 2026-10-20, owner to confirm).
-- **PD-23 Usage.** Each run stores the summed final `usage`, `total_cost_usd`, `num_turns`, `duration_ms`, the context size (input + cache tokens) of the first and last API call, and `session_id`; a killed run stores the sum of the assistant usages seen, counting each `message.id` once (the last usage seen for that id: one API call may emit several `assistant` lines — amended by the controller 2026-10-20, owner to confirm).
+- **PD-22 Rate-limit statuses.** Rank: `"allowed"` 0, `"rejected"` 2, any other string 1. `limit_stop = "allowed_warning"` pauses new picks at rank ≥ 1; `"rejected"` at rank 2; rank 2 requeues the stage with no counter unless the run delivered a valid structured result (PD-40, amended by the controller 2026-10-20, confirmed by owner).
+- **PD-23 Usage.** Each run stores the summed final `usage`, `total_cost_usd`, `num_turns`, `duration_ms`, the context size (input + cache tokens) of the first and last API call, and `session_id`; a killed run stores the sum of the assistant usages seen, counting each `message.id` once (the last usage seen for that id: one API call may emit several `assistant` lines — amended by the controller 2026-10-20, confirmed by owner).
 - **PD-24 Permission denials** are recorded as a runner `FAIL` entry (`denied: <tool_name> <tool_input, truncated>`); they do not change the outcome.
 - **PD-25 String `heavy_lock` prefix** with `shell` sh/bash runs as `[sh, "-c", '<prefix> "$@"', "artel-heavy", *argv]`; with pwsh/cmd a string prefix is a config error.
-- **PD-26 Stop.** `artel stop [--now]` enqueues a `stop` request and also writes the stop file (§12); the runner acts on whichever it sees first and clears both. Signals (SIGINT/SIGTERM, Ctrl+C/Ctrl+Break) are an extra soft stop. *Amended (controller, 2026-10-20, owner to confirm):* with no runner running, `artel stop` only says so (no request, no stop file); `Runner.start` deletes a stale stop file and finishes pending `stop` requests with error `stale: no runner`, so a later `artel run` does not exit at once.
+- **PD-26 Stop.** `artel stop [--now]` enqueues a `stop` request and also writes the stop file (§12); the runner acts on whichever it sees first and clears both. Signals (SIGINT/SIGTERM, Ctrl+C/Ctrl+Break) are an extra soft stop. *Amended (controller, 2026-10-20, confirmed by owner):* with no runner running, `artel stop` only says so (no request, no stop file); `Runner.start` deletes a stale stop file and finishes pending `stop` requests with error `stale: no runner`, so a later `artel run` does not exit at once.
 - **PD-27 Vet result.** The shared schema gains optional fields `risky: bool`, `risk_signals: [string]`, `duplicate_of: integer|null`. Vet outcome `pass` = adequate, `findings` = inadequate (reason in `summary`), `ask`, `fail`. `risky` is true when the agent says so or any `risk_signals` item is returned.
 - **PD-28 Stuck stage.** The task records `stuck_from` (the stage state it got stuck in) so `rework` on a branchless stuck task returns to that stage (§3.1 last rework row).
 - **PD-29 Conflict review.** After a `fix_kind=conflict` fix, the next review uses the closure template (`review_closure = 1` on the task) regardless of `round`.
@@ -80,22 +80,44 @@ Each is listed again under "Spec gaps" for the owner. Tasks cite them as **PD-n*
 - **PD-31 Setup pause end.** The `setup_failed` pause lifts by itself when the setup hash (command + `setup_inputs`) changes or after `setup_retry`; `resume --force` lifts it at once.
 - **PD-32 Vet in a slot.** Vet and attack-before-code run in a free slot detached at the integration tip (§3.1) with the reviewer profile; `vet` uses the `review` model.
 
-Added after controller attack #1 — all **(controller, 2026-10-20, owner to confirm)**:
+Added after controller attack #1 — all **(controller, 2026-10-20, confirmed by owner)**:
 
 - **PD-33 `.cmd` launchers.** cmd.exe decodes a batch file in the console code page and expands `%`. The `artel.cmd` shim and `write_wrapper`'s `.cmd` file are UTF-8 with a preamble that saves the active code page, switches to 65001 (`chcp 65001 >nul`) and restores it before exiting with the command's exit code; `%` in baked paths is written `%%`. This is the only exception to the plain UTF-8 rule (§12 says UTF-8; cmd.exe cannot read it otherwise).
 - **PD-34 Base job bookkeeping.** The base-moved job (§5 "Base moved") belongs to no task: it never sets a task's `running`; its pid, group, fingerprint and slot are stored in meta `base_running` (JSON) while it runs and reconcile terminates it like a task's tree; its setup/verify logs are `logs/base/<setup|verify>-<n>.log` with no `runs` row (`n` = 1 + existing files of that kind). An exception in it writes a runner `FAIL` entry with `task_id` NULL and pauses the board as `base_conflict` with `pause_detail = "internal error: <tail>"` (ended by `resume`).
 - **PD-35 "Ready with new commits" reference** (§3.1 rows 99–102). `write`: the task branch has commits not in `artel/integration` (`git rev-list --count artel/integration..HEAD` > 0). `fix` with `fix_kind` review or verify: `HEAD != task.fix_base`, where `fix_base` is the task-branch tip recorded by every transition into `fixing` (rows that set `fix_base=tip`; the caller passes `tip`). Conflict fix: `merge_committed`. Commits made before an `ask`, a requeue or a runner restart therefore count; a run-start comparison would reset finished work.
 - **PD-36 Accepted flag.** `accept` (R35) sets `accepted = 1`; `verify green` goes to `verified` when `merge = auto` or the task is `accepted` (R31a), to `awaiting_accept` only when `merge = ask` and not `accepted` (R31b). `accepted` is cleared when the task enters `fixing` from verify (R32, R33) or is reset (R17): changed code needs a new accept. Breaks the loop accept → fast-forward impossible → re-verify → `awaiting_accept` (§3.1 rows 118, 122, 124).
 - **PD-37 Risky tasks review on the strong model.** Vet rows R04c/R04d set `risky = 1`; `choose_model` escalates every review of a risky task to `models.strong` with reason `task risky (vet)` (§4 escalates on `--attack`; a vet-triggered attack is the same signal).
-- **PD-38 Internal error event.** `events.EVENT_KINDS` gains `error`: an internal runner error in a job (§3.1 says "notify", §7 has no kind). Text: task id, title, stage and "see artel show <id>" — never the traceback (§7: no file contents). `notify.on` accepts it and its default includes it.
+- **PD-38 Internal error event.** `events.EVENT_KINDS` gains `error`: an internal runner error in a job (§3.1 says "notify", §7 has no kind). Text: task id, title, stage and "see artel show <id>" — never the traceback (§7: no file contents). `notify.on` accepts it and its default includes it. *Confirmed (owner, 2026-10-20):* keep it in the default.
 - **PD-39 Conflict at the cap** (R34b). A merge conflict with `verify_fixes ≥ max_verify_fixes` blocks like a red verify (`asked_by=verify`, `cause=cap`); §3.1 "same, cap reached" is read as covering conflicts. The answer path is spec gap 3.
-- **PD-40 Limit hit in the result.** A run is `rate_limited` when it saw a rank-2 `rate_limit_event` or its result has `is_error: true` and `api_error_status == 429` (unobserved, spike Q2; Task 16 records what a real limit hit shows). A rate-limited run without a valid structured result is requeued with no counter and pauses the board; with a valid result the result is applied normally and the board only pauses. A limit hit seen only in the error result carries no reset time: the pause lasts until the latest future `resets_at` recorded in meta `limit:*`, else until `artel resume --force`, and the `paused` notification says so.
+- **PD-40 Limit hit in the result.** A run is `rate_limited` when it saw a rank-2 `rate_limit_event` or its result has `is_error: true` and `api_error_status == 429` (unobserved, spike Q2; Task 16 records what a real limit hit shows — owner 2026-10-20: Task 16 checks it explicitly). A rate-limited run without a valid structured result is requeued with no counter and pauses the board; with a valid result the result is applied normally and the board only pauses. A limit hit seen only in the error result carries no reset time: the pause lasts until the latest future `resets_at` recorded in meta `limit:*`, else until `artel resume --force`, and the `paused` notification says so.
 - **PD-41 `.cmd` agent command.** On Windows, when `agent_command` resolves to a `.cmd`/`.bat` file, `agent_claude.agent_argv` unwraps it to the program it launches (npm `cmd-shim` form: node + the `cli.js` path; `platform.write_wrapper` form: its quoted argv) so the inline `--json-schema` never passes through cmd.exe; an unrecognized batch file is an `ArtelError` naming `agent_command` and the list form to use. `claude.exe` wins over `claude.cmd` by `PATHEXT` order. Resolves spec gap 12's `.cmd` question without an owner decision.
 - **PD-42 Unknown closure ids.** `closed` ids that are not open review findings of the task are dropped before recording with a runner `FAIL` entry `closed #<id> ignored: not an open finding of #<task>`; they never fail the stage or cost an attempt.
 - **PD-43 Conflict fix skips setup.** A `fix` with `fix_kind=conflict` does not run setup (the merge may leave markers in `setup_inputs`, e.g. a lockfile, and setup would pause the board forever); the following verify rechecks `setup_inputs` (§5 step 7).
 - **PD-44 String `agent_command`.** A string `argv` setting is one executable name or path and is never split (shlex would eat Windows backslashes); arguments need the list form.
-- **PD-45 Integrate exactly the verified commit.** *(controller, 2026-10-20, owner to confirm; from s2's SPEC-GAP in T14)* `finish_verify` on green stores the verified commit in meta `verified:<task_id>` (full sha). `integrate_task` fast-forwards `artel/integration` only to that sha and only if `rev(artel/<id>)` still equals it; a different tip (anything committed after verify) → `ff_impossible` → reverify (R37). The key is deleted on `done`, on reset/delete of the branch, and whenever the task leaves `verified`/`awaiting_accept`. Spec §5 step 8.
-- **PD-46 A branch reset supersedes open review findings.** *(controller, 2026-10-20, owner to confirm; from the opus review of T13)* When a transition's effects include `reset_branch` (R17), every open review finding of the task is closed with a `CLOSE` entry by `artel` reading `superseded: branch reset (R17)`; attack findings stay open (they concern the task, not the code). The first review after a reset is a fresh review, so it must not inherit findings it cannot close (PD-3).
+- **PD-45 Integrate exactly the verified commit.** *(controller, 2026-10-20, confirmed by owner; from s2's SPEC-GAP in T14)* `finish_verify` on green stores the verified commit in meta `verified:<task_id>` (full sha). `integrate_task` fast-forwards `artel/integration` only to that sha and only if `rev(artel/<id>)` still equals it; a different tip (anything committed after verify) → `ff_impossible` → reverify (R37). The key is deleted on `done`, on reset/delete of the branch, and whenever the task leaves `verified`/`awaiting_accept`. Spec §5 step 8.
+- **PD-46 A branch reset supersedes open review findings.** *(controller, 2026-10-20, confirmed by owner; from the opus review of T13)* When a transition's effects include `reset_branch` (R17), every open review finding of the task is closed with a `CLOSE` entry by `artel` reading `superseded: branch reset (R17)`; attack findings stay open (they concern the task, not the code). The first review after a reset is a fresh review, so it must not inherit findings it cannot close (PD-3).
+
+Added by the owner's decisions on the checkpoint questions (`docs/checkpoint-2026-10-20.md` #1–#10) — all **(owner, 2026-10-20)**; PD-47/PD-48 tighten the spec, PD-52 changes spec §9 defaults (spec gaps 23–26, 31):
+
+- **PD-47 Protected paths.** *(owner, 2026-10-20; tightens the spec — spec gap 23)* New setting `protected_paths` (str_list) with default `[".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "artel.toml", ".artel/", ".github/", ".gitlab-ci.yml", ".githooks/", ".husky/", ".pre-commit-config.yaml", ".gitattributes"]`. Effective entries = the setting + `templates_dir` + every argv element of a **list-form** `commands.verify` / `commands.setup` that names a file existing at the `artel/integration` tip (repo-relative, `\` read as `/`; an absolute path inside the repository is made relative); string-form commands are not parsed (`config explain` says to list their scripts by hand). Matching is case-insensitive (casefold) on `/`-separated paths: an entry with no inner `/` (a trailing `/` is allowed) matches any path that has a component equal to it (`CLAUDE.md` matches `docs/CLAUDE.md`, `.claude/` matches `.claude/settings.json`); an entry with an inner `/` is a root-anchored path-component prefix (`scripts/verify.sh`, `tools/ci/`). Changed paths = `git diff --name-only --no-renames -z artel/integration...<tip>` (both sides of a rename count, deletions count). A task whose changed paths hit an entry: (a) every review runs on `models.strong` with reason `touches protected path <p> (protected_paths)` (after `--strong`/`--attack`/risky, before the diff-size rule); (b) on a green verify the merge is treated as `merge = ask` (R31b → `awaiting_accept`; an `accept` is still honoured through `accepted`, PD-36) and a runner VERDICT entry names the paths (≤ 3, then `+N more`) and the setting. An empty list disables it. Not covered (spec gap 23 remainder, deferred): a branch's `.claude/settings.json` hooks are still active for the reviewer and verify running in the slot; reading protected files from the integration tip is not built in v0.1.
+- **PD-48 Verify-fix review.** *(owner, 2026-10-20; tightens §3.1 row "fixing (`fix_kind=verify`) ready → verifying" — spec gap 24)* R15 goes to `reviewing` instead of `verifying`, no round added, sets `review_closure = 2` (1 stays the conflict closure of PD-29). A review with `review_closure == 2` uses the new built-in template `review-verify-fix.md` on `git diff <fix_base>..artel/<id>` (the fix only; `fix_base` is kept by R15) with the verify log tail and any open findings as `$closure_list`; weakening, skipping or deleting a test or check, editing verify/CI configuration, or special-casing the test environment is a **blocker** (PD-4 downgrades other new findings to minor, as in any closure round). The table then continues normally: R21 → `verifying`, R22a/b by `round`. The conflict closure (R16) is unchanged.
+- **PD-49 Attempts reset on stage success.** *(owner, 2026-10-20; checkpoint #4)* `attempts` counts failed runs of the stage the task is in (fail, invalid result, timeout, internal error). A stage **succeeds** when its job delivers a valid classified outcome other than `ask` and the task leaves the stage state: rows R04a–d, R05, R07a/b, R11, R12, R14a, R14b, R15, R16, R21, R22a, R22b (agent stages) and R31a, R31b, R32, R33, R34a, R34b (verify) set `attempts = 0`. `ask` (R18), `setup_failed` (R19), requeues and human events leave `attempts` as is (R29b/R30 reset it already). So `max_attempts` bounds consecutive failures of one stage, not failures over the task's life.
+- **PD-50 Branchless rework is limited to stages without code.** *(owner, 2026-10-20; checkpoint #5, §3.1 "stuck (no branch: vet or attack before code)")* R30 matches only when `task.stuck_from` is `vetting`, `attacking` or `writing`. `writing` is admitted because R17 deletes the branch before a writer gets stuck (PD-28): such a task has no code either, and Task 24 relies on it. A branchless stuck task with any other `stuck_from` (only possible when a human deleted `artel/<id>`) has no `rework` row → `TransitionError`; the request fails with `rework needs a branch; use reject or re-add the task`.
+- **PD-51 `review_rounds = 0`.** *(owner, 2026-10-20; checkpoint #6)* Allowed in `artel.toml` (minimum 0, unchanged) and in `artel add --review 0` (was refused). §3.1 always reviews after `ready`, so 0 behaves like 1: one review, and blocking findings go straight to a human (R22b) — reviews cannot be disabled. `artel add --review 0` prints `warning: --review 0 behaves like 1: one review, blocking findings go to you (no fix round)` to stderr; `config explain review_rounds` says the same; `Runner.start` prints a matching warning when the configured `review_rounds` is 0 (Task 22); `artel status` lists it under warnings (Task 19).
+- **PD-52 Owner defaults that differ from spec §9.** *(owner, 2026-10-20; checkpoint #2, #9, #10 — spec gaps 25, 26, 31)* `slots_dir = ".artel/slots"` (spec: `.claude/worktrees`, shared with Claude Code's own worktrees); `rotation.fix_resumes_writer = false` until Task 25 measures spike Q8 (flipping it back is a plan change by the controller after Task 25); `autoapprove = "none"` in v0.1 (every adequate agent-proposed task waits for `approve`). Each setting's `explain` text names the reason. The spec text is not edited by the build sessions; the README documents the effective defaults (generated table).
+
+**Owner decisions 2026-10-20** (checkpoint questions, all taken as recommended):
+1. Protected paths + verify-fix review → PD-47, PD-48; Tasks 30 (setting), 31 (R15 + template), 32 (behaviour).
+2. `slots_dir` default `.artel/slots` → PD-52, Task 30; Task 16 re-checks spike Q5 there.
+3. PD-6 unchanged: `blocked` / `awaiting_accept` hold no area → PD-6 (confirmed).
+4. `attempts` resets on stage success → PD-49, Task 31.
+5. R30 restricted to stages without code → PD-50, Task 31.
+6. `--review 0` allowed everywhere with a warning → PD-51; Tasks 30, 19, 22.
+7. `error` stays in the default `notify.on` → PD-38 (confirmed).
+8. PD-40's 429 assumption → Task 16 checklist.
+9. `fix_resumes_writer = false` until Task 25 → PD-52, Task 30; Task 26 tests set it explicitly.
+10. `autoapprove = "none"` in v0.1 → PD-52, Task 30; Task 21 tests set it explicitly.
+All controller amendments tagged "owner to confirm" (PD-6, PD-22, PD-23, PD-26 amendments; PD-33 … PD-46) are confirmed.
 
 ## Waves, slice, shared files
 
@@ -108,8 +130,8 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 | W3 | 6 Journal + pick · **7 Transitions** · 8 Procs · **9 Agent adapter** |
 | W4 | **10 Slots** · 11 Templates + agent commands · 12 Prompts · 29 T7 test hardening |
 | W5 | **13 Stages** · **14 Verify + integrate** |
-| W6 | **15 Runner core + happy-path e2e (vertical slice)** → 16 Live slice check (controller) |
-| W7 | 17 Notifier · 18 Requests · 19 Status/show/logs · 20 Stats |
+| W6 | **15 Runner core + happy-path e2e (vertical slice)** → 16 Live slice check (controller) · 30 Owner defaults + `--review 0` |
+| W7 | 17 Notifier · 18 Requests · 19 Status/show/logs · 20 Stats · **31 Transitions follow-up** → **32 Protected paths** |
 | W8 | **21 Vet** · **22 Runner limits, disk, stop, reconcile** · 23 Init |
 | W9 | 24 Runner loop e2e · 25 Live check `--resume` (controller) |
 | W10 | **26 Rotation** (skipped if Task 25 says resume is unusable) |
@@ -117,7 +139,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 
 **Vertical slice:** after Task 15, `artel add` → write → review → verify → integrate works end to end with the fake agent and one slot. Task 16 then runs one real `claude` (haiku) task in a toy repo before anything else is built on top.
 
-**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15, then read-only), `artel/config_schema.py` (5 only; later tasks must not add settings without a plan change), `artel/cmd_config.py` (5 → 11), `artel/runner.py` (15 → 18 → 22 → 26), `artel/stages.py` (13 → 21 → 26), `artel/prompts.py` (12 → 21), `tests/fake_agent.py` (9 → 26), `artel/cmd_human.py` (19 → 26). The wave table already respects this.
+**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15, then read-only), `artel/config_schema.py` (5 → 30 only; later tasks must not add settings without a plan change), `artel/cmd_config.py` (5 → 11), `artel/runner.py` (15 → 18 → 22 → 26), `artel/stages.py` (13 → 15 → 31 → 32 → 21 → 26), `artel/prompts.py` (12 → 31 → 21), `artel/transitions.py` (7 → 29 → 31), `artel/templates.py` (11 → 31), `artel/integrate.py` (14 → 32), `tests/test_runner_core.py` (15 → 31), `tests/fake_agent.py` (9 → 26), `artel/cmd_human.py` (19 → 26). The wave table already respects this.
 
 ---
 
@@ -966,17 +988,17 @@ Full test list (`tests/test_board.py`):
     | `context_budget` | int | `8000` |
     | `limit_stop` | enum allowed_warning/rejected | `"allowed_warning"` |
     | `min_free_disk` | size | `"3G"` |
-    | `slots_dir` | str | `".claude/worktrees"` |
+    | `slots_dir` | str | `".claude/worktrees"` → `".artel/slots"` (Task 30, PD-52) |
     | `slot_keep` | str_list | `["node_modules"]` |
     | `log_keep_tasks` | int | `50` |
     | `poll_interval` | duration | `"5s"` |
     | `setup_retry` | duration | `"15m"` (PD-31) |
-    | `autoapprove` | enum none/non_risky/all | `"non_risky"` |
+    | `autoapprove` | enum none/non_risky/all | `"non_risky"` → `"none"` (Task 30, PD-52) |
     | `risk_signals` | str_list | `["deletes data", "quotas or money", "protocol or public contract", "visible to end users"]` |
     | `rotation.writer_max_tasks` | int ≥ 1 | `1` (fresh writer for every task) |
     | `rotation.writer_max_context` | int ≥ 0 | `0` (no threshold until measured with `artel stats`) |
     | `rotation.same_area_only` | bool | `true` |
-    | `rotation.fix_resumes_writer` | bool | `true` |
+    | `rotation.fix_resumes_writer` | bool | `true` → `false` (Task 30, PD-52) |
     | `templates_dir` | str | `".artel/templates"` |
     | `agent_command` | argv | `"claude"` (resolved with `shutil.which`, so `claude.exe`/`claude.cmd` work on Windows) |
     | `shell` | enum auto/sh/bash/pwsh/cmd | `"auto"` (POSIX `sh`, Windows Git for Windows `bash`) |
@@ -1769,7 +1791,7 @@ Full test list:
         self.assertEqual(cm.exception.where.resolve(), other.resolve())
 ```
 
-Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths `<root>/.claude/worktrees/artel-1..2`, detached, registered); `test_ensure_is_idempotent`; `test_prepare_new_branch_from_integration_tip`; `test_prepare_resumes_existing_branch` (commit on `artel/5`, detach, prepare again → HEAD is that commit — "resume after ASK"); `test_prepare_after_reset_branch_starts_fresh` (`apply_git_effects(repo, board, cfg, tid, ["reset_branch"])` then prepare → HEAD == integration tip — "reset after FAIL"); `test_clean_keeps_slot_keep_paths` (untracked `node_modules/x` survives, untracked `junk.txt` and ignored `build/` removed); `test_uncommitted_changes_discarded`; `test_branch_held_by_other_worktree_is_refused`; `test_slot_reused_across_tasks` (task 1 then task 2 in slot 1); `test_detach_keeps_branch`; `test_setup_hash_changes_with_inputs_and_command`; `test_setup_skipped_when_hash_unchanged` (setup = list `py_cmd` that appends a line to a counter file outside the slot; runs once for two prepares); `test_setup_runs_under_heavy_prefix` (heavy_lock = list `[sys.executable, <marker script>]` where the script appends `locked` to a marker file and then runs `sys.argv[1:]` with `subprocess.run`, exiting with its code); `test_setup_failure_clears_hash` (setup `py_cmd("import sys; sys.exit(3)")` → "failed"); `test_setup_timeout` (setup `py_cmd("import time; time.sleep(30)")`, `setup_timeout = "1s"`, `kill_grace = "1s"` → "timeout"); `test_reconcile_prunes_and_detaches` (delete one slot dir by hand → pruned; other slot on a branch → detached); `test_delete_task_branch_detaches_slot_first`; `test_guard_refuses_unregistered_path` (a worktree created by hand under `slots_dir` but not registered → SlotGuardError, its untracked file survives); `test_guard_refuses_registered_path_outside_slots_dir` (board row edited to point at the main worktree → SlotGuardError, main worktree untouched); `test_leave_aborts_merge_in_progress` (start_conflict_merge, then leave_slot → no MERGE_HEAD, clean tree, detached); `test_prepare_detached_at_integration_tip`; `test_start_conflict_merge_reports_paths`; `test_setup_changed_detects_input_change`; `test_merge_identity_args_fallback` (identity env vars removed with `mock.patch.dict` and no `user.email` → the `-c` pair; configured → `[]`); `test_setup_for_base_job_logs_under_base` (`task_id=None` → `logs/base/setup-1.log`, no `runs` row); `test_setup_on_start_reports_kind_setup`.
+Full test list: `test_ensure_creates_detached_worktrees_under_slots_dir` (paths `<root>/.claude/worktrees/artel-1..2` — `.artel/slots` after Task 30 — detached, registered); `test_ensure_is_idempotent`; `test_prepare_new_branch_from_integration_tip`; `test_prepare_resumes_existing_branch` (commit on `artel/5`, detach, prepare again → HEAD is that commit — "resume after ASK"); `test_prepare_after_reset_branch_starts_fresh` (`apply_git_effects(repo, board, cfg, tid, ["reset_branch"])` then prepare → HEAD == integration tip — "reset after FAIL"); `test_clean_keeps_slot_keep_paths` (untracked `node_modules/x` survives, untracked `junk.txt` and ignored `build/` removed); `test_uncommitted_changes_discarded`; `test_branch_held_by_other_worktree_is_refused`; `test_slot_reused_across_tasks` (task 1 then task 2 in slot 1); `test_detach_keeps_branch`; `test_setup_hash_changes_with_inputs_and_command`; `test_setup_skipped_when_hash_unchanged` (setup = list `py_cmd` that appends a line to a counter file outside the slot; runs once for two prepares); `test_setup_runs_under_heavy_prefix` (heavy_lock = list `[sys.executable, <marker script>]` where the script appends `locked` to a marker file and then runs `sys.argv[1:]` with `subprocess.run`, exiting with its code); `test_setup_failure_clears_hash` (setup `py_cmd("import sys; sys.exit(3)")` → "failed"); `test_setup_timeout` (setup `py_cmd("import time; time.sleep(30)")`, `setup_timeout = "1s"`, `kill_grace = "1s"` → "timeout"); `test_reconcile_prunes_and_detaches` (delete one slot dir by hand → pruned; other slot on a branch → detached); `test_delete_task_branch_detaches_slot_first`; `test_guard_refuses_unregistered_path` (a worktree created by hand under `slots_dir` but not registered → SlotGuardError, its untracked file survives); `test_guard_refuses_registered_path_outside_slots_dir` (board row edited to point at the main worktree → SlotGuardError, main worktree untouched); `test_leave_aborts_merge_in_progress` (start_conflict_merge, then leave_slot → no MERGE_HEAD, clean tree, detached); `test_prepare_detached_at_integration_tip`; `test_start_conflict_merge_reports_paths`; `test_setup_changed_detects_input_change`; `test_merge_identity_args_fallback` (identity env vars removed with `mock.patch.dict` and no `user.email` → the `-c` pair; configured → `[]`); `test_setup_for_base_job_logs_under_base` (`task_id=None` → `logs/base/setup-1.log`, no `runs` row); `test_setup_on_start_reports_kind_setup`.
 
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Slots: worktree pool, prepare and detach, setup hash, branch effects"`
@@ -2258,6 +2280,8 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
 
 **Spec:** §15 (spike facts used by the adapter), §13 (the fake agent stands in for `claude`; this checks the stand-in against reality), Task 15's vertical slice.
 
+**Depends on:** Task 15, 30
+
 **Who runs it:** the controlling session (not a sub-agent), after the owner agrees to a few `haiku` runs (estimate: one task = 1 writer + 1–2 reviewers ≈ 3–5 invocations; the spike measured ≈ $0.007 per cold schema run).
 
 **Context for the writer:** n/a (controller).
@@ -2269,6 +2293,7 @@ Full test list: `test_happy_path_one_slot`; `test_review_findings_fix_then_done`
 - [ ] Create a toy repo in the scratchpad: `calc.py` with one function, `test_calc.py`, `commands.verify = [python, "-m", "unittest"]`, `project_tools = ["Bash(python -m unittest *)"]`, all three `models.*` = `haiku`, `max_agents = 1`; `artel.toml` written from `config.render_toml()` with those edits (init is Task 23).
 - [ ] `artel add "Add a subtract function with a test"`; `artel run -n 1` until the task is `done` or blocked/stuck; then stop the runner.
 - [ ] Record: final state; the stream logs' record types and the fields the adapter reads (`structured_output`, `rate_limit_info`, `assistant.message.usage`, `permission_denials`, `session_id`, `api_error_status`) — any mismatch with `agent_claude` constants; whether several `assistant` lines share one `message.id` (PD-23); any error result's `api_error_status` value (PD-40 assumes 429 for a limit hit); per-run usage and first/last context; wall time per stage; denials; whether the writer used only allowed commands; whether `leave_slot` left the slot clean; the integration commit.
+- [ ] Owner decisions 2026-10-20: (a) the writer edits and commits in `.artel/slots/artel-1` under `acceptEdits` (spike Q5 was measured only under `.claude/worktrees`) — any permission prompt or denial there is a blocker for Task 30's default; (b) PD-40: record `api_error_status` and `rate_limit_event` of any limit hit; if none occurs (expected on `haiku`), write "429 assumption not observed" so PD-40 stays marked unverified.
 - [ ] Every mismatch becomes a fix task for the adapter or stages before Wave 7 starts; list them at the end of the document.
 
 **Acceptance:** the document shows the task reaching `done` with a real agent, or names the exact failure and the fix that follows.
@@ -2411,7 +2436,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
   ```python
   def policy_summary(cfg) -> str
       # "agents 2 · review sonnet (opus if --strong/--attack or diff > 300) · rounds 2 · merge auto ·
-      #  autoapprove non_risky · rotation fresh per task · limit stop at allowed_warning ·
+      #  autoapprove none · rotation fresh per task · limit stop at allowed_warning ·
       #  notify telegram off, command off"
   def status_data(repo, board, cfg) -> dict
       # {"policy": str, "warnings": [str] (e.g. "commands.verify is empty: verified means 'agent said ready'",
@@ -2431,7 +2456,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
   def run_logs(args) -> int      # every log file of the task in run order: "== <stage>-<n> (<path>) ==" + content
   ```
 
-- [ ] **Step 1: Write the failing tests.** Full list: `test_status_starts_with_policy_line`; `test_status_json_shape`; `test_status_lists_pending_requests`; `test_status_warns_on_empty_verify` (PD-14); `test_status_shows_pause_and_runner_state`; `test_status_shows_waiting_reason`; `test_show_lists_effective_settings_with_reasons`; `test_show_groups_findings_open_closed`; `test_show_includes_runs_with_measurements`; `test_show_awaiting_approval_has_vet_and_attack_summaries`; `test_logs_prints_all_stage_logs_in_order`.
+- [ ] **Step 1: Write the failing tests.** Full list: `test_status_starts_with_policy_line`; `test_status_json_shape`; `test_status_lists_pending_requests`; `test_status_warns_on_empty_verify` (PD-14); `test_status_warns_on_review_rounds_zero` (PD-51: `review_rounds = 0` → a warning saying it behaves like 1); `test_status_shows_pause_and_runner_state`; `test_status_shows_waiting_reason`; `test_show_lists_effective_settings_with_reasons`; `test_show_groups_findings_open_closed`; `test_show_includes_runs_with_measurements`; `test_show_awaiting_approval_has_vet_and_attack_summaries`; `test_logs_prints_all_stage_logs_in_order`.
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_cmd_human -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Status, show, logs"`
 
@@ -2493,7 +2518,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
   - `record_stage` for `vet`: VERDICT `"PASS vet (adequate, risky: quotas or money) …"` or `"FINDINGS vet (inadequate: <summary>)"`; `duplicate_of` recorded as a FACT entry `duplicate of #<id>`; for `vet_inadequate` the reason is in the VERDICT (approve stays possible, R08).
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_vet.py` on `E2ECase`; agent-added tasks are created with `transitions.create(board, "add_agent", …)`).
-  Full list: `test_proposed_is_picked_for_vetting_in_a_detached_slot` (slot HEAD == integration tip, no task branch); `test_adequate_non_risky_opens_with_default_autoapprove` (then written, reviewed, done); `test_adequate_with_autoapprove_none_awaits_approval_then_approve_opens`; `test_risky_goes_to_attack_then_awaiting_approval` (strong model on the attack; `then` cleared afterwards; `risky` set; show lists vet and attack summaries; after approve, the review runs on `models.strong` with reason `task risky (vet)` — PD-37); `test_risky_with_autoapprove_all_opens_after_attack`; `test_inadequate_rejected_with_reason_and_approve_reopens`; `test_vet_fail_counts_and_sticks_then_rework_returns_to_vetting` (R06 then R30); `test_vet_ask_blocks_then_answer_returns_to_vetting` (R27); `test_vet_prompt_lists_open_tasks_and_risk_signals` (fake agent's recorded prompt); `test_vet_uses_reviewer_profile_and_review_model`.
+  Full list: `test_proposed_is_picked_for_vetting_in_a_detached_slot` (slot HEAD == integration tip, no task branch); `test_adequate_non_risky_opens_with_autoapprove_non_risky` (config sets `autoapprove = "non_risky"` — the default is `none` since Task 30; then written, reviewed, done); `test_adequate_with_autoapprove_none_awaits_approval_then_approve_opens`; `test_risky_goes_to_attack_then_awaiting_approval` (strong model on the attack; `then` cleared afterwards; `risky` set; show lists vet and attack summaries; after approve, the review runs on `models.strong` with reason `task risky (vet)` — PD-37); `test_risky_with_autoapprove_all_opens_after_attack`; `test_inadequate_rejected_with_reason_and_approve_reopens`; `test_vet_fail_counts_and_sticks_then_rework_returns_to_vetting` (R06 then R30); `test_vet_ask_blocks_then_answer_returns_to_vetting` (R27); `test_vet_prompt_lists_open_tasks_and_risk_signals` (fake agent's recorded prompt); `test_vet_uses_reviewer_profile_and_review_model`.
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_vet -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Vet: adequacy and risk check for proposed tasks"`
 
@@ -2564,7 +2589,7 @@ Full test list: `test_credentials_lookup_order` (subTests for each source; file 
             r.shutdown()
 ```
 
-Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows the Job Object may already have killed the agent; the assertions hold either way); `test_reconcile_skips_reused_pid` (fingerprint mismatch → not signalled); `test_heavy_lock_check_reports_stale_lock`; `test_rate_limit_warning_pauses_new_picks_until_reset` (fake emits a rank-1 status with `resets_at = clock + 2`; running stage finishes; no new pick until the fake clock passes it; `paused` then `resumed` via a recording notify); `test_unknown_status_treated_as_warning` (PD-22); `test_rate_limit_rejected_requeues_without_counter`; `test_limit_stop_rejected_ignores_warning`; `test_disk_guard_pauses_and_auto_resumes` (patch `artel.platform.free_bytes`); `test_setup_pause_lifts_when_inputs_change`; `test_setup_pause_lifts_after_setup_retry` (fake clock); `test_stop_file_soft_waits_for_running_stage`; `test_stop_now_terminates_and_requeues`; `test_signal_soft_stop_and_runner_stopped_notification` (runner subprocess started with `**platform.popen_kwargs()` and `subprocess_env()`, then `platform.soft_terminate(proc.pid, platform.group_of(proc))`; exit code 0; a list-form command notifier receives `runner_stopped`); `test_stage_timeout_counts_attempt`; `test_log_retention_keeps_last_n` (`log_keep_tasks = 2`); `test_base_conflict_pauses_and_notifies`; `test_setup_failed_pause_notifies` (§3.1: `paused` with the setup detail); `test_reconcile_terminates_orphaned_base_job` (meta `base_running` of a killed runner → its tree terminated, key deleted — PD-34); `test_limit_error_result_pauses_without_reset_time` (fake `result_error: 429` → requeue without counter, pause `limit` with no `pause_until`, `paused` text names `resume --force`; with a future `limit:five_hour` in meta → paused until it — PD-40); `test_rate_limit_meta_is_json` (Task 4 format); `test_second_signal_still_soft` (two soft signals → still waits for the running stage; the handler never prints). (PD-8 "branch checked out elsewhere" is tested in Task 15, which implements it.)
+Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows the Job Object may already have killed the agent; the assertions hold either way); `test_start_warns_when_review_rounds_zero` (PD-51: `Runner.start` prints `warning: review_rounds = 0 behaves like 1 …` to stderr; no warning at 1); `test_reconcile_skips_reused_pid` (fingerprint mismatch → not signalled); `test_heavy_lock_check_reports_stale_lock`; `test_rate_limit_warning_pauses_new_picks_until_reset` (fake emits a rank-1 status with `resets_at = clock + 2`; running stage finishes; no new pick until the fake clock passes it; `paused` then `resumed` via a recording notify); `test_unknown_status_treated_as_warning` (PD-22); `test_rate_limit_rejected_requeues_without_counter`; `test_limit_stop_rejected_ignores_warning`; `test_disk_guard_pauses_and_auto_resumes` (patch `artel.platform.free_bytes`); `test_setup_pause_lifts_when_inputs_change`; `test_setup_pause_lifts_after_setup_retry` (fake clock); `test_stop_file_soft_waits_for_running_stage`; `test_stop_now_terminates_and_requeues`; `test_signal_soft_stop_and_runner_stopped_notification` (runner subprocess started with `**platform.popen_kwargs()` and `subprocess_env()`, then `platform.soft_terminate(proc.pid, platform.group_of(proc))`; exit code 0; a list-form command notifier receives `runner_stopped`); `test_stage_timeout_counts_attempt`; `test_log_retention_keeps_last_n` (`log_keep_tasks = 2`); `test_base_conflict_pauses_and_notifies`; `test_setup_failed_pause_notifies` (§3.1: `paused` with the setup detail); `test_reconcile_terminates_orphaned_base_job` (meta `base_running` of a killed runner → its tree terminated, key deleted — PD-34); `test_limit_error_result_pauses_without_reset_time` (fake `result_error: 429` → requeue without counter, pause `limit` with no `pause_until`, `paused` text names `resume --force`; with a future `limit:five_hour` in meta → paused until it — PD-40); `test_rate_limit_meta_is_json` (Task 4 format); `test_second_signal_still_soft` (two soft signals → still waits for the running stage; the handler never prints). (PD-8 "branch checked out elsewhere" is tested in Task 15, which implements it.)
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_runner_ops -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** three times — PASS.
 - [ ] **Step 5: Commit** — `git commit -m "Runner: limits, disk guard, pauses, stop, reconcile, notifications"`
 
@@ -2637,7 +2662,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 - Produces: no new interfaces.
 
 - [ ] **Step 1: Write the tests** (all on `E2ECase`, `poll_interval = "100ms"`, injected clock where time matters, `subprocess_env()` for any `python -m artel` child).
-  Full list: `test_review_fix_closure_loop_then_done`; `test_review_cap_blocks_then_answer_adds_round_and_finishes` (R22b → R26 via a request); `test_reviewer_question_answer_returns_to_review` (R18 → R25); `test_verify_red_fix_loop_with_cap_blocks` (R33 ×2 → R34a); `test_verify_conflict_fix_resolves_markers_then_closure_review_then_done` (R32 → R16 → closure template → R21 → done); `test_merge_ask_waits_then_accept_after_integration_moved_reverifies` (R31b → R35 → R37 → R31a because `accepted` (PD-36) → done, no second `awaiting_accept`); `test_writer_fail_twice_goes_stuck_then_rework_rewrites` (R17 ×2 → stuck_from writing → R30); `test_resume_after_ask_keeps_branch_commits`; `test_slot_reuse_across_tasks_leaves_slots_clean`; `test_branch_held_by_human_worktree_is_skipped_then_picked_after_release`; `test_agent_proposed_task_vetted_and_finished` (agent `artel add` from inside a writer stage → proposed → vetting → open → done); `test_risky_proposal_waits_for_approve`; `test_reject_running_task_from_another_process` (`artel reject` CLI subprocess while the writer runs); `test_two_tasks_parallel_overlapping_areas_serialized`; `test_base_moved_during_run_merged_and_verified`.
+  Full list: `test_review_fix_closure_loop_then_done`; `test_review_cap_blocks_then_answer_adds_round_and_finishes` (R22b → R26 via a request); `test_reviewer_question_answer_returns_to_review` (R18 → R25); `test_verify_red_fix_loop_with_cap_blocks` (R33 → R15 verify-fix review (`review-verify-fix.md`, PD-48) → R21 → R33 → … → R34a); `test_verify_conflict_fix_resolves_markers_then_closure_review_then_done` (R32 → R16 → closure template → R21 → done); `test_merge_ask_waits_then_accept_after_integration_moved_reverifies` (R31b → R35 → R37 → R31a because `accepted` (PD-36) → done, no second `awaiting_accept`); `test_writer_fail_twice_goes_stuck_then_rework_rewrites` (R17 ×2 → stuck_from writing → R30, PD-50); `test_resume_after_ask_keeps_branch_commits`; `test_slot_reuse_across_tasks_leaves_slots_clean`; `test_branch_held_by_human_worktree_is_skipped_then_picked_after_release`; `test_agent_proposed_task_vetted_and_finished` (agent `artel add` from inside a writer stage → proposed → vetting → open → done); `test_risky_proposal_waits_for_approve`; `test_reject_running_task_from_another_process` (`artel reject` CLI subprocess while the writer runs); `test_two_tasks_parallel_overlapping_areas_serialized`; `test_base_moved_during_run_merged_and_verified`.
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_runner_e2e -v`; fix what fails (smallest change, in the module that owns the behavior); re-run.
 - [ ] **Step 3: Whole suite** three times — PASS; CI matrix green once pushed.
 - [ ] **Step 4: Commit** — `git commit -m "Runner e2e: review, verify, conflict, accept, stuck and vetting loops"`
@@ -2658,14 +2683,14 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 - Create: `docs/spike-resume-<YYYY-MM-DD>.md` (docs-only commit)
 
 **Checks (each with the exact command line, the relevant stream excerpts, and a conclusion):**
-1. In a throwaway repo with a worktree at `.claude/worktrees/artel-1`, run a writer-profile stage exactly as `agent_claude.build_argv` builds it (lean common line, `--json-schema` inline, `--permission-mode acceptEdits`, prompt on stdin); record `session_id` from `system/init` and `result`.
+1. In a throwaway repo with a worktree at `.artel/slots/artel-1` (PD-52), run a writer-profile stage exactly as `agent_claude.build_argv` builds it (lean common line, `--json-schema` inline, `--permission-mode acceptEdits`, prompt on stdin); record `session_id` from `system/init` and `result`.
 2. From the same cwd: the same profile plus `--resume <session_id>`, prompt on stdin. Does it run with `--output-format stream-json --verbose --json-schema`? Is `structured_output` present? Is `session_id` the same or new? Must the profile flags be repeated (does the resumed run keep the original `--allowedTools`/`--permission-mode` or take the new ones)?
 3. Cost of the resumed first call: `assistant.message.usage` of call 1 (cache_read vs cache_creation) compared with a fresh run of the same prompt; context size (input + cache tokens) of the last call before and after.
 4. Resume from a different cwd (the main worktree or `artel-2`): error text, exit code, whether a `result` record is emitted — this is the "failed resume" signal the runner must detect.
 5. Resume with an unknown id: same questions as 4.
 6. Does `--append-system-prompt-file` apply to the resumed run (notice file changed between runs → which text is in effect)?
 
-**Acceptance:** the document answers 1–6 with evidence and ends with "resume usable for rotation: yes/no" plus the exact failed-resume signal. If "no", Task 26 is skipped, and the spec gap "rotation defaults assume a working resume" goes to the owner.
+**Acceptance:** the document answers 1–6 with evidence and ends with "resume usable for rotation: yes/no" plus the exact failed-resume signal. `rotation.fix_resumes_writer` stays `false` (PD-52) unless the controller amends the plan after a "yes". If "no", Task 26 is skipped, and the spec gap "rotation defaults assume a working resume" goes to the owner.
 
 ---
 
@@ -2714,7 +2739,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
   - `Runner` assigns, for each selected task, `rotation.decide(...)`'s slot when it names one, else any free slot.
 
 - [ ] **Step 1: Write the failing tests** (`tests/test_rotation.py`; fake agent extended: with `--resume <id>` it appends the id to `calls.jsonl`, emits the same `session_id`, and fails in the Task 25 failed-resume shape when the scenario action `{"resume_fails": true}` is present).
-  Full list: `test_reviewers_and_attackers_always_fresh`; `test_default_write_is_fresh_per_task` (`writer_max_tasks = 1`); `test_fix_resumes_writer_session_in_same_slot` (reason text includes the context numbers); `test_fix_fresh_when_disabled`; `test_fix_fresh_when_slot_busy`; `test_fresh_when_context_over_threshold`; `test_write_continues_within_max_tasks_same_area` (`writer_max_tasks = 3`); `test_write_fresh_for_other_area_when_same_area_only`; `test_failed_resume_falls_back_fresh_without_attempt` (attempts unchanged; session retired; second call has no `--resume`); `test_zero_context_threshold_means_unset` (context 500k with `writer_max_context = 0` still resumes); `test_show_lists_continuations_with_reasons`; `test_runner_prefers_session_slot` (e2e with fake agent: write in slot 2, review elsewhere, fix runs again in slot 2 with `--resume`).
+  Full list: `test_reviewers_and_attackers_always_fresh`; `test_default_write_is_fresh_per_task` (`writer_max_tasks = 1`); `test_fix_resumes_writer_session_in_same_slot` (config sets `fix_resumes_writer = true`; reason text includes the context numbers); `test_fix_fresh_when_disabled` (the default since Task 30, PD-52); `test_fix_fresh_when_slot_busy`; `test_fresh_when_context_over_threshold`; `test_write_continues_within_max_tasks_same_area` (`writer_max_tasks = 3`); `test_write_fresh_for_other_area_when_same_area_only`; `test_failed_resume_falls_back_fresh_without_attempt` (attempts unchanged; session retired; second call has no `--resume`); `test_zero_context_threshold_means_unset` (context 500k with `writer_max_context = 0` still resumes); `test_show_lists_continuations_with_reasons`; `test_runner_prefers_session_slot` (e2e with fake agent: write in slot 2, review elsewhere, fix runs again in slot 2 with `--resume`).
 - [ ] **Step 2: Run** `python3 -m unittest tests.test_rotation -v` — FAIL. **Step 3: Implement.** **Step 4: Whole suite** — PASS .
 - [ ] **Step 5: Commit** — `git commit -m "Rotation: writer session continuation with recorded reasons"`
 
@@ -2742,7 +2767,7 @@ Full test list: `test_reconcile_after_hard_kill_terminates_orphans` (on Windows 
 
 Content requirements per section (§11): (1) three sentences + "when not to use it" (single-shot edits, repos where agents may not run project scripts); (2) one ASCII diagram: `open → [attack] → write → review ⇄ fix → verify (merged tree) → integrate → done`, with blocked/stuck/awaiting_accept branches and the runner/slots; (3) install, `artel init` questions (agents, review model, rotation, auto-approval, verify) and `--yes`, (`pipx install artel-agents` / `uv tool install artel-agents`, or `python artel.pyz` from a release; on Windows: Git for Windows required, `git config core.longpaths true`), `artel init` including the Telegram check, `artel add`, `artel run`, reading `artel status` and `artel show`; (5) one example command and its effect for answer, accept, rework, reject, approve, pause, stop; (6) default cost, with the arithmetic named: `review_rounds = 2` means at most 2 reviews and so at most 1 review fix (review fixes ≤ `review_rounds` − 1); verify fixes ≤ `max_verify_fixes` (2); so one task costs 1 writer + ≤ 2 reviewers + ≤ 1 review fix + ≤ 2 verify fixes (+1 attacker with `--attack`), each failed stage retried up to `max_attempts`; spec §11.6 says "up to 2 fixes" — see Spec gaps; escalation rules, vetting of agent-proposed tasks (one `vet` run each; risky ones add a strong-model attack), writer session rotation (`[rotation]`: fixes resume the writer by default, reviewers always fresh — only if Task 26 shipped), how to measure before tuning (`artel stats`), limit pause behavior with `limit_stop`; (7) permission model per stage (explicit `--permission-mode`; why: `-p` inherits the user's `defaultMode`), never `bypassPermissions`, the notice is best effort against `CLAUDE.md` (spike Q7 open), allowing `npm run *` lets agents run code they edited, `CLAUDE.md` approval rules vs the unattended notice, what Telegram sends (task id, title, state, question — no secrets, no file contents), send-only bot; (8) stuck tasks (`show`, `rework`), stale heavy lock (`heavy_lock_check`), disk guard (`min_free_disk`), second runner error, reading logs (`artel logs`, log location), base conflict (`resume` after resolving on `artel/integration`), Windows specifics (Git Bash not found → `shell` / `CLAUDE_CODE_GIT_BASH_PATH`; string commands vs list form; long paths).
 
-- [ ] **Step 1: Write the failing tests.** Full list: `test_sections_in_order`; `test_defaults_table_matches_generator` (extract between markers, compare with `defaults_markdown()`); `test_every_setting_in_table`; `test_safety_mentions_required_points` (substrings: `bypassPermissions`, `npm run`, `CLAUDE.md`, `getUpdates` or "send-only"); `test_quick_start_commands_exist` (every `artel <cmd>` in fenced code blocks is a key of `cli.COMMANDS`); `test_no_out_of_scope_features_documented` (`propose_minors`, `done_digest`, `integration = "base"` absent).
+- [ ] **Step 1: Write the failing tests.** Full list: `test_sections_in_order`; `test_defaults_table_matches_generator` (extract between markers, compare with `defaults_markdown()`); `test_every_setting_in_table`; `test_safety_mentions_required_points` (substrings: `bypassPermissions`, `npm run`, `CLAUDE.md`, `protected_paths`, `getUpdates` or "send-only"); `test_quick_start_commands_exist` (every `artel <cmd>` in fenced code blocks is a key of `cli.COMMANDS`); `test_no_out_of_scope_features_documented` (`propose_minors`, `done_digest`, `integration = "base"` absent).
 - [ ] **Step 2: Run** — FAIL. **Step 3: Write the README**; generate the table with `python3 -m artel.config_schema --markdown`. **Step 4: Whole suite** — PASS.
 - [ ] **Step 5: Commit** (docs commit, separate from code) — `git commit -m "README: user guide with generated defaults table"`
 
@@ -2820,6 +2845,119 @@ Content requirements per section (§11): (1) three sentences + "when not to use 
 
 ---
 
+### Task 30: Owner defaults — `slots_dir`, `autoapprove`, `fix_resumes_writer`, `protected_paths` setting, `--review 0`
+
+**Spec:** §9 (defaults changed by the owner, PD-52), §10 (every setting explains its value and source), §3 (slot location), §8 (`artel add --review N`), PD-47 (setting only), PD-51, PD-52. Source: owner decisions 2026-10-20 (checkpoint #2, #6, #9, #10; #1 for the setting). Runs in wave 6 beside Task 15's rework: it touches none of Task 15's files, and Task 16 waits for it so the live check runs with the new slot path.
+
+**Context for the writer:** Global Constraints + PD-47, PD-51, PD-52 + this task. Every test added here names, in its docstring, the mutation it catches.
+
+**Files:**
+- Modify: `artel/config_schema.py`, `tests/test_config.py`
+- Modify: `artel/cmd_agent.py` (`--review 0`), `tests/test_cmd_agent.py` (or the module that holds `artel add` tests today)
+- Modify: `artel/slots.py` (docstring/comment text only), `tests/test_slots.py` (expected slot paths)
+
+**Interfaces:**
+- Consumes: T5 (`Setting`, `_s`, `SETTINGS`, `explain`), T11 (`cmd_agent.run_add`), T10 (`slots.slot_path`).
+- Produces / changes (no new names except the setting):
+  - `SETTINGS` defaults: `slots_dir` → `".artel/slots"`; `autoapprove` → `"none"`; `rotation.fix_resumes_writer` → `false`. Their `explain` texts state the reason (`slots_dir`: "kept apart from `.claude/worktrees`, where Claude Code and people keep their own worktrees"; `autoapprove`: "agent-proposed tasks wait for `artel approve` in v0.1"; `fix_resumes_writer`: "off until resume is measured (spike Q8, Task 25)").
+  - New setting `protected_paths` (kind `str_list`, default exactly the PD-47 list, in the same section as `merge`; `meaning` "Paths whose change forces merge=ask and a strong-model review."; `cost` "A strong-model review for tasks that touch them."; `explain` states the matching rule, the derived entries (templates_dir, list-form verify/setup files) and that an empty list turns it off). The setting only exists here; Task 32 uses it.
+  - `review_rounds`: minimum stays 0; its `explain` adds "0 behaves like 1: one review, blocking findings go to you; reviews cannot be turned off" (PD-51).
+  - `artel add --review N`: accepts N ≥ 0 (N < 0 → `UsageError("--review must be at least 0")`); N == 0 prints the PD-51 warning line to stderr and still adds the task (exit 0).
+  - The plan's Task 5 defaults table is superseded for these four keys; README regenerates from the schema (Task 27).
+
+- [ ] **Step 1: Write the failing tests.**
+  - `tests/test_config.py`: update the expected-defaults dict (`slots_dir`, `autoapprove`, `rotation.fix_resumes_writer`, new `protected_paths`) — catches a default left at the spec value; `test_protected_paths_default_exact` (the exact PD-47 list, order included); `test_review_rounds_explain_mentions_zero` (`explain("review_rounds")` contains "0 behaves like 1"); `test_changed_defaults_explain_reason` (each of the three explain texts contains its reason keyword: `.claude/worktrees`, `approve`, `Task 25`) — catches a default changed without its visible reason (§10).
+  - `artel add` tests: `test_add_review_zero_accepted_with_warning` (exit 0, task `review_rounds == 0`, stderr contains `--review 0 behaves like 1`) — catches the old `< 1` check; `test_add_review_negative_refused` (exit 2, nothing inserted) — catches dropping the check entirely; `test_add_review_one_no_warning` (stderr empty) — catches warning on every value.
+  - `tests/test_slots.py`: expected paths `<root>/.artel/slots/artel-<n>` — catches `slot_path` hard-coding the old directory.
+- [ ] **Step 2: Run** `python3 -m unittest tests.test_config tests.test_slots <add tests> -v` — FAIL. **Step 3: Implement.**
+- [ ] **Step 4: Whole suite** — PASS (also with `PYTHONWARNDEFAULTENCODING=1 PYTHONWARNINGS=error::EncodingWarning`); fix any other test that assumed an old default by setting the value explicitly in that test, never by reverting the default.
+- [ ] **Step 5: Commit** — `T30: owner defaults (slots_dir, autoapprove, fix_resumes_writer), protected_paths setting, --review 0`
+
+**Acceptance:** `artel config` shows the new defaults with their reasons; `artel add --review 0` works with the warning; the slot pool is created under `.artel/slots`; CI green on all six jobs.
+
+---
+
+### Task 31: Transitions follow-up — attempts reset on success, branchless rework limit, verify-fix review — **RISKY (strong-model review)**
+
+**Spec:** §3.1 (rows "writing, fixing ready", "fixing (`fix_kind=verify`) ready", "stuck (no branch: vet or attack before code)", counters), §4 (closure checks; template per stage), §10 (VERDICTs name the setting), PD-4, PD-28, PD-29, PD-35, PD-48, PD-49, PD-50. Source: owner decisions 2026-10-20 (checkpoint #1 verify-fix review, #4, #5).
+
+**Context for the writer:** Global Constraints + PD-4, PD-28, PD-29, PD-35, PD-48, PD-49, PD-50 + Task 7's table and guard semantics (read-only reference) + this task.
+
+**Files:**
+- Modify: `artel/transitions.py`, `tests/test_transitions.py`
+- Modify: `artel/templates.py` (`TEMPLATE_NAMES`), Create: `artel/builtin_templates/review-verify-fix.md`, Modify: `tests/test_templates.py`
+- Modify: `artel/prompts.py` (`template_name`), `tests/test_prompts.py`
+- Modify: `artel/stages.py` (`plan_stage`: `diff_range` for `review_closure == 2`), `tests/test_stages.py`
+- Modify: `tests/test_runner_core.py` (Task 15's `test_verify_red_fix_then_done` scenario gains the verify-fix review result), any other test that asserted R15 → `verifying`
+
+**Interfaces:**
+- Consumes: T7 table/engine, T11 templates, T12 prompts, T13 stages, T15 e2e.
+- Produces / changes:
+  - Table rows (everything else unchanged):
+    - R15: `Row("R15", ("fixing",), "ready", "reviewing", when=("fix_kind=verify",), sets=("fix_kind=none", "review_closure=2", "attempts=0"))` — `fix_base` is kept (PD-48).
+    - `attempts=0` added to the `sets` of R04a, R04b, R04c, R04d, R05, R07a, R07b, R11, R12, R14a, R14b, R16, R21, R22a, R22b, R31a, R31b, R32, R33, R34a, R34b (PD-49).
+    - R30: `when=("no_branch", "stuck_from=vetting|attacking|writing")` — new guard `stuck_from=a|b|c` → `task.stuck_from in (a, b, c)` (PD-50).
+    - `sets` grammar accepts `review_closure=2`.
+  - `templates.TEMPLATE_NAMES` gains `"review-verify-fix.md"` (after `"review-closure.md"`); `templates export` exports it like the others.
+  - `prompts.template_name`: review → `review-verify-fix.md` if `task.review_closure == 2`, else the PD-29 rule.
+  - `stages.plan_stage`: for a review with `review_closure == 2`, `diff_range = f"{task.fix_base}..artel/{task.id}"` and the latest verify log tail goes in `$verify_log`; open review findings are the `$closure_list` as in any closure round.
+  - `review-verify-fix.md` (built-in text, uses only existing PLACEHOLDERS): the writer fixed a red verify on the merged tree; review only `git diff $diff_range`; blocker = any change that weakens, skips, deletes or loosens a test or check, edits verify/CI configuration, or special-cases the test environment; otherwise check the fix addresses `$verify_log`; close ids from `$closure_list` with basis; read-only; same result schema.
+
+- [ ] **Step 1: Write the failing tests.**
+  - `tests/test_transitions.py`: `test_R15_verify_fix_ready_goes_reviewing_closure_2` (exact updates `{"state": "reviewing", "fix_kind": None, "review_closure": 2, "attempts": 0}`, no `round`, `fix_base` absent from updates) — catches R15 left at `verifying` or adding a round; `test_success_rows_reset_attempts` (subTest per listed row, task with `attempts=1` → `updates["attempts"] == 0`) — catches any listed row without the reset; `test_non_success_rows_keep_attempts` (R18, R19, R13/R17 below the cap, R23–R28, R35–R37 with `attempts=1` → no `attempts: 0` in updates) — catches resetting on `ask` or human events; `test_R30_only_for_codeless_stuck_stages` (stuck_from `vetting`/`attacking`/`writing` → that state; `reviewing`/`fixing`/`verifying` with `has_branch=False` → `TransitionError`) — catches the old unrestricted R30; update every existing exact-updates assertion (Task 29) for the new `attempts` key; `test_table_rows_are_unambiguous` still passes with the new guard in its combinations.
+  - `tests/test_templates.py`: `TEMPLATE_NAMES` exact tuple; `review-verify-fix.md` uses only `PLACEHOLDERS`; export writes it.
+  - `tests/test_prompts.py`: `test_template_name_verify_fix_review` (`review_closure=2` → `review-verify-fix.md`; `1` → `review-closure.md`; round 2 with 0 → `review-closure.md`) — catches `review_closure` treated as a bool.
+  - `tests/test_stages.py`: `test_verify_fix_review_diff_range_is_the_fix` (fake reviewer records its prompt; `$diff_range` == `<fix_base>..artel/<id>`, the verify log tail is in it) — catches a full-branch diff; `test_verify_fix_ready_goes_reviewing` replaces the old "→ verifying" assertion; `test_attempts_reset_after_success` (write fails once → attempts 1; next write succeeds → attempts 0) — catches a reset only in the table tests' imagination (stages must not overwrite it).
+  - `tests/test_runner_core.py`: `test_verify_red_fix_then_done` scenario gains `review` results for the verify-fix review; assert the journal shows a review run with template `review-verify-fix.md` between the fix and the second verify.
+- [ ] **Step 2: Run** the touched test modules — FAIL. **Step 3: Implement.** **Step 4: Whole suite** three times (CI encoding env) — PASS; mutation spot-check: drop `attempts=0` from R21, restore R15's target to `verifying`, remove the R30 guard — each must fail.
+- [ ] **Step 5: Commit** — `T31: attempts reset on success, R30 limited to codeless stages, verify-fix review`
+
+**Acceptance:** every listed row has the exact new effect under test; a verify fix cannot reach `verifying` without a review of the fix; CI green on all six jobs.
+
+---
+
+### Task 32: Protected paths — strong review and forced `merge = ask` — **RISKY (strong-model review)**
+
+**Spec:** §4 (model escalation), §3.1 (verify green → verified / awaiting_accept), §5 step 7–8 (verify on the merged tree, integrate), §10 (VERDICT names the setting), PD-36, PD-37, PD-45, PD-47. Source: owner decision 2026-10-20 (checkpoint #1).
+
+**Context for the writer:** Global Constraints + PD-36, PD-37, PD-45, PD-47 + this task.
+
+**Files:**
+- Create: `artel/protect.py`, `tests/test_protect.py`
+- Modify: `artel/stages.py` (`choose_model` escalation, `plan_stage` passes the hits), `tests/test_stages.py`
+- Modify: `artel/integrate.py` (`finish_verify` on green), `tests/test_integrate.py`
+
+**Interfaces:**
+- Consumes: T1 `Repo`, `INTEGRATION`, `task_branch`; T5 `protected_paths`, `templates_dir`, `commands.verify`, `commands.setup` (Task 30); T7 `Limits`; T13 `choose_model`, `plan_stage`; T14 `finish_verify`.
+- Produces:
+  - `artel.protect`:
+    ```python
+    def entries(repo: Repo, cfg: Config) -> tuple[str, ...]
+        # cfg["protected_paths"] + (templates_dir,) + files named by list-form commands.verify/commands.setup
+        # that exist at the artel/integration tip (git cat-file -e), normalized per PD-47; deduplicated, sorted
+    def matches(path: str, entry: str) -> bool
+        # PD-47 rule, casefold; entry without an inner "/" → any path component equal to it;
+        # entry with an inner "/" → root-anchored path-component prefix
+    def changed_paths(repo: Repo, tip: str) -> list[str]
+        # git diff --name-only --no-renames -z artel/integration...<tip>; sorted
+    def hits(repo: Repo, cfg: Config, tip: str) -> list[str]
+        # changed paths that match any entry; [] when protected_paths is empty
+    def summary(paths: Sequence[str]) -> str   # "a, b, c +2 more"
+    ```
+  - `stages.choose_model(cfg, task, stage, diff, *, protected: Sequence[str] = ())` — review only: after `--strong`, `--attack` and risky (PD-37), a non-empty `protected` → `(models.strong, f"touches protected path {protected[0]} (protected_paths)")`; then the diff rule. `plan_stage` passes `protect.hits(repo, cfg, task_branch(task.id))` for reviews.
+  - `integrate.finish_verify` on green: `hits(repo, cfg, verified_sha)` non-empty and effective `merge == "auto"` → the event is applied with `dataclasses.replace(limits, merge="ask")` and a runner `VERDICT` entry `merge=ask: touches protected path(s) <summary> (protected_paths)` is journaled in the same transaction; an `accepted` task still goes to `verified` (R31a, PD-36).
+
+- [ ] **Step 1: Write the failing tests.**
+  - `tests/test_protect.py`: `test_matches_component_anywhere` (`CLAUDE.md` vs `CLAUDE.md`, `docs/CLAUDE.md`, not `CLAUDE.md.bak`; `.claude/` vs `.claude/settings.json`, `a/.claude/x`) — catches substring matching; `test_matches_anchored_prefix` (`scripts/verify.sh` vs `scripts/verify.sh`, not `x/scripts/verify.sh`, not `scripts/verify.sh2`); `test_matches_casefold` (`claude.md` hits `CLAUDE.md`) — catches case-sensitive compare (macOS/Windows); `test_entries_derive_list_form_verify_files` (`commands.verify = [python, "tools/check.py"]` with the file committed on integration → entry present; a non-existent arg and a string-form command add nothing) — catches parsing string commands or adding flags; `test_entries_include_templates_dir`; `test_changed_paths_counts_both_sides_of_rename_and_deletions` (real repo) — catches `-M` rename collapsing; `test_hits_empty_when_setting_empty`; `test_summary_caps_at_three`.
+  - `tests/test_stages.py`: `test_choose_model_protected_review_is_strong` (reason text exact; `--strong` still wins first; write/fix unaffected) — catches escalation of writers or wrong precedence; `test_plan_stage_passes_protected_hits` (task branch edits `CLAUDE.md` → review run's model is `models.strong`).
+  - `tests/test_integrate.py`: `test_green_verify_touching_protected_goes_awaiting_accept` (merge auto, branch edits `.claude/settings.json` → `awaiting_accept`, VERDICT names the path and `protected_paths`) — catches the check skipped on green; `test_accepted_protected_task_goes_verified` (accept after awaiting → re-verify green → `verified`) — catches a loop through `awaiting_accept`; `test_unprotected_change_auto_merges` — catches forcing ask always; `test_protected_hit_uses_verified_sha` (a commit after verify is not what is checked) — PD-45 consistency.
+- [ ] **Step 2: Run** the touched modules — FAIL. **Step 3: Implement.** **Step 4: Whole suite** three times (CI encoding env) — PASS.
+- [ ] **Step 5: Commit** — `T32: protected paths force merge=ask and a strong-model review`
+
+**Acceptance:** a branch that edits a protected path never auto-merges and is reviewed on `models.strong`, each with its reason visible (VERDICT, `artel show`); CI green on all six jobs.
+
+---
+
 ## Review routing
 
 | Task | Reviewer | Why |
@@ -2834,6 +2972,8 @@ Content requirements per section (§11): (1) three sentences + "when not to use 
 | T21 Vet | strong | Gate between agent-proposed work and the queue. |
 | T22 Runner ops | strong | Limits, pauses, reconcile after a crash, stop and signals. |
 | T26 Rotation | strong | Session reuse must never reach reviewers; failed-resume fallback. |
+| T31 Transitions follow-up | strong | Table rows change (attempts, R15, R30); verify fixes now pass a review. |
+| T32 Protected paths | strong | Decides what may auto-merge; path matching across case-insensitive file systems. |
 | T16, T25 | controller | Live evidence documents. |
 | all others | fresh Sonnet | Bounded units. |
 
@@ -2845,9 +2985,9 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 |---|---|
 | §1–§2 | goals 7–8 → T1, T2, T3, T28 |
 | §3 concepts | T1 (paths), T4 (board), T6 (area), T10 (slots) |
-| §3.1 table | T7 (rows); T13, T14, T15, T18, T21, T22 (events); single writer T18; slots without a branch T10/T13; leaving a slot T10; recorded processes T3/T22; empty verify T14/T19/T23; base conflict T14/T22 |
+| §3.1 table | T7 (rows), T29, T31 (owner follow-up); T13, T14, T15, T18, T21, T22 (events); single writer T18; slots without a branch T10/T13; leaving a slot T10; recorded processes T3/T22; empty verify T14/T19/T23; base conflict T14/T22 |
 | §3.2 journal | T6 |
-| §4 stages, escalation, minors | T9, T12, T13 |
+| §4 stages, escalation, minors | T9, T12, T13, T31 (verify-fix review), T32 (protected-path escalation) |
 | §4 rotation | T5 (settings), T9 (session id, context), T25 (Q8), T26 |
 | §4 measuring | T4 (columns), T13 (recording), T20 (`stats`), T23 (questions) |
 | §4 vetting | T5, T6, T7, T9, T11, T21 |
@@ -2856,7 +2996,7 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 | §6 prompts, tools, agent CLI | T5 (profiles), T9, T11, T12, T13 |
 | §7 notifications | T17, T22 (wiring), T23 (init check) |
 | §8 CLI, SQLite | T1, T4, T11, T18, T19, T20, T22, T23 |
-| §9 config | T5 |
+| §9 config | T5, T30 (owner defaults, `protected_paths`) |
 | §10 visibility | T5, T11, T13, T19, T23 |
 | §11 README | T27 |
 | §12 platforms | T2, T3, T8, T11, T18, T22, T23, T28, Global Constraints |
@@ -2885,17 +3025,18 @@ Each task gets two reviews at most: a full first review, then a **closure check 
 17. `artel logs --stage` in §8 vs "log filters" out of scope in §14a (plan: no `--stage`).
 18. Pauses and human notes have no journal kind (PD-19); §10 says pauses are explained in the journal — plan records them in board meta and status.
 19. A task whose `--after` dependency is rejected waits forever; the minimum Claude Code version is not checked at runtime.
-20. Controller amendments of 2026-10-20 (owner to confirm): PD-6, PD-22, PD-23, PD-26 amended; new PD-33 (`.cmd` code page), PD-34 (base job without a task), PD-35 ("new commits" reference), PD-36 (`accepted` flag ends the accept loop of §3.1 rows 118/122/124), PD-37 (risky tasks reviewed on the strong model), PD-38 (`error` notification event; `notify.on` default gains it — §9 lists no such event), PD-39 (conflict at cap), PD-40 (limit hit in the result), PD-41 (`.cmd` agent command), PD-42 (unknown closure ids), PD-43 (conflict fix skips setup), PD-44 (string `agent_command` never split).
+20. Controller amendments of 2026-10-20 (confirmed by the owner 2026-10-20): PD-6, PD-22, PD-23, PD-26 amended; new PD-33 (`.cmd` code page), PD-34 (base job without a task), PD-35 ("new commits" reference), PD-36 (`accepted` flag ends the accept loop of §3.1 rows 118/122/124), PD-37 (risky tasks reviewed on the strong model), PD-38 (`error` notification event; `notify.on` default gains it — §9 lists no such event), PD-39 (conflict at cap), PD-40 (limit hit in the result), PD-41 (`.cmd` agent command), PD-42 (unknown closure ids), PD-43 (conflict fix skips setup), PD-44 (string `agent_command` never split).
 21. §11.6 says a task costs "up to 2 fixes"; with the defaults it is ≤ 1 review fix (`review_rounds` − 1) plus ≤ 2 verify fixes. Recommended: reword §11.6 to that arithmetic (Task 27 already writes it so).
 22. `[rotation]` settings exist from Task 5 even if Task 26 is skipped. Recommended: keep them, with `explain` saying they take effect only when rotation is built (Task 5 does so); remove them in a later plan change only if the owner prefers.
 
 Spec-level questions from the independent spec attack (`<git-common-dir>/artel-dev/reviews/spec-1.md`; not implemented in any task until the owner decides):
 
-23. **Protected paths.** The branch under review can change what reviews and verifies it (`.claude/settings.json`, `CLAUDE.md`, hooks, `package.json` scripts, CI config). Recommended: a `protected_paths` setting (default `.claude/`, `CLAUDE.md`, `artel.toml`, `.artel/`, hook dirs, CI config, the verify entry points); a diff touching one → `merge = ask` and a strong-model review; reviewers and verify read protected files from the integration tip; the README states that tool profiles stop accidents, not a hostile agent.
-24. **Verify-fix review.** `fixing (verify)` → `verifying` has no review, so a writer can weaken a flaky test and auto-merge. Recommended: a closure review after every verify fix; rerun a red verify once before blaming the task; a fix that only touches tests → `merge = ask`.
-25. **`autoapprove` default.** Agent-proposed tasks run unattended by default (`non_risky`). Recommended: default `"none"` in v0.1, plus a cap on proposals per task.
-26. **`fix_resumes_writer` default.** `true` rests on the open spike Q8. Recommended: default `false` until Task 25 shows resume works.
+23. **Protected paths.** *Decided (owner, 2026-10-20): PD-47, Tasks 30/32; reading protected files from the integration tip deferred.* The branch under review can change what reviews and verifies it (`.claude/settings.json`, `CLAUDE.md`, hooks, `package.json` scripts, CI config). Recommended: a `protected_paths` setting (default `.claude/`, `CLAUDE.md`, `artel.toml`, `.artel/`, hook dirs, CI config, the verify entry points); a diff touching one → `merge = ask` and a strong-model review; reviewers and verify read protected files from the integration tip; the README states that tool profiles stop accidents, not a hostile agent.
+24. **Verify-fix review.** *Decided (owner, 2026-10-20): closure review after every verify fix — PD-48, Task 31; the rerun-once and tests-only → ask parts are not adopted.* `fixing (verify)` → `verifying` has no review, so a writer can weaken a flaky test and auto-merge. Recommended: a closure review after every verify fix; rerun a red verify once before blaming the task; a fix that only touches tests → `merge = ask`.
+25. **`autoapprove` default.** *Decided (owner, 2026-10-20): `none` — PD-52, Task 30; no proposal cap yet.* Agent-proposed tasks run unattended by default (`non_risky`). Recommended: default `"none"` in v0.1, plus a cap on proposals per task.
+26. **`fix_resumes_writer` default.** *Decided (owner, 2026-10-20): `false` until Task 25 — PD-52, Task 30.* `true` rests on the open spike Q8. Recommended: default `false` until Task 25 shows resume works.
 27. **Success metrics.** Nothing measures whether artel pays off. Recommended: `artel stats` reports merged tasks per % of weekly quota and human minutes per task; a per-task summary for the human merge; `artel revert ID`.
 28. **Acceptance criteria.** Tasks have none, and reviewers fed the writer's notes share its framing. Recommended: `artel add --accept CRITERIA` stored on the task and given to every stage; round-1 reviewers do not get the writer's notes.
 29. **v0.1 scope.** Recommended cuts: vetting/proposals/autoapprove, rotation/resume, the `stats` counterfactual, `config set`; recommended additions: protected paths, verify-fix review, utilization pause + per-task budget, acceptance criteria, revert. Decide before wave 8 (Tasks 21–23), which is where most of the cut work sits.
 30. Other spec-attack items for the owner (details in spec-1.md): empty area serializes everything and the diff is never checked against the area; pausing on utilization thresholds (0.8 five-hour / 0.6 weekly) and a per-task cost cap; sticky permission denials (init derives `project_tools` from `verify`; denials become reviewer findings); and its minor list (WIP commit on ask, one attempts counter, notify events for awaiting_accept/approval, unfiltered agent questions to Telegram, logs containing `.env`).
+31. Owner defaults of 2026-10-20 differ from spec §9 (`slots_dir`, `autoapprove`, `rotation.fix_resumes_writer`, PD-52) and tighten §3.1 (R15 review PD-48, R30 PD-50, attempts reset PD-49, protected paths PD-47). The spec text still shows the old values; the owner may update the spec (build sessions never edit it).
