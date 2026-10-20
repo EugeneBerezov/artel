@@ -3,7 +3,7 @@
 Used as agent_command = [sys.executable, "<repo>/tests/fake_agent.py"]. Reads the prompt on stdin,
 ARTEL_TASK / ARTEL_STAGE / ARTEL_ROUND from the environment and $ARTEL_FAKE_DIR/scenario.json.
 Scenario keys, first match wins: "<task>:<stage>#<n>", "<task>:<stage>", "<stage>", "*".
-Actions: write, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit.
+Actions: write, read, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit.
 """
 import json
 import os
@@ -97,7 +97,9 @@ def main() -> int:
     scenario_path = fake_dir / "scenario.json"
     scenario = json.loads(scenario_path.read_text(encoding="utf-8")) if scenario_path.exists() else {}
     n = record_call(fake_dir, {"argv": argv, "stage": stage, "task": task, "model": model, "prompt": prompt,
-                               "cwd": os.getcwd(), "pid": os.getpid()}, f"{task}:{stage}")
+                               "cwd": os.getcwd(), "pid": os.getpid(),
+                               "env": {k: v for k, v in os.environ.items() if k.startswith("ARTEL_")}},
+                  f"{task}:{stage}")
     emit(A.sample_init_line())
     usage = None
     denials: list[dict] = []
@@ -108,6 +110,9 @@ def main() -> int:
             target = Path(rel)
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_text(content, encoding="utf-8", newline="\n")
+        elif name == "read":   # copy a file of the cwd aside, to show a test what the agent saw
+            rel, out_name = arg
+            (fake_dir / out_name).write_text(Path(rel).read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
         elif name == "commit":
             run_git("add", "-A")
             run_git("commit", "-q", "-m", arg)
