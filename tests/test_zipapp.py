@@ -1,6 +1,7 @@
 import contextlib
 import importlib.util
 import io
+import os
 import subprocess
 import sys
 import tempfile
@@ -9,7 +10,7 @@ import zipfile
 from pathlib import Path
 
 from artel import __version__
-from tests.helpers import REPO_ROOT
+from tests.helpers import REPO_ROOT, make_repo
 
 _spec = importlib.util.spec_from_file_location("build_pyz", REPO_ROOT / "tools" / "build_pyz.py")
 build_pyz = importlib.util.module_from_spec(_spec)
@@ -103,3 +104,21 @@ class BuildTest(unittest.TestCase):
                              cwd=self.tmp, capture_output=True, encoding="utf-8", errors="replace")
         self.assertEqual(run.returncode, 0, run.stderr)
         self.assertTrue(target.is_file())
+
+
+class PyzTemplatesTest(unittest.TestCase):
+    def test_builtin_templates_load_from_pyz(self):
+        """Mutation caught: reading templates through __file__ paths / leaving builtin_templates out of the archive."""
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            root = Path(tmp).resolve()
+            pyz = root / "artel.pyz"
+            build_pyz.build(pyz, root / "stage")
+            repo = make_repo(root)
+            env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}   # the archive must stand alone
+            env["PYTHONIOENCODING"] = "utf-8"
+            run = subprocess.run([sys.executable, str(pyz), "templates", "export"], cwd=repo, env=env,
+                                 capture_output=True, encoding="utf-8", errors="replace")
+            self.assertEqual(run.returncode, 0, run.stderr)
+            names = ("vet.md", "attack.md", "write.md", "review.md", "review-closure.md", "fix.md", "unattended.md")
+            for name in names:
+                self.assertGreater((repo / ".artel" / "templates" / name).stat().st_size, 50, name)
