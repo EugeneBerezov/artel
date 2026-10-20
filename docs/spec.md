@@ -174,12 +174,13 @@ removes another kind. Kinds:
 | `failures` | the failure breaker (§5 step 6) | `resume` (resets the breaker count) |
 | `limit` | usage limit reported by the agent CLI (§5 step 5) | by itself at the reset time; without one, when a probe passes (§5 step 5); after `limit_probes` failed probes, `resume` |
 | `agent_unavailable` | an `agent_unavailable` run (§5 step 6) | by itself when a probe passes (same schedule as `limit`); after `limit_probes` failed probes, `resume` |
-| `quota` | a usage window's utilization reached its `quota_stop_*`, or `night_budget_seven_day` is spent (§5 step 5) | by itself at that window's reset time (budget: 24 h after the baseline sample) |
+| `quota` | a usage window's utilization reached its `quota_stop_*`, or `night_budget_seven_day` is spent (§5 step 5) | by itself at that window's reset time (budget: 24 h after the baseline sample); a window with no future reset time is probed as for `limit`; after `limit_probes` failed probes, `resume` |
 | `disk` | free disk below `min_free_disk` | by itself when space is back |
 | `setup_failed` | `setup` failed before an agent started | by itself when `setup_inputs` change or the retry after `setup_retry` succeeds |
 
 Plain `resume` removes exactly the kinds whose Ends column names `resume`
-(`limit` and `agent_unavailable` only after their probes are spent); on any
+(`limit`, `agent_unavailable` and a probed `quota` only after their probes
+are spent); on any
 other active kind it says `pause <kind> ends by itself; use resume --force`.
 `resume --force` empties the set. Every pause notifies (`paused`, with kind,
 cause and reset time when known) and names the setting or event that caused
@@ -360,8 +361,11 @@ Loop:
    - a limit hit without a reset time (e.g. an error result only, PD-40) →
      pause `limit` until the latest future `resetsAt` already recorded for a
      window; if none is known, **probe**: a minimal agent call on
-     `models.probe` (one turn, "reply OK", no tools, no slot, no task) after
-     1 ×, 2 ×, 3 ×, 4 × `limit_retry` (30/60/90/120 min by default); a probe
+     `models.probe` (profile `probe`, §6: one turn, "reply OK", no tools, no
+     schema, no slot, no task); the k-th probe of a pause runs k ×
+     `limit_retry` after the previous one (the first after the pause began:
+     gaps 30/60/90/120 min by default; a machine waking late runs one probe,
+     not a burst); a probe
      that reports a reset time sets the end, a probe without a limit ends the
      pause, at most `limit_probes` probes in any rolling 24 h; then notify and
      wait for `resume`. Probes never count toward `attempts`, `stage_runs`
@@ -376,11 +380,17 @@ Loop:
    whose result carries `api_error_status` 5xx or 529 is an environment
    fault, not a task fault: requeue (no counter, branch kept), pause
    `agent_unavailable` and notify; probes as for `limit` (step 5) lift it.
+   A permanent fault can look the same (a bad `models.*` value, an agent
+   command that rejects its arguments) while probes pass: when
+   `max_consecutive_failures` `agent_unavailable` runs in a row that started
+   after a passing probe end with the same signature (exit code + first
+   stderr line), pause `failures` instead, naming the signature.
    **Failure breaker:** a failure is any agent-stage outcome that increments
    `attempts` (§3.1 Counters). `max_consecutive_failures` failures in a row,
    from at least two distinct tasks, → pause `failures` and notify. Any
    other classified agent outcome resets the count; requeues, setup failures,
-   `agent_unavailable` and verify jobs neither count nor reset. The count is
+   `agent_unavailable` (except the escalation above) and verify jobs neither
+   count nor reset. The count is
    stored in the board, survives a restart, and `resume` of a `failures`
    pause sets it to 0.
 7. **Verify** (one task at a time). In the slot: merge `artel/integration`
@@ -392,7 +402,7 @@ Loop:
    after an earlier `accept`), and a runner `FAIL` entry `flaky verify:
    <command>, red log <path>` is written — never a `FACT`, which later agents
    would read as established. Each verify run is a `runs` row (stage
-   `verify`, outcome `red|green`, duration). `setup` and `verify` run in their own
+   `verify`, outcome `green|red|timeout|stopped`, duration). `setup` and `verify` run in their own
    process groups, recorded like agents, so reconcile and timeouts terminate
    them the same way (SIGTERM, `kill_grace`, SIGKILL).
 8. **Integrate.** Fast-forward `artel/integration` to the verified commit
@@ -468,6 +478,13 @@ reviewer/attacker:
          --disallowedTools "Edit Write NotebookEdit"
          --allowedTools "Bash(artel note *) Bash(git diff *) Bash(git log *)
                          Bash(git show *) Bash(git status *)" {project_read_tools}
+probe:   claude -p --model {model} --output-format stream-json --verbose
+         --permission-prompts none --disable-slash-commands
+         --strict-mcp-config --permission-mode default --max-turns 1
+         --disallowedTools "Bash Edit Write NotebookEdit Read Glob Grep
+                            WebFetch WebSearch Task TodoWrite"
+         (no `common`: no schema, no notice; cwd an empty directory;
+          the `--setting-sources` pair of `common` is added when set)
 ```
 
 Every profile passes `--permission-mode` explicitly: `-p` inherits the
@@ -557,7 +574,7 @@ limit_stop = "allowed_warning"    # or "rejected"
 quota_stop_five_hour = 0.95       # pause when the five-hour window's utilization reaches this
 quota_stop_seven_day = 0.8        # … the weekly window's (keeps the rest of the week for you)
 night_budget_seven_day = 0.15     # at most this much weekly utilization in any 24 h
-limit_retry = "30m"               # no reset time known: k-th probe after k × this (30/60/90/120 min)
+limit_retry = "30m"               # no reset time known: gap before the k-th probe = k × this (30/60/90/120 min)
 limit_probes = 4                  # probes in any 24 h, then wait for resume
 setup_retry = "15m"               # setup_failed: retry setup after this
 poll_interval = "5s"              # how often the runner looks for work
