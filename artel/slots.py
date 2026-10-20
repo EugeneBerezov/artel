@@ -3,13 +3,14 @@
 Every reset, clean, switch and merge in this module runs only after `guard()` accepted the path as a
 registered slot under `slots_dir`: a corrupt board row or a hand-made worktree must never be scrubbed.
 """
+import fnmatch
 import hashlib
 import json
 import os
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
-from artel import procs
+from artel import platform, procs
 from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 
@@ -71,14 +72,44 @@ def _check_slots_dir(repo: Repo, cfg) -> None:
         raise ArtelError(f"slots_dir {cfg['slots_dir']!r} must be a directory below the repository root")
 
 
+def _kept(line_path: str, keep: Sequence[str]) -> bool:
+    name = line_path.strip().strip('"').replace("\\", "/")
+    return any(fnmatch.fnmatchcase(name, pattern) or name.startswith(pattern.rstrip("/") + "/")
+               or name.rstrip("/") == pattern.rstrip("/") for pattern in keep)
+
+
+def _adoptable(repo: Repo, wt, keep: Sequence[str], registered: bool) -> str | None:
+    """Why an existing worktree at a slot path must not be taken over, or None. `.claude/worktrees` is also
+    where Claude Code and users keep their own worktrees: scrubbing one would destroy their work."""
+    if wt.branch is not None and not wt.branch.startswith("artel/"):
+        return f"it has branch {wt.branch!r} checked out"
+    if registered:
+        return None   # artel created this slot; leftover dirt from a killed agent is scrubbed on the next use
+    status = _git(repo, "status", "--porcelain", cwd=wt.path, check=False)
+    dirty = [l for l in status.stdout.splitlines() if not _kept(l[3:].split(" -> ")[-1], keep)]
+    if status.returncode != 0 or dirty:
+        return "it has uncommitted changes"
+    return None
+
+
 def ensure_slots(repo: Repo, board, cfg, count: int) -> list[int]:
     _check_slots_dir(repo, cfg)
     repo.git("worktree", "prune")
-    known = {wt.path.resolve() for wt in repo.worktrees()}
+    known = {wt.path.resolve(): wt for wt in repo.worktrees()}
+    registered = {s.n: Path(s.path).resolve() for s in board.list_slots()}
     for n in range(1, count + 1):
         path = slot_path(repo, cfg, n)
         if path.resolve() == repo.root.resolve():
             raise ArtelError(f"slot {n} would be the main worktree {path}")
+        if platform.is_link_or_junction(path):
+            raise ArtelError(f"{path} is a link; a slot must be a real directory")
+        if path.exists() and not path.is_dir():
+            raise ArtelError(f"{path} exists and is not a directory; remove it or change slots_dir")
+        if path.resolve() in known:
+            why = _adoptable(repo, known[path.resolve()], cfg["slot_keep"], registered.get(n) == path.resolve())
+            if why:
+                raise ArtelError(f"{path} is an existing git worktree that artel did not create ({why}); "
+                                 "move it or change slots_dir")
         if path.resolve() not in known:
             if path.exists() and any(path.iterdir()):
                 raise ArtelError(f"{path} exists but is not a git worktree; remove it or change slots_dir")
@@ -103,10 +134,14 @@ def guard(repo: Repo, board, cfg, n: int) -> Path:
     slot = next((s for s in board.list_slots() if s.n == n), None)
     if slot is None:
         raise SlotGuardError(f"slot {n} is not registered")
+    if platform.is_link_or_junction(expected):
+        raise SlotGuardError(f"{expected} is a link: it may lead to somebody else's worktree")
     if Path(slot.path).resolve() != expected.resolve():
         raise SlotGuardError(f"slot {n} is registered at {slot.path}, expected {expected}")
     if not _inside(expected.resolve(), _slots_root(repo, cfg).resolve()):
         raise SlotGuardError(f"{expected} is not inside {_slots_root(repo, cfg)}")
+    if expected.resolve() != _slots_root(repo, cfg).resolve() / expected.name:
+        raise SlotGuardError(f"{expected} resolves to a different directory than its slot name")
     if not expected.is_dir():
         raise SlotGuardError(f"slot {n} directory {expected} does not exist")
     if expected.resolve() == repo.root.resolve() or expected.resolve() in repo.root.resolve().parents:

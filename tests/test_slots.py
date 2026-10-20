@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from artel import board as B, config as C, slots
+from artel import board as B, config as C, platform as P, slots
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION, Repo
 from tests.helpers import RepoTestCase, git, py_cmd
@@ -83,6 +83,99 @@ class EnsureTest(SlotsCase):
         with self.assertRaises(ArtelError):
             self.slot(1)
         self.assertEqual((path / "precious.txt").read_text(encoding="utf-8"), "mine")
+
+
+class AdoptionTest(SlotsCase):
+    """`.claude/worktrees` is also where Claude Code and users keep their own worktrees (data-loss review)."""
+
+    def user_worktree(self, n=1, *opts, commit=None):
+        path = slots.slot_path(self.repo, self.cfg, n)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        git(self.repo_path, "worktree", "add", "-q", *opts, str(path), *([commit] if commit else []))
+        return path
+
+    def test_ensure_refuses_a_users_worktree_on_a_feature_branch(self):
+        """Mutation caught: adopting any existing worktree (the branch rule)."""
+        path = self.user_worktree(1, "-b", "userfeature")
+        (path / "wip.txt").write_text("precious", encoding="utf-8")
+        with self.assertRaises(ArtelError) as cm:
+            self.slot(1)
+        self.assertIn("userfeature", str(cm.exception))
+        self.assertEqual(self.board.list_slots(), [])
+        self.assertEqual((path / "wip.txt").read_text(encoding="utf-8"), "precious")
+        self.assertEqual(self.branch_of(path), "userfeature")
+
+    def test_ensure_refuses_a_dirty_detached_worktree_it_did_not_create(self):
+        """Mutation caught: dropping the clean-status rule (the branch rule alone passes a detached worktree)."""
+        path = self.user_worktree(1, "--detach", commit="main")
+        (path / "wip.txt").write_text("precious", encoding="utf-8")
+        with self.assertRaises(ArtelError) as cm:
+            self.slot(1)
+        self.assertIn("uncommitted", str(cm.exception))
+        (path / "README").write_text("edited", encoding="utf-8")
+        with self.assertRaises(ArtelError):
+            self.slot(1)
+        self.assertEqual((path / "wip.txt").read_text(encoding="utf-8"), "precious")
+
+    def test_ensure_adopts_a_clean_detached_or_artel_branch_worktree(self):
+        path = self.user_worktree(1, "--detach", commit="main")
+        self.assertEqual(self.slot(1), [1])
+        self.assertEqual([s.n for s in self.board.list_slots()], [1])
+        path2 = self.user_worktree(2, "-b", "artel/7")
+        self.assertEqual(self.slot(2), [1, 2])
+        self.assertTrue(path.is_dir() and path2.is_dir())
+
+    def test_clean_check_ignores_slot_keep_paths(self):
+        path = self.user_worktree(1, "--detach", commit="main")
+        (path / "deps_cache").mkdir()
+        (path / "deps_cache" / "dep.js").write_text("x", encoding="utf-8")
+        with self.assertRaises(ArtelError):
+            self.slot(1)
+        self.assertEqual(self.slot(1, slot_keep=["deps_cache"]), [1])
+
+    def test_a_registered_slot_with_leftover_dirt_is_kept(self):
+        """Mutation caught: refusing artel's own slot after a killed agent left uncommitted files."""
+        self.slot(1)
+        path = slots.slot_path(self.repo, self.cfg, 1)
+        (path / "half.txt").write_text("unfinished", encoding="utf-8")
+        self.assertEqual(self.slot(1), [1])
+        self.assertTrue((path / "half.txt").exists())
+
+    def test_ensure_refuses_a_link_in_place_of_a_slot(self):
+        """Mutation caught: following a symlink/junction slot path into somebody's (clean) worktree."""
+        user = self.repo_path / ".claude" / "worktrees" / "mywork"   # clean and detached: nothing else refuses it
+        user.parent.mkdir(parents=True, exist_ok=True)
+        git(self.repo_path, "worktree", "add", "-q", "--detach", str(user), "main")
+        link = slots.slot_path(self.repo, self.cfg, 2)
+        P.link_dir(link, user)
+        with self.assertRaises(ArtelError) as cm:
+            self.slot(2)
+        self.assertIn("link", str(cm.exception))
+        self.assertNotIn(2, [s.n for s in self.board.list_slots()])   # the link was never registered
+
+    def test_guard_refuses_a_slot_replaced_by_a_link(self):
+        """Mutation caught: the guard comparing resolved paths only."""
+        import shutil
+        self.slot(1)
+        path = slots.slot_path(self.repo, self.cfg, 1)
+        user = self.repo_path / ".claude" / "worktrees" / "mywork"   # inside slots_dir: the old guard passed this
+        user.parent.mkdir(parents=True, exist_ok=True)
+        git(self.repo_path, "worktree", "add", "-q", "--detach", str(user), "main")
+        (user / "wip.txt").write_text("precious", encoding="utf-8")
+        shutil.rmtree(path)
+        git(self.repo_path, "worktree", "prune")
+        P.link_dir(path, user)
+        with self.assertRaises(slots.SlotGuardError) as cm:
+            slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        self.assertIn("link", str(cm.exception))
+        self.assertEqual((user / "wip.txt").read_text(encoding="utf-8"), "precious")
+
+    def test_ensure_refuses_a_regular_file_at_the_slot_path(self):
+        path = slots.slot_path(self.repo, self.cfg, 1)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(ArtelError):
+            self.slot(1)
 
 
 class PrepareTest(SlotsCase):

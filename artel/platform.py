@@ -5,6 +5,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import time
@@ -491,6 +492,27 @@ def write_wrapper(stem: Path, argv: Sequence[str]) -> list[str]:
             fh.write(body)
         path.chmod(0o755)
     return [str(path)]
+
+
+def is_link_or_junction(path: Path) -> bool:
+    """A symbolic link, or a Windows junction / other reparse point (os.path.isjunction needs Python 3.12)."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def link_dir(link: Path, target: Path) -> None:
+    """Make `link` a directory link to `target` (symlink; a junction on Windows, which needs no privilege).
+    Only tests and tools use it: artel itself never creates links."""
+    if IS_WINDOWS:
+        result = subprocess.run(["cmd", "/d", "/c", "mklink", "/J", str(link), str(target)], capture_output=True,
+                                encoding="utf-8", errors="replace")
+        if result.returncode != 0:
+            raise ArtelError(f"cannot create a junction: {result.stdout.strip()} {result.stderr.strip()}")
+    else:
+        os.symlink(target, link, target_is_directory=True)
 
 
 def free_bytes(path: Path) -> int:
