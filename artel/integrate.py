@@ -411,8 +411,9 @@ def base_update(repo: Repo, board, cfg, slot_n: int, *, on_start: OnStart | None
         slots.leave_slot(repo, board, cfg, slot_n)
 
 
-def finish_base_update(repo: Repo, board, cfg, bu: BaseUpdate) -> str:
-    """-> "applied" | "retry" | "held" | "paused" | "noop"."""
+def finish_base_update(repo: Repo, board, cfg, bu: BaseUpdate, *, now: float | None = None) -> str:
+    """-> "applied" | "retry" | "held" | "paused" | "noop". `now`: the runner's clock, the `since` of the
+    base_conflict pause (T22 review); None = the wall clock."""
     if bu.kind in ("fast_forward", "merged"):
         if slots.checked_out_elsewhere(repo, INTEGRATION) is not None:
             return "held"
@@ -423,7 +424,7 @@ def finish_base_update(repo: Repo, board, cfg, bu: BaseUpdate) -> str:
         return "applied"
     if bu.kind in ("conflict", "red", "timeout"):
         detail = journal.truncate_utf8(f"{bu.kind}: {bu.detail}", journal.TEXT_LIMIT)
-        pauses.add(board, "base_conflict", detail, now=time.time())
+        pauses.add(board, "base_conflict", detail, now=time.time() if now is None else now)
         journal.append(board, "FAIL", journal.truncate_utf8(f"base {cfg['base']} into {INTEGRATION}: {detail}",
                                                             journal.TEXT_LIMIT), author=_RUNNER,
                        basis=journal.truncate_utf8(_rel(repo, bu.log_path) if bu.log_path else "", 200))

@@ -404,18 +404,30 @@ def _unwrap_artel_wrapper(text: str) -> list[str] | None:
     return [t.replace("%%", "%") for t in tokens]
 
 
+class CannotStartAgent(ArtelError):
+    """agent_command cannot be turned into a runnable argv (not found, an unusable batch file): no agent can start
+    (owner 2026-10-21: a stage is then `agent_unavailable`, a probe a failed probe)."""
+
+
 def agent_argv(cfg) -> list[str]:
     command = cfg["agent_command"]
-    argv = platform.resolve_argv([command] if isinstance(command, str) else list(command))   # PD-44
+    try:
+        argv = platform.resolve_argv([command] if isinstance(command, str) else list(command))   # PD-44
+    except ArtelError as exc:
+        raise CannotStartAgent(str(exc)) from exc
     if argv[0].lower().endswith((".cmd", ".bat")):
         path = Path(argv[0])
-        unwrapped = unwrap_cmd_shim(path.read_text(encoding="utf-8", errors="replace"), path)
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            raise CannotStartAgent(f"cannot read agent_command {path}: {exc}") from exc
+        unwrapped = unwrap_cmd_shim(text, path)
         if unwrapped is None:
-            raise ArtelError(f"agent_command {path} is a batch file artel cannot unwrap; "
-                             "set agent_command to a list [node, cli.js] or to claude.exe")
+            raise CannotStartAgent(f"agent_command {path} is a batch file artel cannot unwrap; "
+                                   "set agent_command to a list [node, cli.js] or to claude.exe")
         if unwrapped[0].lower().endswith((".cmd", ".bat")):   # the inline schema must never reach cmd.exe
-            raise ArtelError(f"agent_command {path} wraps another batch file ({unwrapped[0]}); "
-                             "set agent_command to a list [node, cli.js] or to claude.exe")
+            raise CannotStartAgent(f"agent_command {path} wraps another batch file ({unwrapped[0]}); "
+                                   "set agent_command to a list [node, cli.js] or to claude.exe")
         argv = unwrapped + argv[1:]
     return argv
 

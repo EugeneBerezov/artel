@@ -337,6 +337,22 @@ class RowTests(unittest.TestCase):
                    text="fix failed 2 times after 1 branch reset(s) (max_branch_resets=1)")
         self.assertNotIn("reset_branch", t.effects)
 
+    def test_R17g_counts_from_one(self):
+        """Mutation caught: `resets=1` for `resets+1` (with max_branch_resets=2 the second reset would leave
+        resets at 1 and the branch would be reset forever)."""
+        fields = {"fix_kind": "review", "round": 1, "attempts": 1, "resets": 1}
+        t = tr("fixing", "stage_failed", lim(max_branch_resets=2), task=fields)
+        self.assertEqual((t.rid, t.to_state, t.updates["resets"]), ("R17g", "open", 2))
+        self.assertEqual(t.cause, "attempts 2 >= max_attempts 2: branch reset 2 of max_branch_resets 2")
+
+    def test_R17h_cause_names_the_tasks_resets(self):
+        """Mutation caught: the R17h cause text naming `max_branch_resets` where it means the task's `resets`
+        (they differ when the setting was lowered after the resets happened)."""
+        fields = {"fix_kind": "review", "round": 1, "attempts": 1, "resets": 2}
+        t = tr("fixing", "stage_failed", lim(max_branch_resets=1), task=fields)
+        self.assertEqual(t.rid, "R17h")
+        self.assertEqual(t.cause, "fix failed 2 times after 2 branch reset(s) (max_branch_resets=1)")
+
     def test_max_branch_resets_zero_goes_stuck_at_once(self):
         """Mutation caught: `resets_left` treating 0 as unlimited."""
         t = tr("fixing", "stage_failed", lim(max_branch_resets=0), task={"fix_kind": "review", "attempts": 1})
@@ -382,6 +398,22 @@ class RowTests(unittest.TestCase):
                            stuck_from=state, text="12 agent runs since a human last moved the task (max_stage_runs=12)")
         with self.assertRaises(T.TransitionError):
             tr("writing", "due_at_cap", lim(max_stage_runs=12), task={"stage_runs": 11})
+
+    def test_due_at_cap_refused_outside_stage_states(self):
+        """Mutation caught: R39's sources widened (JOB_STATES or LIVE): a verify job is not an agent run, and a
+        task outside a stage state has no run to refuse."""
+        for state in sorted(set(B.STATES) - set(T.STAGE_STATES)):
+            with self.subTest(state=state):
+                with self.assertRaises(T.TransitionError):
+                    tr(state, "due_at_cap", lim(max_stage_runs=1), task={"stage_runs": 5, "stuck_from": "writing"})
+
+    def test_requeue_refused_in_verifying(self):
+        """Mutation caught: R38's sources widened to `verifying` (a verify job is never agent_unavailable; a
+        stopped verify job is requeued by the runner, not through the table)."""
+        for state in sorted(set(B.STATES) - set(T.STAGE_STATES)):
+            with self.subTest(state=state):
+                with self.assertRaises(T.TransitionError):
+                    tr(state, "agent_unavailable", task={"stage_runs": 1})
 
     def test_R39_is_a_row(self):
         """Mutation caught: the cap check done in the runner instead of the table (N10 b)."""

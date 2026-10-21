@@ -204,6 +204,75 @@ class WaitingReasonTest(unittest.TestCase):
         self.assertEqual(pick.waiting_reason(tasks[3], tasks, [1]), "after #1 (open)")
 
 
+def reason(tasks, deps=None, busy=()):
+    return pick.idle_reason(tasks, deps or {}, busy=busy)
+
+
+class IdleReasonTest(unittest.TestCase):
+    """PD-71 (round 3, plan M6): the reason a slot without a job is idle after the tick's pick."""
+
+    def test_no_task_when_nothing_is_startable(self):
+        # catches: returning "deps" or "area" by default
+        self.assertEqual(reason([]), "no_task")
+        tasks = [make_task(id=i, state=s) for i, s in enumerate(
+            ("blocked", "stuck", "awaiting_approval", "awaiting_accept", "done", "rejected"), 1)]
+        self.assertEqual(reason(tasks), "no_task")
+
+    def test_no_task_when_everything_startable_is_running(self):
+        # catches: counting a running or busy task as a startable one held back by its area
+        tasks = [make_task(id=1, state="writing", area=("src",), running=True),
+                 make_task(id=2, state="open", area=("docs",))]
+        self.assertEqual(reason(tasks, busy=[2]), "no_task")
+
+    def test_deps_when_an_open_task_waits_for_a_dependency(self):
+        # catches: deps ignored (→ no_task), or a dependency in `verified` taken as done
+        for state in ("verified", "rejected", "blocked"):
+            with self.subTest(dependency=state):
+                tasks = [make_task(id=1, state=state, area=("x",)), make_task(id=2, state="open", area=("a",))]
+                self.assertEqual(reason(tasks, {2: [1]}), "deps")
+        self.assertEqual(reason([make_task(id=2, state="open", area=("a",))], {2: [99]}), "deps")   # missing
+        tasks = [make_task(id=1, state="done"), make_task(id=2, state="open", area=("a",), running=True)]
+        self.assertEqual(reason(tasks, {2: [1]}), "no_task")   # catches: deps for a task whose dependency is done
+
+    def test_area_when_overlapping_a_running_task(self):
+        # catches: area ignored (→ no_task)
+        tasks = [make_task(id=1, state="reviewing", area=("src",), running=True),
+                 make_task(id=2, state="open", area=("src/a",))]
+        self.assertEqual(reason(tasks), "area")
+        due = [make_task(id=1, state="reviewing", area=("src",), running=True),
+               make_task(id=2, state="fixing", area=("src/a",))]
+        self.assertEqual(reason(due), "area")   # catches: only open tasks checked
+
+    def test_area_when_overlapping_a_busy_task(self):
+        # catches: `busy` (jobs starting, held tasks) not passed on to the selection
+        tasks = [make_task(id=1, state="open", area=("src",)), make_task(id=2, state="open", area=("src/a",),
+                                                                        priority=5)]
+        self.assertEqual(reason(tasks, busy=[1]), "area")   # #2 would be picked first if #1 were not busy
+
+    def test_area_when_overlapping_a_task_selected_before_it(self):
+        # catches: comparing only with running tasks, not with this tick's selection
+        tasks = [make_task(id=1, state="open", area=("src",)), make_task(id=2, state="open", area=("src/a",))]
+        self.assertEqual(reason(tasks), "area")
+
+    def test_area_wins_over_deps(self):
+        # catches: checking deps first (PD-71 order: area, deps, no_task)
+        tasks = [make_task(id=1, state="writing", area=("src",), running=True),
+                 make_task(id=2, state="open", area=("src/a",)),
+                 make_task(id=3, state="open", area=("docs",))]
+        self.assertEqual(reason(tasks, {3: [99]}), "area")
+
+    def test_no_area_when_the_overlap_is_not_the_reason(self):
+        # catches: "area" for a task that waits for a dependency, or for a vet / branchless attack (no area)
+        tasks = [make_task(id=1, state="writing", area=("src",), running=True),
+                 make_task(id=2, state="open", area=("src/a",))]
+        self.assertEqual(reason(tasks, {2: [99]}), "deps")
+        holder = make_task(id=1, state="writing", area=("src",), running=True)
+        self.assertEqual(reason([holder, make_task(id=2, state="vetting", area=("src",))]), "no_task")
+        self.assertEqual(reason([holder, make_task(id=2, state="attacking", then="open", area=("src",))]),
+                         "no_task")
+        self.assertEqual(reason([holder, make_task(id=2, state="open", area=("docs",))]), "no_task")
+
+
 class PurityTest(unittest.TestCase):
     def test_pick_imports_no_board_git_or_io_modules(self):
         source = (Path(__file__).resolve().parents[1] / "artel" / "pick.py").read_text(encoding="utf-8")

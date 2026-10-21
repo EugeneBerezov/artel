@@ -358,15 +358,20 @@ class StopRequest:
 
 def install_stop_handlers() -> StopRequest:
     """The handler does no I/O, takes no lock and starts nothing (a print, Event.set or Thread.start from
-    signal context can raise "reentrant call" or deadlock). Callers poll `requested()`."""
+    signal context can raise "reentrant call" or deadlock). Callers poll `requested()`. SIGHUP (POSIX) is a soft
+    stop like SIGTERM: a dropped ssh session must not kill the runner while its agents keep running (Task 37);
+    a SIGHUP already ignored (`nohup`) stays ignored, so a nohup'ed runner survives the drop."""
     request = StopRequest()
-    names = ("SIGINT", "SIGBREAK") if IS_WINDOWS else ("SIGINT", "SIGTERM")
+    names = ("SIGINT", "SIGBREAK") if IS_WINDOWS else ("SIGINT", "SIGTERM", "SIGHUP")
 
     def handler(signum, frame):
         request.count += 1
 
     for name in names:
-        signal.signal(getattr(signal, name), handler)
+        signum = getattr(signal, name)
+        if name == "SIGHUP" and signal.getsignal(signum) is signal.SIG_IGN:
+            continue
+        signal.signal(signum, handler)
     return request
 
 

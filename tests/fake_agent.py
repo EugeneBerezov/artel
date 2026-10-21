@@ -3,7 +3,10 @@
 Used as agent_command = [sys.executable, "<repo>/tests/fake_agent.py"]. Reads the prompt on stdin,
 ARTEL_TASK / ARTEL_STAGE / ARTEL_ROUND from the environment and $ARTEL_FAKE_DIR/scenario.json.
 Scenario keys, first match wins: "<task>:<stage>#<n>", "<task>:<stage>", "<stage>", "*".
-Actions: write, read, git, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit.
+Actions: write, read, git, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit,
+crash. `{"crash": <exit code>, "stderr": <line>}` writes the line to stderr and exits with the code; as the first
+action it comes before any stream record (an agent CLI that dies before its first model call, PD-57).
+`{"result_error": <status>}` is an error result with that `api_error_status` (429, 5xx, 529; `true`: none).
 """
 import json
 import os
@@ -88,9 +91,19 @@ def run_note(kind: str, text: str, basis: str) -> None:
                    encoding="utf-8", errors="replace")
 
 
+def crash(action: dict) -> int:
+    line = action.get("stderr")
+    if line is not None:
+        sys.stderr.write(str(line) + "\n")
+    sys.stdout.flush()
+    sys.stderr.flush()
+    return int(action["crash"])
+
+
 def main() -> int:
     sys.stdin.reconfigure(encoding="utf-8")
     sys.stdout.reconfigure(encoding="utf-8", newline="\n")
+    sys.stderr.reconfigure(encoding="utf-8", newline="\n")
     prompt = sys.stdin.read()
     fake_dir = Path(os.environ["ARTEL_FAKE_DIR"])
     task = os.environ.get("ARTEL_TASK", "")
@@ -103,10 +116,15 @@ def main() -> int:
                                "cwd": os.getcwd(), "pid": os.getpid(),
                                "env": {k: v for k, v in os.environ.items() if k.startswith("ARTEL_")}},
                   f"{task}:{stage}")
+    actions = pick_actions(scenario, task, stage, n)
+    if actions and "crash" in actions[0]:
+        return crash(actions[0])   # before any stream record
     emit(A.sample_init_line())
     usage = None
     denials: list[dict] = []
-    for action in pick_actions(scenario, task, stage, n):
+    for action in actions:
+        if "crash" in action:
+            return crash(action)
         (name, arg), = action.items()
         if name == "write":
             rel, content = arg

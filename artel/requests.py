@@ -186,6 +186,9 @@ class Applied:
     transition: Transition | None
 
 
+MANUAL_DETAIL = "artel pause"   # the cause of the pause `artel pause` adds
+
+
 class RunnerHooks(Protocol):
     def terminate(self, task_id: int) -> None: ...      # stop the task's job and wait for it (PD-30)
     def stop(self, now: bool) -> None: ...
@@ -211,12 +214,13 @@ def _git_effects(repo, board, cfg, task_id: int, effects) -> None:
                        author="runner", task_id=task_id)
 
 
-def _apply_one(repo, board, cfg, request: Request, hooks) -> Applied:
-    """The state change and `finish_request` commit together: a request is applied exactly once."""
+def _apply_one(repo, board, cfg, request: Request, hooks, now: float | None = None) -> Applied:
+    """The state change and `finish_request` commit together: a request is applied exactly once. `now`: the
+    runner's clock (a pause's `since`); None = the wall clock."""
     command, task_id, payload = request.command, request.task_id, request.payload
     if command == "pause":
         with board.tx():
-            pauses.add(board, "manual", "artel pause", now=time.time())
+            pauses.add(board, "manual", MANUAL_DETAIL, now=time.time() if now is None else now)
             board.finish_request(request.id)
         return Applied(request, None, None)
     if command == "resume":
@@ -259,13 +263,14 @@ def _apply_one(repo, board, cfg, request: Request, hooks) -> Applied:
     return Applied(request, None, tr)
 
 
-def apply_pending(repo, board, cfg, hooks: RunnerHooks) -> list[Applied]:
+def apply_pending(repo, board, cfg, hooks: RunnerHooks, *, now: float | None = None) -> list[Applied]:
     """Applies every pending request in id order; a refused one is finished with its error text. A busy board
-    leaves the rest pending for the next tick (a human's answer is never dropped for a lock)."""
+    leaves the rest pending for the next tick (a human's answer is never dropped for a lock). `now`: the runner's
+    clock, the `since` of a pause a request adds (T22 review); None = the wall clock."""
     applied = []
     for request in board.pending_requests():
         try:
-            applied.append(_apply_one(repo, board, cfg, request, hooks))
+            applied.append(_apply_one(repo, board, cfg, request, hooks, now))
             continue
         except BoardBusy:
             break

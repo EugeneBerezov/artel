@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -185,19 +186,29 @@ _SECRET_ENV = ("ARTEL_TELEGRAM_TOKEN", "TELEGRAM_BOT_TOKEN")   # never handed to
 
 
 class CommandNotifier:
-    def __init__(self, command, shell: str, drop_env: Sequence[str] = ()):
+    def __init__(self, command, shell: str, drop_env: Sequence[str] = (), kill_grace: float = 5.0):
         self.command = command
         self.shell = shell
         self.drop_env = {name.upper() for name in (*_SECRET_ENV, *drop_env)}   # Windows names are case-insensitive
+        self.kill_grace = kill_grace
+        self._killed = threading.Event()
+
+    def kill(self) -> None:
+        """Terminates the process tree of a command still running (procs.run_tree, through artel/platform.py) and
+        refuses every later send: the runner calls it when shutdown's flush deadline has passed (T22 review d)."""
+        self._killed.set()
 
     def send_event(self, e: Event) -> bool:
         """The event as JSON (UTF-8) on stdin; the formatted text also in ARTEL_NOTIFY_TEXT."""
+        if self._killed.is_set():
+            return False
         try:
             argv = procs.command_argv(self.command, self.shell)
             env = {k: v for k, v in os.environ.items() if k.upper() not in self.drop_env}
             env["ARTEL_NOTIFY_TEXT"] = format_event(e)
+            env["ARTEL_CHILD"] = "1"   # PD-65: a notify script cannot answer or accept in the human's name
             result = procs.run_tree(argv, cwd=Path.cwd(), env=env, stdin_text=_ascii_json(e),
-                                    timeout=COMMAND_TIMEOUT, kill_grace=5.0)
+                                    timeout=COMMAND_TIMEOUT, kill_grace=self.kill_grace, stop_event=self._killed)
         except (ArtelError, OSError):
             return False
         return result.returncode == 0 and not result.timed_out
@@ -218,8 +229,14 @@ class Dispatcher:
                 telegram = TelegramNotifier(creds, cfg["notify.telegram_api_base"])
         command = None
         if cfg["notify.command"]:
-            command = CommandNotifier(cfg["notify.command"], cfg["shell"], [cfg["notify.telegram_token_env"]])
+            command = CommandNotifier(cfg["notify.command"], cfg["shell"], [cfg["notify.telegram_token_env"]],
+                                      kill_grace=cfg["kill_grace"])
         return cls(cfg["notify.on"], telegram, command)
+
+    def kill(self) -> None:
+        """Ends a notify command that still runs (shutdown, after the flush deadline)."""
+        if self.command is not None:
+            self.command.kill()
 
     def emit(self, e: Event) -> None:
         """Filtered by notify.on; never raises; failures go to stderr (never with a secret)."""

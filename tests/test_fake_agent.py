@@ -144,6 +144,25 @@ class FakeAgentTest(RepoTestCase):
         self.assertTrue(self.parse(res.stdout)[0].failed())
         self.assertEqual((self.repo_path / "a.txt").read_text(encoding="utf-8"), "x")
 
+    def test_fake_crash_and_server_error(self):
+        """Mutation caught: `crash` emitting the init record first (not "before any stream record"), losing the
+        stderr line or the exit code; `result_error` dropping a 5xx/529 status."""
+        self.scenario({"1:write": [{"crash": 7, "stderr": "fatal: bad option (pid 31)"}, {"result": {"outcome": "ready",
+                                                                                                 "summary": "x"}}],
+                       "2:write": [{"assistant": {"input_tokens": 1}}, {"crash": 5}],
+                       "3:write": [{"result_error": 529}]})
+        res = self.run_fake(task="1")
+        self.assertEqual((res.returncode, res.stdout), (7, ""))
+        self.assertEqual(res.stderr, "fatal: bad option (pid 31)\n")
+        self.assertEqual(len(self.calls()), 1)   # the call is still recorded
+        res = self.run_fake(task="2")
+        self.assertEqual((res.returncode, res.stderr), (5, ""))
+        parser, _ = self.parse(res.stdout)
+        self.assertTrue(parser.assistant_seen and not parser.result_seen)
+        parser, _ = self.parse(self.run_fake(task="3").stdout)
+        self.assertEqual((parser.is_error, parser.api_error_status), (True, 529))
+        self.assertTrue(A.is_unavailable(parser, 1))
+
     def test_fake_note_fails_loudly_without_the_shim(self):
         """Mutation caught: a silent `python -m artel` fallback (a runner that never installs the shim would pass)."""
         self.scenario({"*": [{"note": ["FACT", "hi", "basis"]}]})

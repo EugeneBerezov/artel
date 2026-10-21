@@ -104,6 +104,7 @@ class ChildMarkerTest(OpsCase):
 
         def fake_run_forever(self_):
             seen["notify"] = self_.notify
+            seen["kill"] = self_.notify_kill
             return 0
 
         old = os.getcwd()
@@ -114,6 +115,7 @@ class ChildMarkerTest(OpsCase):
         finally:
             os.chdir(old)
         self.assertIsInstance(getattr(seen["notify"], "__self__", None), notify.Dispatcher)
+        self.assertIs(getattr(seen["kill"], "__self__", None), seen["notify"].__self__)   # T37: the hung-command kill
 
 
 # --- reconcile (§5, PD-34) ----------------------------------------------------------------------------------------
@@ -429,6 +431,76 @@ class SetupPauseTest(OpsCase):
             requests.enqueue(self.repo, self.board, "resume", None, {"force": False})
             r.tick()
             self.assertIn("setup_failed", pauses.active(self.board))
+        finally:
+            r.shutdown()
+
+
+    def test_skipped_setup_ends_outage(self):
+        """T35-2 F1. Mutation caught: only `setup == "ok"` ending the outage — no `resumed`, and the next failure with
+        the same inputs re-pauses silently as the "same outage" (no second `paused`)."""
+        r = self.failed_once()
+        try:
+            path = slots.slot_path(self.repo, self.cfg, 1)
+            good = slots.setup_hash(path, self.cfg["commands.setup"], self.cfg["commands.setup_inputs"])
+            self.board.set_slot_setup_hash(1, good)   # as if another slot had proved this setup: the retry skips it
+            self.clock.advance(15 * 60 + 1)
+            self.drive(r, lambda: self.board.get_task(self.tid).state == "done" and not r.jobs)
+            self.assertEqual([e.text for e in self.sent(r, "resumed")], ["setup_failed"])
+            self.board.set_slot_setup_hash(1, None)   # days later the same setup fails again with the same inputs
+            self.add_task("next")
+            self.drive(r, lambda: "setup_failed" in pauses.active(self.board) and not r.jobs)
+            self.assertEqual(len(self.sent(r, "paused")), 2)   # a new outage, announced
+        finally:
+            r.shutdown()
+
+    def test_conflict_fix_does_not_end_outage(self):
+        """T37 review m3. A conflict fix never runs setup (PD-43, the markers would break it), so it proves nothing
+        about the retry. Mutation caught: its setup reported as `skipped` and taken as the end of the outage — a
+        false `resumed`, then a duplicate `paused` when the next stage fails setup with the same inputs."""
+        c = self.add_task("conflicted")
+        self.set_task(c, state="stuck", stuck_from="fixing")       # out of the way until the outage is on
+        self.task_branch_with_commit(c, "shared.txt")
+        self.commit_on(INTEGRATION, "shared.txt", "theirs\n")      # before the start: not a move under the runner
+        self.scenario({"write": WRITE, "review": PASS,
+                       f"{c}:fix": [{"write": ["shared.txt", "merged\n"]}, {"commit": "resolve conflict"},
+                                    {"result": {"outcome": "ready", "summary": "merged"}}]})
+        r = self.failed_once()
+        try:
+            self.set_task(self.tid, state="stuck", stuck_from="writing")
+            self.set_task(c, state="fixing", fix_kind="conflict", round=1, stuck_from=None)
+            self.clock.advance(15 * 60 + 1)
+            r.tick()                                                # the timed lift
+            self.assertNotIn("setup_failed", pauses.active(self.board))
+            # the fix runs (no setup), then its closure review fails setup again with the same inputs
+            self.drive(r, lambda: any(c_["stage"] == "fix" for c_ in self.calls())
+                       and "setup_failed" in pauses.active(self.board) and not r.jobs)
+            self.assertTrue(any(run.stage == "fix" and run.outcome == "ready" for run in self.board.list_runs(c)))
+            self.assertEqual(self.sent(r, "resumed"), [])
+            self.assertEqual(len(self.sent(r, "paused")), 1)
+        finally:
+            r.shutdown()
+
+    def test_stage_started_before_the_lift_does_not_end_outage(self):
+        """T35-2 m-d N6: the end is judged by the stage's start time, through the real wiring. Mutation caught:
+        `_setup_worked(self.clock())` — a stage already running when setup failed in another slot, finishing after
+        the timed lift, would announce an end nobody proved."""
+        self.set_task(self.tid, state="stuck", stuck_from="writing")
+        early, other = self.add_task("early", area=["a"]), self.add_task("other", area=["b"])
+        self.scenario({f"{early}:write": [{"sleep": 2}, {"result": {"outcome": "fail", "summary": "x"}}]})
+        r = self.started(max_agents=2, max_attempts=1)
+        try:
+            path = slots.slot_path(self.repo, self.cfg, 1)
+            self.board.set_slot_setup_hash(1, slots.setup_hash(path, self.cfg["commands.setup"],
+                                                               self.cfg["commands.setup_inputs"]))
+            self.drive(r, lambda: "setup_failed" in pauses.active(self.board)   # slot 2: setup runs and fails
+                       and not any(j.task_id == other for j in r.jobs))
+            self.assertEqual([j.task_id for j in r.jobs], [early])   # still sleeping in slot 1, setup skipped
+            self.set_task(other, state="stuck", stuck_from="writing")   # nothing else may start after the lift
+            self.clock.advance(15 * 60 + 1)
+            r.tick()                                                    # the timed lift
+            self.assertNotIn("setup_failed", pauses.active(self.board))
+            self.drive(r, lambda: not r.jobs)
+            self.assertEqual(self.sent(r, "resumed"), [])
         finally:
             r.shutdown()
 
@@ -854,6 +926,32 @@ class NotifierTest(OpsCase):
         self.assertEqual(len([x for x in rows if "notifier down" in x["text"]]), 2)
 
 
+    def test_shutdown_kills_hung_notify_command(self):
+        """T22-1 d. Mutation caught: shutdown leaving a hung notify command (and the child it started) running after
+        the flush deadline — the sender is a daemon, so the process would outlive the runner."""
+        pid_file = self.tmp / "notify-pids.txt"
+        code = ("import os, subprocess, sys, time\n"
+                "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+                f"open({str(pid_file)!r}, 'w', encoding='utf-8').write(f'{{os.getpid()}} {{child.pid}}')\n"
+                "time.sleep(60)\n")
+        r = self.started(kill_grace="1s")
+        dispatcher = notify.Dispatcher(["paused"], command=notify.CommandNotifier(py_cmd(code), self.cfg["shell"],
+                                                                                  kill_grace=1.0))
+        r.notify, r.notify_kill = dispatcher.emit, dispatcher.kill
+        r.pause("manual", "hung notifier")
+        self.wait_until(lambda: pid_file.exists() and len(pid_file.read_text(encoding="utf-8").split()) == 2)
+        pids = [int(x) for x in pid_file.read_text(encoding="utf-8").split()]
+        started = time.monotonic()
+        with mock.patch.object(runner_module, "NOTIFY_FLUSH_MIN", 0.0), mock.patch("sys.stderr", io.StringIO()):
+            r.shutdown()
+        # the flush waits kill_grace (1 s); then the kill: within kill_grace + the join deadline
+        self.assertLess(time.monotonic() - started, 1.0 + 1.0 + procs.JOIN_DEADLINE)
+        deadline = time.monotonic() + 5
+        while any(platform.pid_alive(p) for p in pids) and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertEqual([p for p in pids if platform.pid_alive(p)], [])
+
+
 # --- log retention (§5) -------------------------------------------------------------------------------------------
 
 class LogRetentionTest(OpsCase):
@@ -875,6 +973,33 @@ class LogRetentionTest(OpsCase):
             self.set_task(ids[3], state="rejected")
             r.tick()
             self.assertEqual(kept(), [ids[0], ids[3]])
+        finally:
+            r.shutdown()
+
+
+    def test_probe_logs_pruned(self):
+        """T35 SPEC-GAP: probe logs go by age (runner.PROBE_LOG_KEEP, by the stamp in their name). Mutation caught:
+        probe logs never pruned (one log per probe, for ever); a still-young log or a foreign file removed."""
+        from datetime import datetime, timezone
+
+        def name(ts):
+            return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+        directory = self.repo.logs_dir / "probe"
+        directory.mkdir(parents=True)
+        keep = runner_module.PROBE_LOG_KEEP
+        old, young = self.clock() - keep - 60, self.clock() - keep + 3600
+        files = {"old": directory / f"{name(old)}.jsonl", "old-err": directory / f"{name(old)}-2.jsonl.stderr",
+                 "young": directory / f"{name(young)}.jsonl", "foreign": directory / "notes.txt"}
+        for path in files.values():
+            path.write_text("{}\n", encoding="utf-8")
+        r = self.started(max_agents=1, limit_retry="30m")
+        try:
+            self.assertEqual(sorted(k for k, p in files.items() if p.exists()), ["foreign", "young"])
+            pauses.add(self.board, "agent_unavailable", "exit 1: x", now=self.clock())
+            self.clock.advance(2 * 3600)   # the young log is now past PROBE_LOG_KEEP; a probe is due
+            self.drive(r, lambda: pauses.probe_times(self.board, now=self.clock()) and not r.jobs)
+            self.assertEqual(sorted(k for k, p in files.items() if p.exists()), ["foreign"])
+            self.assertEqual(len(list(directory.glob(f"{name(self.clock())}*.jsonl"))), 1)   # the new probe's own log
         finally:
             r.shutdown()
 
@@ -1073,3 +1198,157 @@ class T15LeftoversTest(OpsCase):
             self.assertEqual(lines(), [f"held: artel/{tid} checked out at {human}", f"released: artel/{tid}"])
         finally:
             r.shutdown()
+
+
+# --- Task 37: the T22 review leftovers (reviews/T22-1.md, T22-ctl.md) and the probe process ----------------------
+
+class T22LeftoversTest(OpsCase):
+    def test_pause_and_resume_in_one_tick_emit_both(self):
+        """T22-1 a. Mutation caught: a lone `resumed` for a pause the human was never told about; and, the other way
+        round, a resume then a new pause in one tick ending on `resumed` while the runner is paused."""
+        r = self.started()
+        try:
+            requests.enqueue(self.repo, self.board, "pause", None, {})
+            requests.enqueue(self.repo, self.board, "resume", None, {"force": False})
+            r.tick()
+            self.assertEqual(pauses.active(self.board), {})
+            requests.enqueue(self.repo, self.board, "pause", None, {})
+            r.tick()
+            requests.enqueue(self.repo, self.board, "resume", None, {"force": False})
+            requests.enqueue(self.repo, self.board, "pause", None, {})
+            r.tick()
+            self.assertIn("manual", pauses.active(self.board))
+            kinds = [(e.kind, e.text) for e in self.sent(r) if e.kind in ("paused", "resumed")]
+            self.assertEqual(kinds, [("paused", "manual: artel pause"), ("resumed", "manual"),
+                                     ("paused", "manual: artel pause"),
+                                     ("resumed", "manual"), ("paused", "manual: artel pause")])
+        finally:
+            r.shutdown()
+
+    def test_manual_pause_uses_runner_clock(self):
+        """T22-1 b (the fake clock is years before the wall clock). Mutation caught: `since` from time.time() in
+        requests._apply_one or integrate.finish_base_update (the pause's age and the probe schedule would be wrong)."""
+        self.commit_on(INTEGRATION, "shared.txt", "integration side\n")
+        self.commit_file("shared.txt", "base side\n", "base side")
+        r = self.started(max_agents=1)
+        try:
+            self.clock.advance(123)
+            requests.enqueue(self.repo, self.board, "pause", None, {})
+            r.tick()
+            self.assertEqual(pauses.active(self.board)["manual"].since, self.clock())
+            requests.enqueue(self.repo, self.board, "resume", None, {"force": False})
+            self.clock.advance(7)
+            self.drive(r, lambda: "base_conflict" in pauses.active(self.board) and not r.jobs)
+            self.assertEqual(pauses.active(self.board)["base_conflict"].since, self.clock())
+        finally:
+            r.shutdown()
+
+    def test_orphan_running_flag_cleared_next_tick(self):
+        """T22-ctl a. Mutation caught: a task left `running` with no job after its result could not be applied (the
+        board was locked) — never picked again until a restart, area held, nothing journaled."""
+        self.scenario({"write": [{"result": {"outcome": "fail", "summary": "lost"}}]})
+        tid = self.add_task("orphan")
+        r = self.started(max_agents=1)
+        other = sqlite3.connect(str(self.repo.board_path), isolation_level=None)
+        try:
+            r.board.conn.execute("PRAGMA busy_timeout = 50")   # the locked tick fails fast
+            r.tick()
+            (job,) = r.jobs
+            self.wait_until(lambda: job.finished)
+            other.execute("BEGIN IMMEDIATE")
+            with mock.patch("sys.stderr", io.StringIO()):
+                r.tick()                                       # collecting fails: the result and the clear are lost
+            other.execute("ROLLBACK")
+            self.assertEqual(r.jobs, [])
+            self.assertTrue(self.board.get_task(tid).running)
+            r.tick()
+            task = self.board.get_task(tid)
+            self.assertEqual(task.attempts, 0)                 # requeued without a counter
+            fails = [e.text for e in journal.task_entries(self.board, tid) if e.kind == "FAIL"]
+            self.assertTrue(any(t.startswith("running flag of write cleared") for t in fails), fails)
+            self.assertEqual([e.task_id for e in self.sent(r, "error")], [tid])
+            self.drive(r, lambda: len([c for c in self.calls() if c["stage"] == "write"]) == 2)   # picked again
+        finally:
+            other.close()
+            r.shutdown()
+
+    def test_start_adopts_moved_integration_visibly(self):
+        """T22-ctl c. Mutation caught: a move of artel/integration while no runner ran adopted silently (no FACT, no
+        `error` event), or not adopted (an integration_moved pause at once)."""
+        r = self.started(max_agents=1)
+        old = git(self.repo_path, "rev-parse", INTEGRATION)
+        r.shutdown()
+        new = self.commit_on(INTEGRATION, "repair.txt", "x\n")
+        self.events.clear()
+        r2 = self.started(max_agents=1)
+        try:
+            text = f"integration moved while stopped: {old}..{new} adopted"
+            self.assertEqual(self.board.get_meta("integration_tip"), new)
+            facts = [e.text for e in journal.recent_entries(self.board, kinds=["FACT"])]
+            self.assertEqual(facts.count(text), 1)
+            self.assertEqual([e.text for e in self.sent(r2, "error")], [text])
+            r2.tick()
+            self.assertEqual(pauses.active(self.board), {})
+        finally:
+            r2.shutdown()
+        self.events.clear()
+        r3 = self.started(max_agents=1)   # unmoved: nothing to report
+        r3.shutdown()
+        self.assertEqual([e for e in self.events if e.kind == "error"], [])
+
+    def test_reconcile_journals_and_closes_runs(self):
+        """T22-ctl d. Mutation caught: reconcile's kills and requeues left unjournaled, or their `runs` rows left open
+        (a run that no process will ever finish)."""
+        killed, gone = self.add_task("killed"), self.add_task("gone")
+        proc, dead = sleeper(), sleeper(0)
+        self.wait_for_exit(dead)
+        try:
+            for tid, p, fp in ((killed, proc, platform.process_fingerprint(proc.pid)), (gone, dead, "gone-start")):
+                self.set_task(tid, state="writing")
+                self.board.start_run(task_id=tid, stage="write", round=0, model="m", model_reason="r", slot=1,
+                                     log_path="x.jsonl")
+                self.board.set_running(tid, kind="agent", pid=p.pid, group=p.pid, fingerprint=fp, slot=1)
+            r = self.started(max_agents=1)
+            r.shutdown()
+            self.wait_for_exit(proc)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()
+        for tid, what in ((killed, "terminated and requeued"), (gone, "requeued (its process was gone)")):
+            facts = [e.text for e in journal.task_entries(self.board, tid) if e.kind == "FACT"]
+            self.assertEqual(facts, [f"reconcile: write left running by a previous runner {what} without a counter"])
+            (run,) = self.board.list_runs(tid)
+            self.assertEqual(run.outcome, "stopped")
+            self.assertIsNotNone(run.ended_at)
+            self.assertEqual(run.killed, tid == killed)
+
+    def test_reconcile_kills_orphan_probe(self):
+        """T35 SPEC-GAP. Mutation caught: a probe's process not recorded (meta `probe_running`), or reconcile not
+        terminating a probe a crashed runner left behind, or the record kept after the probe ended."""
+        self.scenario({"probe": [{"sleep": 30}, {"result": {"summary": "OK"}}]})
+        r = self.started(max_agents=1, limit_retry="30m")
+        try:
+            pauses.add(self.board, "agent_unavailable", "exit 1: x", now=self.clock())
+            self.clock.advance(31 * 60)
+            r.tick()
+            self.wait_until(lambda: self.board.get_meta("probe_running"))
+            rec = json.loads(self.board.get_meta("probe_running"))
+            self.assertTrue(platform.pid_alive(rec["pid"]))
+            self.assertEqual(rec["fingerprint"], platform.process_fingerprint(rec["pid"]))
+        finally:
+            r.shutdown()
+        self.assertIsNone(self.board.get_meta("probe_running"))   # collected: the record goes with the job
+        proc = sleeper()
+        try:
+            self.board.set_meta("probe_running", json.dumps({
+                "pid": proc.pid, "group": platform.group_of(proc),
+                "fingerprint": platform.process_fingerprint(proc.pid), "slot": -1, "started_at": 1.0}))
+            r = self.started(max_agents=1)
+            r.shutdown()
+            self.wait_for_exit(proc)
+            self.assertIsNone(self.board.get_meta("probe_running"))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.wait()

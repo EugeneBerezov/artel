@@ -98,3 +98,27 @@ def waiting_reason(task: Task, tasks_by_id: Mapping[int, Task], deps: Sequence[i
         if other.id != task.id and holds_area(other) and areas_overlap(task.area, other.area):
             return f"area overlaps #{other.id}"
     return None
+
+
+def idle_reason(tasks: Sequence[Task], deps: Mapping[int, Sequence[int]], *, busy: Collection[int]) -> str:
+    """PD-71: why a slot without a job is idle after this tick's pick (the caller handles pauses first).
+    `tasks`, `deps` and `busy` are exactly what the tick gave `select`. "area" when a task `select` could start
+    (a due stage without a job, or `open` with every dependency `done`) was not selected only because its area
+    overlaps a busy task, an in-flight task or a task selected before it; else "deps" when an `open` task waits for
+    a dependency that is not `done`; else "no_task". A slot is idle, so `select` was not stopped by the slot count:
+    with unlimited slots it selects the same tasks, and a startable task it leaves out was held back by an area."""
+    by_id = {t.id: t for t in tasks}
+    running = set(busy) | {t.id for t in tasks if t.running}
+
+    def deps_done(t: Task) -> bool:
+        return all(d in by_id and by_id[d].state == "done" for d in deps.get(t.id, ()))
+
+    startable = [t for t in tasks if t.id not in running
+                 and (t.state in DUE_STAGES or (t.state == "open" and deps_done(t)))]
+    if startable:
+        picked = {t.id for t in select(tasks, deps, free_slots=len(tasks) + 1, verify_busy=True, busy=busy)}
+        if any(t.id not in picked for t in startable):
+            return "area"
+    if any(t.state == "open" and not deps_done(t) for t in tasks):
+        return "deps"
+    return "no_task"
