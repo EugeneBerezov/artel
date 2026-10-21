@@ -3,12 +3,13 @@
 `artel/integration` is only ever moved here, by `git update-ref` with the old value as a guard; nothing in
 this module pushes or checks that branch out.
 """
+import dataclasses
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import journal, pauses, procs, slots, transitions
+from artel import journal, pauses, procs, protect, slots, transitions
 from artel.board import Task
 from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
@@ -145,12 +146,21 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
     task = board.get_task(task_id)
     limits = transitions.Limits.from_cfg(task, cfg)
     tip = repo.rev(task_branch(task_id))   # after the verify merge: the base of a verify fix (PD-35)
+    guarded: list[protect.Hit] = []
+    if result.kind == "green" and limits.merge == "auto":
+        guarded = protect.hits(repo, cfg, result.commit or tip)   # the verified commit, not a later one (PD-45)
+        if guarded:
+            limits = dataclasses.replace(limits, merge="ask")   # R31b unless accepted (R31a, PD-36)
     transitions.decide(task, _EVENT[result.kind], limits, tip=tip)   # refuse before writing anything
     if result.kind != "setup_failed":
         if not board.update_task(task_id, expect_state=task.state, expect_version=task.version,
                                  last_verify=result.kind):
             raise transitions.StaleTask(f"task {task_id} changed under us (verify result)")
     tr = transitions.apply(board, task_id, _EVENT[result.kind], limits, tip=tip)
+    if guarded and tr.rid == "R31b":
+        sources = ", ".join(sorted({h.source for h in guarded}))
+        tr = dataclasses.replace(
+            tr, cause=f"merge=ask: touches protected path(s) {protect.summary(guarded)} ({sources})")
     if result.kind == "green" and result.commit:
         board.set_meta(_verified_key(task_id), result.commit)   # PD-45: exactly this commit may be integrated
     elif result.kind != "setup_failed":
