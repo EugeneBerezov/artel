@@ -76,6 +76,10 @@ class Task:
     version: int
     created_at: float
     updated_at: float
+    stage_runs: int = 0             # agent runs since a human last moved the task (PD-58, spec §3.1 "Counters")
+    flaky: bool = False             # the last verify was green only on a rerun (R31c)
+    resets: int = 0                 # branch resets by a failed fix (PD-63)
+    red_seen: bool = False          # an earlier verify of this task was red: it must now be green on every run (PD-72)
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,16 @@ class Run:
     duration_ms: int | None
     cost_usd: float | None
     session_id: str | None
+    workers: int | None = None      # the runner's worker count when the run started (PD-71 a)
+    queued_at: float | None = None  # when a verify run first became due (PD-71 c)
+
+
+@dataclass(frozen=True)
+class IdleSpan:
+    slot: int
+    reason: str
+    since: float
+    until: float | None
 
 
 @dataclass(frozen=True)
@@ -124,10 +138,13 @@ class Request:
 
 
 _TASK_FIELDS = tuple(f.name for f in dataclasses.fields(Task))
-_TASK_BOOLS = frozenset({"attack", "strong", "accepted", "risky", "answered", "running"})
+_TASK_BOOLS = frozenset({"attack", "strong", "accepted", "risky", "answered", "running", "flaky", "red_seen"})
 _NOT_UPDATABLE = frozenset({"id", "version", "created_at", "updated_at"})
 _RUNNING_COLUMNS = ("running_kind", "running_started_at", "running_pid", "running_group",
                     "running_fingerprint", "running_slot")
+
+_IDLE_TABLE = """CREATE TABLE IF NOT EXISTS idle (
+    id INTEGER PRIMARY KEY, slot INTEGER NOT NULL, reason TEXT NOT NULL, since REAL NOT NULL, until REAL)"""
 
 # "then" is an SQLite keyword: every column name is double-quoted in generated SQL.
 _SCHEMA = (
@@ -145,7 +162,9 @@ _SCHEMA = (
     answered INTEGER NOT NULL DEFAULT 0, last_verify TEXT,
     running INTEGER NOT NULL DEFAULT 0, running_kind TEXT, running_started_at REAL, running_pid INTEGER,
     running_group INTEGER, running_fingerprint TEXT, running_slot INTEGER,
-    version INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL)""",
+    version INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL, updated_at REAL NOT NULL,
+    stage_runs INTEGER NOT NULL DEFAULT 0, flaky INTEGER NOT NULL DEFAULT 0, resets INTEGER NOT NULL DEFAULT 0,
+    red_seen INTEGER NOT NULL DEFAULT 0)""",
     """CREATE TABLE IF NOT EXISTS task_deps (task_id INTEGER NOT NULL, after_id INTEGER NOT NULL,
     PRIMARY KEY (task_id, after_id))""",
     """CREATE TABLE IF NOT EXISTS entries (
@@ -159,11 +178,22 @@ _SCHEMA = (
     log_path TEXT NOT NULL, started_at REAL NOT NULL, ended_at REAL, outcome TEXT,
     usage TEXT NOT NULL DEFAULT '{}', exit_code INTEGER, timed_out INTEGER NOT NULL DEFAULT 0,
     killed INTEGER NOT NULL DEFAULT 0, first_context INTEGER, last_context INTEGER, turns INTEGER,
-    duration_ms INTEGER, cost_usd REAL, session_id TEXT)""",
+    duration_ms INTEGER, cost_usd REAL, session_id TEXT, workers INTEGER, queued_at REAL)""",
     "CREATE TABLE IF NOT EXISTS slots (n INTEGER PRIMARY KEY, path TEXT NOT NULL, task_id INTEGER, setup_hash TEXT)",
     """CREATE TABLE IF NOT EXISTS requests (
     id INTEGER PRIMARY KEY AUTOINCREMENT, ts REAL NOT NULL, command TEXT NOT NULL,
     task_id INTEGER, payload TEXT NOT NULL DEFAULT '{}', applied_at REAL, error TEXT)""",
+    _IDLE_TABLE,
+)
+
+# Columns added after the first release (PD-58): an older board gets them when it is opened.
+_ADDED_COLUMNS = (
+    ("tasks", "stage_runs", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "flaky", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "resets", "INTEGER NOT NULL DEFAULT 0"),
+    ("tasks", "red_seen", "INTEGER NOT NULL DEFAULT 0"),
+    ("runs", "workers", "INTEGER"),
+    ("runs", "queued_at", "REAL"),
 )
 
 
@@ -297,6 +327,7 @@ class Board:
             row = None
         if row is not None:
             self._check_schema_version(row[0])
+            self._migrate()
             return
         with self.tx() as conn:
             for statement in _SCHEMA:
@@ -305,6 +336,23 @@ class Board:
                          (str(SCHEMA_VERSION),))
             found = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0]
             self._check_schema_version(found)
+
+    def _missing_additions(self) -> list[tuple[str, str, str]]:
+        have: dict[str, set[str]] = {}
+        for table in {t for t, _, _ in _ADDED_COLUMNS}:
+            have[table] = {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}
+        return [(t, c, ddl) for t, c, ddl in _ADDED_COLUMNS if c not in have[t]]
+
+    def _migrate(self) -> None:
+        """PD-58: `ALTER TABLE ... ADD COLUMN` for what an older board lacks, and the `idle` table. A current
+        board is only read here: no write lock is taken (read-only commands must not queue behind the runner)."""
+        has_idle = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'idle'").fetchone()
+        if has_idle is not None and not self._missing_additions():
+            return
+        with self.tx() as conn:
+            for table, column, ddl in self._missing_additions():   # again inside the lock: another opener may have won
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
+            conn.execute(_IDLE_TABLE)
 
     @staticmethod
     def _check_schema_version(found: str) -> None:
@@ -441,15 +489,17 @@ class Board:
     # runs ----------------------------------------------------------------
 
     def start_run(self, *, task_id: int, stage: str, round: int, model: str | None,
-                  model_reason: str | None, slot: int | None, log_path: str) -> Run:
+                  model_reason: str | None, slot: int | None, log_path: str, workers: int | None = None,
+                  queued_at: float | None = None) -> Run:
         """n = 1 + count of existing runs for (task_id, stage)."""
         with self.tx() as conn:
             count = conn.execute("SELECT COUNT(*) FROM runs WHERE task_id = ? AND stage = ?",
                                  (task_id, stage)).fetchone()[0]
             cur = conn.execute(
-                "INSERT INTO runs (task_id, stage, n, round, model, model_reason, slot, log_path, started_at)"
-                " VALUES (?,?,?,?,?,?,?,?,?)",
-                (task_id, stage, count + 1, round, model, model_reason, slot, log_path, time.time()))
+                "INSERT INTO runs (task_id, stage, n, round, model, model_reason, slot, log_path, started_at,"
+                " workers, queued_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (task_id, stage, count + 1, round, model, model_reason, slot, log_path, time.time(), workers,
+                 queued_at))
             row = conn.execute("SELECT * FROM runs WHERE id = ?", (cur.lastrowid,)).fetchone()
         return _run_from_row(row)
 
@@ -478,6 +528,26 @@ class Board:
         rows = self.conn.execute("SELECT * FROM runs ORDER BY id").fetchall()
         wanted = None if stages is None else set(stages)
         return [r for r in map(_run_from_row, rows) if wanted is None or r.stage in wanted]
+
+    # idle spans (PD-71 b) ---------------------------------------------------
+
+    def open_idle(self, slot: int, reason: str, now: float) -> int:
+        with self.tx() as conn:
+            conn.execute("UPDATE idle SET until = ? WHERE slot = ? AND until IS NULL", (now, slot))   # one open span
+            return conn.execute("INSERT INTO idle (slot, reason, since) VALUES (?,?,?)",
+                                (slot, reason, now)).lastrowid
+
+    def close_idle(self, slot: int, now: float) -> None:
+        """Closes the slot's open span, if any."""
+        with self.tx() as conn:
+            conn.execute("UPDATE idle SET until = ? WHERE slot = ? AND until IS NULL", (now, slot))
+
+    def idle_spans(self, *, since: float | None = None) -> list[IdleSpan]:
+        """Spans that overlap the time from `since` on (all when None), oldest first."""
+        rows = self.conn.execute("SELECT slot, reason, since, until FROM idle"
+                                 " WHERE (? IS NULL OR until IS NULL OR until >= ?) ORDER BY id",
+                                 (since, since)).fetchall()
+        return [IdleSpan(*tuple(r)) for r in rows]
 
     # requests (§3.1: the single writer applies them) ------------------------
 

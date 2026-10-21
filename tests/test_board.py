@@ -257,6 +257,109 @@ class BoardTest(unittest.TestCase):
             self.assertEqual(got, value)
             self.assertIs(type(got), int)
 
+    def test_round2_task_columns_roundtrip(self):
+        """Mutation caught: `flaky` / `red_seen` missing from _TASK_BOOLS (a stored 1 reading back as int 1, and
+        `is False` checks of the runner failing), `stage_runs` / `resets` coerced to bool."""
+        tid = self.new_task()
+        t = self.board.get_task(tid)
+        self.assertEqual((t.stage_runs, t.flaky, t.resets, t.red_seen), (0, False, 0, False))
+        self.board.update_task(tid, expect_state="open", expect_version=t.version, stage_runs=7, flaky=True,
+                               resets=2, red_seen=True)
+        t = self.board.get_task(tid)
+        self.assertEqual((t.stage_runs, t.flaky, t.resets, t.red_seen), (7, True, 2, True))
+        self.assertIs(type(t.flaky), bool)
+        self.assertIs(type(t.red_seen), bool)
+        self.assertIs(type(t.stage_runs), int)
+        self.assertIs(type(t.resets), int)
+
+    test_flaky_roundtrips_as_bool = test_round2_task_columns_roundtrip
+
+    def _make_pre_t33_board(self, path):
+        """A board file as Task 4 / Task 31 wrote it: the current schema without the Task 33 columns and `idle`."""
+        conn = sqlite3.connect(str(path), isolation_level=None)
+        for statement in B._SCHEMA:
+            if statement is B._IDLE_TABLE:
+                continue
+            for _, column, ddl in B._ADDED_COLUMNS:   # the statement as it was before the column was added
+                statement = statement.replace(f",\n    {column} {ddl}", "").replace(f", {column} {ddl}", "")
+            conn.execute(statement)
+        conn.execute("INSERT INTO meta(key, value) VALUES ('schema_version', '1')")
+        conn.execute("INSERT INTO tasks (title, state, created_by, created_at, updated_at, attempts)"
+                     " VALUES ('old', 'writing', 'human', 1.0, 1.0, 1)")
+        conn.execute("INSERT INTO runs (task_id, stage, n, round, log_path, started_at)"
+                     " VALUES (1, 'write', 1, 0, 'l', 1.0)")
+        conn.close()
+
+    def test_board_migrates_old_tasks_table(self):
+        """Mutation caught: no migration (an old board raising `no such column`), a migration that loses rows,
+        defaults other than 0, a missing `idle` table."""
+        path = Path(self._tmp.name) / "old.db"
+        self._make_pre_t33_board(path)
+        old = sqlite3.connect(str(path))
+        self.assertNotIn("stage_runs", {r[1] for r in old.execute("PRAGMA table_info(tasks)")})
+        old.close()
+        migrated = B.open_board(path)
+        self.addCleanup(migrated.close)
+        task = migrated.get_task(1)
+        self.assertEqual((task.title, task.state, task.attempts), ("old", "writing", 1))
+        self.assertEqual((task.stage_runs, task.flaky, task.resets, task.red_seen), (0, False, 0, False))
+        run = migrated.list_runs(1)[0]
+        self.assertEqual((run.workers, run.queued_at), (None, None))
+        self.assertEqual(migrated.idle_spans(), [])
+        again = B.open_board(path)   # a second open finds nothing to do
+        again.close()
+
+    test_migration_adds_round2_columns_and_idle = test_board_migrates_old_tasks_table
+
+    def test_migration_waits_for_no_lock_on_a_current_board(self):
+        """Mutation caught: `_migrate` always opening a write transaction (read-only commands hit BoardBusy)."""
+        with self.board.tx():
+            again = B.open_board(self.path, busy_timeout_ms=50)
+            again.close()
+
+    def test_run_records_workers_and_queued_at(self):
+        """Mutation caught: the PD-71 keywords dropped on the way to the row, or read back from the wrong column."""
+        tid = self.new_task()
+        plain = self.board.start_run(task_id=tid, stage="verify", round=0, model=None, model_reason=None, slot=1,
+                                     log_path="a")
+        full = self.board.start_run(task_id=tid, stage="verify", round=0, model=None, model_reason=None, slot=1,
+                                    log_path="b", workers=3, queued_at=12.5)
+        self.assertEqual((plain.workers, plain.queued_at, full.workers, full.queued_at), (None, None, 3, 12.5))
+        self.assertEqual([(r.workers, r.queued_at) for r in self.board.list_runs(tid)], [(None, None), (3, 12.5)])
+
+    def test_idle_open_close_roundtrip(self):
+        """Mutation caught: close_idle closing another slot's span or an already closed one, `since` filtering
+        on the wrong end, an open span read back as closed."""
+        a = self.board.open_idle(1, "no_task", 10.0)
+        self.board.open_idle(2, "area", 11.0)
+        self.assertIsInstance(a, int)
+        self.board.close_idle(1, 20.0)
+        self.board.close_idle(1, 30.0)   # nothing open on slot 1: unchanged
+        self.board.close_idle(3, 30.0)   # no such span: not an error
+        self.assertEqual(self.board.idle_spans(), [B.IdleSpan(1, "no_task", 10.0, 20.0),
+                                                   B.IdleSpan(2, "area", 11.0, None)])
+        # spans that overlap the window count, also one that began before `since` (an idle total since X)
+        self.assertEqual(self.board.idle_spans(since=15.0), [B.IdleSpan(1, "no_task", 10.0, 20.0),
+                                                             B.IdleSpan(2, "area", 11.0, None)])
+        self.assertEqual(self.board.idle_spans(since=25.0), [B.IdleSpan(2, "area", 11.0, None)])
+        self.board.open_idle(1, "deps", 40.0)
+        self.assertEqual([s.reason for s in self.board.idle_spans()], ["no_task", "area", "deps"])
+
+    def test_open_idle_closes_the_slots_open_span(self):
+        """Mutation caught: two open spans for one slot when the caller forgets close_idle on a reason change."""
+        self.board.open_idle(1, "area", 10.0)
+        self.board.open_idle(2, "deps", 10.0)
+        self.board.open_idle(1, "no_task", 15.0)
+        self.assertEqual(self.board.idle_spans(), [B.IdleSpan(1, "area", 10.0, 15.0), B.IdleSpan(2, "deps", 10.0, None),
+                                                   B.IdleSpan(1, "no_task", 15.0, None)])
+
+    def test_every_added_column_is_migrated(self):
+        """Mutation caught: a column in _SCHEMA but missing from _ADDED_COLUMNS (an old board would lack it; the
+        generated 'old' board of the migration test cannot see this because it is built from the same list)."""
+        self.assertEqual({(t, c) for t, c, _ in B._ADDED_COLUMNS},
+                         {("tasks", "stage_runs"), ("tasks", "flaky"), ("tasks", "resets"), ("tasks", "red_seen"),
+                          ("runs", "workers"), ("runs", "queued_at")})
+
     def test_second_writer_times_out_with_board_busy(self):
         other = B.open_board(self.path, busy_timeout_ms=50)
         with self.board.tx():

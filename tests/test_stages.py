@@ -592,7 +592,18 @@ class FixTest(StagesCase):
         self.scenario({f"{tid}:fix": [{"result": READY}]})
         self.go(tid)
         task = self.task(tid)
-        self.assertEqual((task.state, task.attempts), ("open", 1))   # R17 also covers a failed fixer
+        self.assertEqual((task.state, task.attempts, task.resets), ("fixing", 1, 0))   # R17f: retried in place
+        self.assertTrue(self.repo.branch_exists(f"artel/{tid}"))                       # PD-63: the branch is kept
+
+    def test_fix_without_commit_at_the_attempt_cap_resets_once(self):
+        """Mutation caught: R17g missing from the stage path (a spent fixer retried forever on the same branch)."""
+        tid = self.task_in("fixing", fix_kind="review", with_commit=True, attempts=1)
+        base = git(self.repo_path, "rev-parse", f"artel/{tid}")
+        self.board.update_task(tid, expect_state="fixing", expect_version=self.task(tid).version, fix_base=base)
+        self.scenario({f"{tid}:fix": [{"result": READY}]})
+        _, _, tr = self.go(tid)
+        task = self.task(tid)
+        self.assertEqual((tr.rid, task.state, task.attempts, task.resets), ("R17g", "open", 0, 1))
         self.assertFalse(self.repo.branch_exists(f"artel/{tid}"))
 
     def test_conflict_fix_that_resets_away_its_work_is_not_a_merge(self):
@@ -603,7 +614,23 @@ class FixTest(StagesCase):
                                      {"result": READY}]})
         plan, run, tr = self.go(tid)
         self.assertFalse(run.merge_committed)
-        self.assertEqual(self.task(tid).state, "open")
+        self.assertEqual(self.task(tid).state, "fixing")   # R17f: the conflict fix is retried
+
+    def test_conflict_fix_retry_after_a_reset_is_not_a_merge(self):
+        """Mutation caught: judging the retry against where THIS run started (head_before). Run 1 resets the branch
+        to integration (R17f keeps it in `fixing`); run 2 does nothing, `merge` is "already up to date", and both
+        ancestor checks would pass on a branch that holds none of the task's work."""
+        tid = self.conflict_task()
+        pre_merge = git(self.repo_path, "rev-parse", f"artel/{tid}")
+        self.board.update_task(tid, expect_state="fixing", expect_version=self.task(tid).version, fix_base=pre_merge)
+        self.scenario({f"{tid}:fix": [{"git": ["merge", "--abort"]}, {"git": ["reset", "--hard", INTEGRATION]},
+                                     {"result": READY}]})
+        _, _, tr = self.go(tid)
+        self.assertEqual((tr.rid, self.task(tid).state), ("R17f", "fixing"))
+        self.scenario({f"{tid}:fix": [{"result": READY}]})
+        _, run, tr = self.go(tid)
+        self.assertFalse(run.merge_committed)
+        self.assertEqual((tr.rid, self.task(tid).state), ("R17g", "open"))
 
     def test_conflict_fix_with_a_follow_up_commit_after_the_merge_counts(self):
         tid = self.conflict_task()
@@ -617,7 +644,7 @@ class FixTest(StagesCase):
     def test_branch_reset_supersedes_open_review_findings_but_not_attack_ones(self):
         """PD-46. Mutation caught: leaving review findings open after R17 (the fresh review inherits findings
         about deleted code)."""
-        tid = self.task_in("fixing", fix_kind="review", with_commit=True)
+        tid = self.task_in("fixing", fix_kind="review", with_commit=True, attempts=1)
         base = git(self.repo_path, "rev-parse", f"artel/{tid}")
         self.board.update_task(tid, expect_state="fixing", expect_version=self.task(tid).version, fix_base=base,
                                round=1)
@@ -625,9 +652,9 @@ class FixTest(StagesCase):
                                   text="about the old code", basis="a.py:1", author="agent:review")
         attack = journal.add_finding(self.board, task_id=tid, stage="attack", round=0, severity="minor",
                                      text="about the task", basis="", author="agent:attack")
-        self.scenario({f"{tid}:fix": [{"result": READY}]})   # no commit: R17
+        self.scenario({f"{tid}:fix": [{"result": READY}]})   # no commit, attempts spent: R17g
         _, _, tr = self.go(tid)
-        self.assertEqual(tr.rid, "R17")
+        self.assertEqual(tr.rid, "R17g")
         self.assertEqual([e.id for e in journal.open_findings(self.board, tid, stages=("review",))], [])
         self.assertEqual([e.id for e in journal.open_findings(self.board, tid, stages=("attack",))], [attack])
         closes = [e for e in self.entries(tid, "FINDING") if e.status == "closed"]
@@ -681,7 +708,7 @@ class FixTest(StagesCase):
         plan, run, tr = self.go(tid)
         self.assertFalse(run.merge_committed)
         task = self.task(tid)
-        self.assertEqual((task.state, task.attempts), ("open", 1))
+        self.assertEqual((task.state, task.attempts), ("fixing", 1))
         self.assertIn("ready without a merge commit", self.entries(tid, "VERDICT")[0].text)
         self.assert_slot_left()
 

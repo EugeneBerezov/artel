@@ -208,7 +208,9 @@ def _commit_facts(repo, path: Path, task: Task, plan: StagePlan, merge_target: s
         # BOTH the merged commit and where the fix started must be in the branch: a follow-up commit is fine,
         # `git reset --hard <integration>` (the work dropped) is not
         merged = all(slots._git(repo, "merge-base", "--is-ancestor", ancestor, tip, cwd=path,
-                                check=False).returncode == 0 for ancestor in (merge_target, plan.head_before))
+                                check=False).returncode == 0
+                     for ancestor in (merge_target, task.fix_base or plan.head_before))   # fix_base: a retry (R17f) must
+        # not take a branch an earlier run reset to integration as "where the fix started"
         new = tip != plan.head_before
     return new, merged
 
