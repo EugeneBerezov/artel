@@ -934,8 +934,35 @@ minutes. Sections:
    same OS user as the runner; tool profiles, `ARTEL_CHILD` refusals, the
    repository check and the integration-tip check stop mistakes of a confused
    agent, not hostile code, which can do anything that user can (write the
-   board, move refs, read credentials). Run artel as a user without
-   credentials you would not hand to the agent.
+   board, move refs, read credentials). **Where to run** (owner,
+   2026-10-21): artel is meant to be installed and run as your own user on a
+   development machine — a dev VPS or a box whose files and credentials you
+   accept an unattended agent may use. A separate OS user without your
+   credentials is recommended, not required. On a machine with credentials
+   or data that matter (a personal computer, a server with production
+   access), run it only as such a separate user and only after reading this
+   list of **what an agent can do as the runner's user**, despite the
+   profiles:
+   1. read your files and credentials (SSH keys, git and `gh` tokens, the
+      agent CLI's own login, `.env` files) and send them out — Bash has the
+      network;
+   2. use your git credentials on remotes: push, delete branches, rewrite
+      refs (the repository check sees only the local repository);
+   3. delete or change files outside its slot — in your home and in other
+      projects (`rm`, `mv`, `sed -i` are not blocked by the default
+      profiles);
+   4. follow instructions planted in what it reads: repository content,
+      dependencies, task text, notes from other agents;
+   5. run project code unattended through `verify` and `setup` (for
+      example dependency install scripts);
+   6. spend quota or money of the agent account, including at night within
+      the limits of §3.1;
+   7. if the code it runs is hostile: write the board directly — fake
+      approvals, accepts or answers in your name.
+   The first `artel run` on a board prints one line before the runner
+   starts — `artel: agents run as <user> with that user's files and
+   credentials; see README "Safety"` — and records board meta
+   `trust_notice_shown`; later runs stay quiet.
 8. Troubleshooting: stuck tasks, stale heavy lock, disk guard, a second
    runner, reading logs.
 
