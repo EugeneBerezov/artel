@@ -752,6 +752,40 @@ class ReviewTest(StagesCase):
         self.assertEqual(plan.model, self.cfg["models.review"])
         slots.leave_slot(self.repo, self.board, self.cfg, 1)
 
+    def test_soft_and_hard_hits_escalate_round_one_review(self):
+        """Mutation caught: only protected hits escalating (a changed or deleted test reviewed on the cheap
+        model), a wrong reason text, protected hits losing to test hits, or a closure review escalating (it stays
+        on models.review, PD-67)."""
+        self.commit_file("tests/test_a.py", "x = 1\n", "base test")
+        git(self.repo_path, "branch", "-f", INTEGRATION, "main")
+        strong, cheap = self.cfg["models.strong"], self.cfg["models.review"]
+
+        def planned(files=None, *, delete=(), **fields):
+            tid = self.task_in("reviewing", round=fields.pop("round", 1), **fields)
+            slots.prepare_slot(self.repo, self.board, self.cfg, 1, tid)
+            path = slots.slot_path(self.repo, self.cfg, 1)
+            for rel, content in (files or {}).items():
+                self.commit_file(rel, content, f"work {rel}", cwd=path)
+            for rel in delete:
+                git(path, "rm", "-q", rel)
+                git(path, "commit", "-q", "-m", f"drop {rel}")
+            slots.leave_slot(self.repo, self.board, self.cfg, 1)
+            plan = stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+            slots.leave_slot(self.repo, self.board, self.cfg, 1)
+            return plan.model, plan.model_reason
+
+        self.assertEqual(planned({"tests/test_a.py": "x = 2\n"}),                       # soft: a changed line
+                         (strong, "test change: tests/test_a.py (test_paths)"))
+        self.assertEqual(planned(delete=["tests/test_a.py"]),                            # hard: deleted
+                         (strong, "test change: tests/test_a.py (test_paths)"))
+        self.assertEqual(planned({"tests/test_a.py": "x = 1\nos._exit(0)\n"}),         # hard: a marker
+                         (strong, "test change: tests/test_a.py (test_markers)"))
+        self.assertEqual(planned({"CLAUDE.md": "r\n", "tests/test_a.py": "x = 2\n"}),   # protected comes first
+                         (strong, "touches protected path CLAUDE.md (protected_paths)"))
+        self.assertEqual(planned({"tests/test_b.py": "y = 1\n"}), (cheap, "models.review"))   # an addition is free
+        self.assertEqual(planned({"tests/test_a.py": "x = 2\n"}, round=2),
+                         (cheap, "closure check (models.review)"))
+
     def test_review_pass_goes_to_verifying(self):
         tid = self.review_task()
         self.scenario({f"{tid}:review": [{"result": {"outcome": "pass", "summary": "looks fine"}}]})

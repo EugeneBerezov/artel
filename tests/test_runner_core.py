@@ -76,6 +76,24 @@ class RunnerCoreTest(E2ECase):
         self.assertNotIn("weakens, skips, deletes or loosens", calls[1]["prompt"])
         self.assertEqual(self.board.get_task(tid).verify_fixes, 1)
 
+    def test_finish_failure_after_red_run_emits_error_event(self):
+        """T36 review m2. Mutation caught: a red run's red_seen write bumping `version`, so `_finish_failed` took the
+        result for applied and stayed silent (no error event, no charge) when finish_verify then raised."""
+        self.write_toml({"commands.verify": py_cmd("import sys; sys.exit(1)"), "verify_reruns": 0})
+        self.scenario({"write": WRITE, "review": PASS})
+        tid = self.add_task("Add hello")
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            with mock.patch.object(integrate, "finish_verify", side_effect=RuntimeError("bookkeeping broke")):
+                self.drive(r, lambda: "error" in kinds(self))
+        finally:
+            r.shutdown()
+        task = self.board.get_task(tid)
+        self.assertTrue(task.red_seen)
+        self.assertIn("error", kinds(self))
+        self.assertEqual(self.events[0].task_id, tid)
+
     def test_accept_blocked_verify_fix_reverifies(self):
         """Replaces Task 18's test_accept_on_blocked_is_an_error_until_r35b. Mutation caught: R35b missing (the
         request ends in an error and the task stays blocked) or `accepted` set."""
