@@ -221,6 +221,50 @@ class RunnerCoreTest(E2ECase):
         r.activity = {7: 5.0, 9: 5.0, 10: 1.0}
         self.assertEqual(r._skip_refs(own, 4.0), {"refs/heads/artel/8", "refs/heads/artel/9"})
 
+    def test_overlapping_counts_stages_setups_verify_and_base_jobs(self):
+        """Mutation caught: `overlapping()` empty, or verify / base jobs left out (a verify job's setup installs
+        hooks too; the base job is key 0)."""
+        r = self.runner(max_agents=1)
+        gone = threading.Thread(target=lambda: None)
+        gone.start()
+        gone.join()
+        own = Job("stage", 7, 1, gone, threading.Event())
+        r.jobs = [own, Job("verify", 8, 2, gone, threading.Event()), Job("base", None, 3, gone, threading.Event()),
+                  Job("probe", None, -1, gone, threading.Event())]
+        r.stage_activity = {7: 9.0, 9: 5.0, 10: 1.0}
+        self.assertEqual(r._overlapping(own, 4.0), {0, 8, 9})
+
+    def test_restores_of_other_stages_are_skipped(self):
+        """Mutation caught: refs and files another stage's restore put back being compared (and put back again)."""
+        r = self.runner(max_agents=1)
+        gone = threading.Thread(target=lambda: None)
+        gone.start()
+        gone.join()
+        own = Job("stage", 7, 1, gone, threading.Event())
+        r.restores = [(5.0, frozenset({"refs/heads/artel/evil"}), frozenset({"config"})),
+                      (1.0, frozenset({"refs/heads/artel/old"}), frozenset({"hooks/old"}))]
+        self.assertEqual(r._skip_refs(own, 4.0), {"refs/heads/artel/evil"})
+        self.assertEqual(r._skip_files(4.0), {"config"})
+
+    def test_unrestored_config_pauses(self):
+        """Mutation caught: a config the check could not put back leaving the runner going (the planted
+        hooksPath would run in every later git call): the pause `repo_changed` stops new stages."""
+        tid = self.add_task("A")
+        lock = self.repo.common_dir / "config.lock"
+        config = self.repo.common_dir / "config"
+        self.scenario({"write": WRITE, "review": [{"write": [str(config), "[core]\n\thooksPath = /evil\n"]},
+                                                  *PASS]})
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            self.drive(r, lambda: self.board.get_task(tid).state == "reviewing")
+            lock.write_bytes(b"")   # a live git holds the config lock: the restore must skip it and report
+            self.drive(r, lambda: "repo_changed" in pauses.active(self.board), timeout=40)
+        finally:
+            r.shutdown()
+            lock.unlink(missing_ok=True)
+        self.assertIn("config", pauses.active(self.board)["repo_changed"].detail)
+
     def test_requests_are_stamped_before_they_are_applied(self):
         """Mutation caught: `_touch_requested` missing (a request that deletes a branch is a foreign change to the
         stage that is running)."""
@@ -230,7 +274,11 @@ class RunnerCoreTest(E2ECase):
         r.board = runner_module.open_board(self.repo.board_path)
         self.addCleanup(r.board.close)
         seen = []
-        with mock.patch.object(requests, "apply_pending", side_effect=lambda *a, **k: seen.append(dict(r.activity))):
+
+        def effect(repo, board, cfg, request, hooks, now):
+            seen.append(dict(r.activity))   # the stamp must be there when this request's own effect starts
+            raise ArtelError("stop here")
+        with mock.patch.object(requests, "_apply_one", side_effect=effect):
             r._apply_requests()
         self.assertIn(tid, seen[0])
 

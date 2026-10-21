@@ -1,6 +1,8 @@
+import os
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from artel import board as B, config as C, platform as P, repocheck, slots
 from artel.gitutil import INTEGRATION, Repo
@@ -293,6 +295,171 @@ class ConfigAndHooksTest(RepoCheckCase):
         self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
         self.assertFalse(marker.exists(), "a planted hook or fsmonitor ran inside the check")
         self.assertEqual(git(self.repo_path, "rev-parse", "artel/8"), self.sha[8])
+
+
+class RoundTwoTest(RepoCheckCase):
+    def marker_hook(self, directory: Path, name: str, marker: Path) -> Path:
+        script = self.tmp / "plant2.py"
+        script.write_text(f"open({str(marker)!r}, 'a', encoding='utf-8').write('x')\n", encoding="utf-8")
+        directory.mkdir(parents=True, exist_ok=True)
+        hook = directory / name
+        hook.write_text(f'#!/bin/sh\n"{sys.executable}" "{script.as_posix()}"\n', encoding="utf-8", newline="\n")
+        P.set_file_mode(hook, 0o755)
+        return hook
+
+    def test_planted_file_in_override_hooks_dir_never_runs(self):
+        """Mutation caught: a fixed, agent-writable directory as the hooks override (a `reference-transaction`
+        written there runs in the runner at restore; so does a file planted in any directory under artel/)."""
+        marker = self.tmp / "ran-override.txt"
+        before = self.take()
+        git(self.repo_path, "branch", "-D", "artel/8")
+        for name in ("empty-hooks", "tmp", "no-hooks"):   # every place an override directory could have been
+            self.marker_hook(self.repo.artel_dir / name, "reference-transaction", marker)
+        marker.unlink(missing_ok=True)
+        after = self.take()
+        self.assertEqual(repocheck.restore(self.repo, before, after, self.compare(before, after)), [])
+        self.assertFalse(marker.exists())
+        self.assertEqual(git(self.repo_path, "rev-parse", "artel/8"), self.sha[8])
+
+    def test_stale_config_lock_is_removed_and_restored(self):
+        """Mutation caught: a `config.lock` the agent left blocking the restore (its hooksPath then stays)."""
+        before = self.take()
+        git(self.repo_path, "config", "core.hooksPath", "/evil")
+        (self.repo.common_dir / "config.lock").write_bytes(b"")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(sorted(changes), ["file config changed", "file config.lock created"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertFalse((self.repo.common_dir / "config.lock").exists())
+        self.assertEqual(git(self.repo_path, "config", "--get", "core.hooksPath", check=False), "")
+
+    def test_a_lock_that_vanished_is_not_a_change(self):
+        """Mutation caught: a lock present in `before` and gone later reported as a deleted file (restore would
+        recreate someone else's lock)."""
+        (self.repo.common_dir / "config.lock").write_bytes(b"")
+        before = self.take()
+        (self.repo.common_dir / "config.lock").unlink()
+        self.assertEqual(self.compare(before, self.take()), [])
+
+    def test_a_lock_that_was_there_before_blocks_and_is_reported(self):
+        """Mutation caught: removing a live git's lock, or claiming a restore that did not happen."""
+        (self.repo.common_dir / "config.lock").write_bytes(b"")
+        before = self.take()
+        with open(self.repo.common_dir / "config", "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("[core]\n\thooksPath = /evil\n")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(changes, ["file config changed"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), changes)
+        self.assertEqual(repocheck.config_left(changes), changes)
+        self.assertTrue((self.repo.common_dir / "config.lock").exists())
+
+    def test_config_restore_drops_sections_runner_deleted(self):
+        """Mutation caught: the old bytes written back whole (a `branch -D` of the runner is undone and the
+        `[branch "artel/9"]` section comes back)."""
+        git(self.repo_path, "config", "branch.artel/9.remote", ".")
+        git(self.repo_path, "config", "branch.artel/9.merge", "refs/heads/x")
+        before = self.take()
+        git(self.repo_path, "config", "core.hooksPath", "/evil")
+        git(self.repo_path, "config", "--remove-section", "branch.artel/9")
+        git(self.repo_path, "config", "branch.artel/10.remote", ".")
+        after = self.take()
+        self.assertEqual(repocheck.restore(self.repo, before, after, self.compare(before, after)), [])
+        self.assertEqual(git(self.repo_path, "config", "--get", "core.hooksPath", check=False), "")
+        self.assertEqual(git(self.repo_path, "config", "--get", "branch.artel/9.remote", check=False), "")
+        self.assertEqual(git(self.repo_path, "config", "--get", "branch.artel/10.remote"), ".")
+
+    def test_branch_merge_options_is_a_change(self):
+        """Mutation caught: every branch.artel/* key exempt (`mergeOptions = -s ours` makes the runner's merges
+        drop other tasks' work); only `.remote` and `.merge` are the runner's."""
+        before = self.take()
+        git(self.repo_path, "config", "branch.artel/9.remote", ".")
+        git(self.repo_path, "config", "branch.artel/9.merge", "refs/heads/x")
+        self.assertEqual(self.compare(before, self.take()), [])
+        git(self.repo_path, "config", "branch.artel/9.mergeOptions", "-s ours")
+        self.assertEqual(self.compare(before, self.take()), ["file config changed"])
+
+    def test_dangling_symref_is_a_change(self):
+        """Mutation caught: for-each-ref alone (a dangling symbolic ref is not listed; the runner's later
+        `git branch artel/10` would create the target)."""
+        before = self.take()
+        git(self.repo_path, "symbolic-ref", "refs/heads/artel/10", "refs/heads/artel/nothere")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(changes, ["ref refs/heads/artel/10 created"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertEqual(git(self.repo_path, "symbolic-ref", "-q", "refs/heads/artel/10", check=False), "")
+
+    def test_planted_tmp_name_cannot_block_restore(self):
+        """Mutation caught: a fixed temp name (a directory at `config.artel-tmp` or `hooks/x.artel-tmp` made the
+        restore fail), and a quarantine copy that can fail the restore."""
+        hook = self.repo.common_dir / "hooks" / "pre-push"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_bytes(b"#!/bin/sh\nexit 0\n")
+        before = self.take()
+        hook.write_bytes(b"#!/bin/sh\nexit 1\n")
+        git(self.repo_path, "config", "core.hooksPath", "/evil")
+        (self.repo.common_dir / "config.artel-tmp").mkdir()
+        (self.repo.common_dir / "hooks" / "pre-push.artel-tmp").mkdir()
+        quarantine = self.tmp / "q-blocked"
+        quarantine.write_bytes(b"a file where the directory should be")
+        after = self.take()
+        self.assertEqual(repocheck.restore(self.repo, before, after, self.compare(before, after),
+                                           quarantine=quarantine), [])
+        self.assertEqual(hook.read_bytes(), b"#!/bin/sh\nexit 0\n")
+        self.assertEqual(git(self.repo_path, "config", "--get", "core.hooksPath", check=False), "")
+
+    def test_restore_leaves_no_temp_file_behind(self):
+        """Mutation caught: a failed or finished replace leaving `<name>.<random>` files in hooks/ and info/."""
+        before = self.take()
+        attrs = self.repo.common_dir / "info" / "attributes"
+        attrs.write_bytes(b"x\n")
+        info = self.repo.common_dir / "info"
+        names = {p.name for p in info.iterdir()}
+        after = self.take()
+        repocheck.restore(self.repo, before, after, self.compare(before, after))
+        self.assertEqual({p.name for p in info.iterdir()}, names - {"attributes"})
+
+    def test_parallel_restore_is_not_undone(self):
+        """Mutation caught: no skip_files (stage B, whose before held stage A's planted state, puts it back after
+        A's restore removed it)."""
+        git(self.repo_path, "config", "core.hooksPath", "/evil-from-A")   # A's plant, present in B's before
+        git(self.repo_path, "branch", "artel/evil", "main")
+        before_b = self.take()
+        git(self.repo_path, "config", "--unset", "core.hooksPath")        # A's restore
+        git(self.repo_path, "branch", "-D", "artel/evil")
+        after_b = self.take()
+        changes = self.compare(before_b, after_b)
+        self.assertEqual(sorted(changes), ["file config changed", "ref refs/heads/artel/evil deleted"])
+        self.assertEqual(self.compare(before_b, after_b, skip_refs={"refs/heads/artel/evil"},
+                                      skip_files={"config"}), [])
+
+    def test_stash_deletion_names_the_sha(self):
+        """Mutation caught: a FAIL text that cannot recover a dropped stash (`git stash store <sha>`)."""
+        (self.repo_path / "README").write_text("mine\n", encoding="utf-8", newline="\n")
+        git(self.repo_path, "stash", "push", "-q")
+        sha = git(self.repo_path, "rev-parse", "refs/stash")
+        before = self.take()
+        git(self.repo_path, "stash", "clear")
+        (change,) = self.compare(before, self.take())
+        self.assertIn(sha[:12], change)
+
+    def test_diff_external_and_foreign_git_dir_do_not_run_or_redirect(self):
+        """Mutation caught: `--no-ext-diff` missing from tracked_state (a planted `diff.external` runs), or the
+        inherited GIT_DIR reaching the check's git calls (they would read another repository)."""
+        marker = self.tmp / "ext.txt"
+        script = self.tmp / "ext.py"
+        script.write_text(f"open({str(marker)!r}, 'a', encoding='utf-8').write('x')\n", encoding="utf-8")
+        git(self.repo_path, "config", "diff.external", f'"{sys.executable}" "{script.as_posix()}"')
+        (self.slot1 / "README").write_text("edited\n", encoding="utf-8", newline="\n")
+        repocheck.tracked_state(self.repo, self.slot1)
+        self.assertFalse(marker.exists())
+        other = self.tmp / "other"
+        other.mkdir()
+        git(other, "init", "-q")
+        with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
+            snapshot = repocheck.take(self.repo, self.slot1)
+        self.assertIn("refs/heads/artel/7", snapshot.refs)
 
 
 class SkipWorktreeTest(RepoCheckCase):

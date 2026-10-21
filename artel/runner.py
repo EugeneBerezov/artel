@@ -22,7 +22,7 @@ from pathlib import Path
 
 from artel import agent_claude, cmd_agent, config as config_mod, integrate, journal, notify as notify_mod, pauses
 from artel import pick, platform, probe, procs
-from artel import requests, slots, stages, transitions
+from artel import repocheck, requests, slots, stages, transitions
 from artel.board import Board, open_board
 from artel.errors import ArtelError
 from artel.events import Event, Notify, null_notify
@@ -92,6 +92,7 @@ class Runner:
         self.jobs: list[Job] = []
         self.activity: dict[int, float] = {}           # PD-66: when the runner last started, ended or moved a task
         self.stage_activity: dict[int, float] = {}     # ... an agent stage, setup or verify job (0: the base job)
+        self.restores: list[tuple[float, frozenset, frozenset]] = []   # (when, refs, files) the checks put back
         self._rate_events: queue.SimpleQueue = queue.SimpleQueue()   # RateLimit events from worker threads
         self._setup_lifted_at: float = 0.0             # the last timed lift: only a stage started after it proves setup
         self._setup_outage: dict | None = None         # PD-31: the setup_failed outage a timed retry goes on with
@@ -808,14 +809,25 @@ class Runner:
         tasks = {t for t, at in list(self.activity.items()) if at >= started}
         tasks |= {j.task_id for j in list(self.jobs) if j.task_id is not None}
         tasks.discard(job.task_id)
-        return {f"refs/heads/{task_branch(t)}" for t in tasks}
+        refs = {f"refs/heads/{task_branch(t)}" for t in tasks}
+        for at, restored, _ in list(self.restores):   # a restore of another stage put these back: not ours to undo
+            if at >= started:
+                refs |= restored
+        return refs
 
-    def _touch_requested(self) -> None:
-        """A request may move or delete the branch of its task: stamp it before the git effect (PD-66 N1)."""
-        now = self.clock()
-        for request in self.board.pending_requests():
-            if request.task_id is not None:
-                self.activity[request.task_id] = now
+    def _overlapping(self, job: Job, started: float) -> set[int]:
+        """Other agent stages, setups and verify jobs (0: the base job) that ran during the stage."""
+        others = {t for t, at in list(self.stage_activity.items()) if at >= started}
+        others |= {j.task_id or 0 for j in list(self.jobs) if j is not job and j.kind in ("stage", "verify", "base")}
+        others.discard(job.task_id)
+        return others
+
+    def _skip_files(self, started: float) -> set[str]:
+        return {f for at, _, files in list(self.restores) if at >= started for f in files}
+
+    def touch(self, task_id: int) -> None:
+        """A request may move or delete the branch of its task: stamped right before its git effect (PD-66 N1)."""
+        self.activity[task_id] = self.clock()
 
     def _leave_quietly(self, board: Board | None, slot: int) -> None:
         if board is None:
@@ -850,14 +862,13 @@ class Runner:
         def skip_refs() -> set[str]:   # the branches the runner itself touched during the stage (PD-66)
             return self._skip_refs(job, started)
 
-        def overlapping() -> set[int]:   # other agent stages, setups and verify jobs during this stage
-            others = {t for t, at in list(self.stage_activity.items()) if at >= started}
-            others |= {j.task_id or 0 for j in list(self.jobs) if j is not job and j.kind in ("stage", "verify", "base")}
-            others.discard(job.task_id)
-            return others
+        def overlapping() -> set[int]:
+            return self._overlapping(job, started)
         run = stages.run_stage(self.repo, board, self.cfg, plan, job.slot, on_start=self._on_start(board, job),
                                on_rate_limit=self.on_rate_limit, stop_event=job.stop, skip_refs=skip_refs,
-                               overlapping=overlapping)
+                               overlapping=overlapping, skip_files=lambda: self._skip_files(started),
+                               on_restore=lambda refs, files: self.restores.append(
+                                   (self.clock(), frozenset(refs), frozenset(files))))
         return plan, run
 
     def _verify_work(self, board: Board, job: Job, queued_at: float | None = None):
@@ -914,9 +925,7 @@ class Runner:
     def _apply_requests(self) -> None:
         self._announced = set(pauses.active(self.board))   # kinds whose `paused` the human has already been sent
         try:
-            self._touch_requested()
             requests.apply_pending(self.repo, self.board, self.cfg, self, now=self.clock())
-            self._touch_requested()
             for kind in pauses.active(self.board):   # `artel pause`: every pause notifies (§3.1)
                 if kind not in self._announced:
                     self._notify_paused(kind)
@@ -1079,6 +1088,9 @@ class Runner:
         if job.kind == "stage":
             plan, run = job.result
             tr = stages.finish_stage(self.repo, board, self.cfg, job.task_id, plan, run)
+            stuck = repocheck.config_left(run.unrestored)
+            if stuck:   # the shared config could not be put back: no later git call may run with it
+                self.pause("repo_changed", f"#{job.task_id} {plan.stage} left {'; '.join(stuck)} unrestored")
             detail = f"setup {run.setup}"
             # T35-2 F1: a skipped setup (inputs unchanged) got past setup too; a conflict fix's `not_run` did not
             if run.setup in ("ok", "skipped"):

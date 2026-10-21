@@ -3,11 +3,14 @@
 Every reset, clean, switch and merge in this module runs only after `guard()` accepted the path as a
 registered slot under `slots_dir`: a corrupt board row or a hand-made worktree must never be scrubbed.
 """
+import contextlib
 import fnmatch
 import hashlib
 import json
 import os
 import re
+import shutil
+import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 
@@ -48,6 +51,29 @@ def merge_identity_args(repo: Repo) -> list[str]:
 def clean_env() -> dict[str, str]:
     """The environment without the variables that would redirect git to another repository."""
     return {k: v for k, v in os.environ.items() if k not in _GIT_ENV}
+
+
+@contextlib.contextmanager
+def no_hooks(repo: Repo):
+    """The git options that keep an agent-planted hook or fsmonitor from running in the runner: a hooks directory
+    that is new, empty and named at random for this one call (nothing an agent wrote beforehand is in it)."""
+    repo.tmp_dir.mkdir(parents=True, exist_ok=True)
+    empty = Path(tempfile.mkdtemp(prefix="nohooks-", dir=repo.tmp_dir))
+    try:
+        yield ["-c", f"core.hooksPath={empty}", "-c", "core.fsmonitor=false", "--no-optional-locks"]
+    finally:
+        shutil.rmtree(empty, ignore_errors=True)
+
+
+def git_hardened(repo: Repo, *args: str, cwd: Path | None = None, check: bool = True, input: str | None = None):
+    with no_hooks(repo) as options:
+        return repo.git(*options, *args, cwd=cwd, check=check, input=input, env=clean_env(),
+                        errors="surrogateescape")
+
+
+def git_hardened_bytes(repo: Repo, *args: str, cwd: Path | None = None) -> bytes:
+    with no_hooks(repo) as options:
+        return repo.git_bytes(*options, *args, cwd=cwd, env=clean_env())
 
 
 def _git(repo: Repo, *args: str, cwd: Path, check: bool = True):
@@ -201,7 +227,7 @@ _STATE_PATHS = ("rebase-merge", "rebase-apply", "BISECT_LOG", "CHERRY_PICK_HEAD"
 
 def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
     """Private: only called after guard()."""
-    asked = _git(repo, "rev-parse", "--path-format=absolute", *[a for name in _STATE_PATHS
+    asked = git_hardened(repo, "rev-parse", "--path-format=absolute", *[a for name in _STATE_PATHS
                                                                for a in ("--git-path", name)], cwd=path)
     state = {name: Path(line).exists() for name, line in zip(_STATE_PATHS, asked.stdout.splitlines())}
     if state["index.lock"]:   # a writer killed during `git add`/`git commit` leaves it; no process of the slot is alive
@@ -212,28 +238,23 @@ def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
                 except OSError:
                     pass
     if state["rebase-merge"] or state["rebase-apply"]:   # a writer killed mid-rebase or mid-am wedges the slot
-        _git(repo, "rebase", "--abort", cwd=path, check=False)
-        _git(repo, "am", "--abort", cwd=path, check=False)
+        git_hardened(repo, "rebase", "--abort", cwd=path, check=False)
+        git_hardened(repo, "am", "--abort", cwd=path, check=False)
         if any(Path(line).exists() for name, line in zip(_STATE_PATHS, asked.stdout.splitlines())
                if name.startswith("rebase")):
-            _git(repo, "rebase", "--quit", cwd=path, check=False)
+            git_hardened(repo, "rebase", "--quit", cwd=path, check=False)
     if state["BISECT_LOG"]:
-        _git(repo, "bisect", "reset", cwd=path, check=False)
+        git_hardened(repo, "bisect", "reset", cwd=path, check=False)
     if state["CHERRY_PICK_HEAD"]:
-        _git(repo, "cherry-pick", "--quit", cwd=path, check=False)
+        git_hardened(repo, "cherry-pick", "--quit", cwd=path, check=False)
     if state["REVERT_HEAD"]:
-        _git(repo, "revert", "--quit", cwd=path, check=False)
+        git_hardened(repo, "revert", "--quit", cwd=path, check=False)
     if state["MERGE_HEAD"]:
-        _git(repo, "merge", "--abort", cwd=path, check=False)
-    clear = _git(repo, "ls-files", "-v", "-z", cwd=path).stdout   # skip-worktree / assume-unchanged hide edits
-    hidden = [e[2:] for e in clear.split("\0") if e and e[0] != "H"]
-    if hidden:
-        for flag in ("--no-skip-worktree", "--no-assume-unchanged"):   # one flag per call: two lose the first
-            repo.git("update-index", flag, "-z", "--stdin", cwd=path, input="\0".join(hidden) + "\0",
-                     env=clean_env())
-    _git(repo, "reset", "--hard", cwd=path)
+        git_hardened(repo, "merge", "--abort", cwd=path, check=False)
+    git_hardened(repo, "reset", "--hard", cwd=path)
+    clear_index_flags(repo, path)   # after the reset: an unmerged entry is gone by then
     excludes = [arg for pattern in keep for arg in ("-e", pattern)]
-    _git(repo, "clean", "-ffdx", *excludes, cwd=path)
+    git_hardened(repo, "clean", "-ffdx", *excludes, cwd=path)
 
 
 def _head(repo: Repo, path: Path) -> str:
@@ -249,16 +270,16 @@ def prepare_slot(repo: Repo, board, cfg, n: int, task_id: int) -> str:
         raise SlotBusy(elsewhere, branch)
     scrub(repo, path, cfg["slot_keep"])
     if repo.branch_exists(branch):
-        _git(repo, "switch", branch, cwd=path)
+        git_hardened(repo, "switch", branch, cwd=path)
     else:
-        _git(repo, "switch", "-C", branch, INTEGRATION, cwd=path)
+        git_hardened(repo, "switch", "-C", branch, INTEGRATION, cwd=path)
     return _head(repo, path)
 
 
 def prepare_detached(repo: Repo, board, cfg, n: int) -> str:
     path = guard(repo, board, cfg, n)
     scrub(repo, path, cfg["slot_keep"])
-    _git(repo, "switch", "--detach", INTEGRATION, cwd=path)
+    git_hardened(repo, "switch", "--detach", INTEGRATION, cwd=path)
     return _head(repo, path)
 
 
@@ -274,6 +295,19 @@ def start_conflict_merge(repo: Repo, board, cfg, n: int) -> list[str]:
 
 def _setup_outputs_key(n: int) -> str:
     return f"setup_outputs:{n}"
+
+
+HIDING_TAGS = "Shs"   # `ls-files -v`: skip-worktree, assume-unchanged (never `M`: unmerged)
+
+
+def clear_index_flags(repo: Repo, path: Path) -> None:
+    """Skip-worktree and assume-unchanged flags hide edits to tracked files. Never raises."""
+    listing = git_hardened(repo, "ls-files", "-v", "-z", cwd=path, check=False).stdout
+    hidden = [e[2:] for e in listing.split("\0") if e and e[0] in HIDING_TAGS]
+    for flag in ("--no-skip-worktree", "--no-assume-unchanged"):   # one flag per call: two lose the first
+        if hidden:
+            git_hardened(repo, "update-index", flag, "-z", "--stdin", cwd=path, check=False,
+                         input="\0".join(hidden) + "\0")
 
 
 def forget_setup(board, n: int) -> None:
@@ -293,7 +327,7 @@ def leave_slot(repo: Repo, board, cfg, n: int) -> None:
         if any(not _kept(name, cfg["slot_keep"]) for name in outputs):   # PD-73: the scrub deletes setup output;
             forget_setup(board, n)                                       # forget first: a crash must not keep the hash
     scrub(repo, path, cfg["slot_keep"])
-    _git(repo, "switch", "--detach", cwd=path)
+    git_hardened(repo, "switch", "--detach", cwd=path)
 
 
 def setup_hash(path: Path, setup_cmd, inputs: Sequence[str]) -> str:
@@ -316,7 +350,7 @@ def setup_changed(path: Path, cfg, stored_hash: str | None) -> bool:
 
 def _untracked_tops(repo: Repo, path: Path) -> set[str]:
     """Top-level paths git shows as untracked or ignored: what a setup command can leave behind for a scrub."""
-    out = _git(repo, "status", "--porcelain=v1", "--ignored", "--untracked-files=all", "-z", cwd=path,
+    out = _git(repo, "status", "--porcelain=v1", "--ignored", "--untracked-files=normal", "-z", cwd=path,
                check=False).stdout
     tops, skip = set(), False
     for entry in out.split("\0"):

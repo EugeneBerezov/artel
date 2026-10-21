@@ -93,6 +93,21 @@ class EnsureTest(SlotsCase):
         self.assertIsNone(slots._exclude_slots_dir(self.repo, {"slots_dir": "../outside-pool"}))
         self.assertNotIn("outside-pool", (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8"))
 
+    def test_scrub_after_unmerged_entries_keeps_slot_usable(self):
+        """Mutation caught: the flag clean-up treating an unmerged entry (`ls-files -v` tag `M`) as a hidden file
+        and raising (the slot is dead for every later job)."""
+        [n] = self.slot(1)
+        path = slots.slot_path(self.repo, self.cfg, n)
+        self.commit_on_branch(n, 5, name="clash.txt")
+        git(path, "switch", "--detach", INTEGRATION)
+        other = self.commit_file("clash.txt", "other\n", "other side", cwd=path)
+        git(path, "cherry-pick", "artel/5", check=False)   # conflicts: unmerged entries in the index
+        git(path, "cherry-pick", "--quit")
+        self.assertIn("M clash.txt", git(path, "ls-files", "-v"))
+        slots.leave_slot(self.repo, self.board, self.cfg, n)
+        slots.prepare_slot(self.repo, self.board, self.cfg, n, 6)
+        self.assertEqual(git(path, "status", "--porcelain"), "")
+
     def test_slots_dir_with_dotdot_is_normalized(self):
         """Mutation caught: the unnormalized `relative_to` (`x/../.artel/slots` writes a '/x/../.artel/slots/' line
         that hides nothing; `../outside` must still write none)."""
