@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from artel import board as B, config as C, integrate, pauses, platform as P, slots, transitions as T
+from artel import board as B, config as C, integrate, pauses, platform as P, slots, testguard, transitions as T
 from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 from tests.helpers import RepoTestCase, git, py_cmd
@@ -327,7 +327,7 @@ class VerifyTest(IntegrateCase):
         self.assertIn("verify not configured", result.detail)
         self.finish(tid, result)
         self.assertIn("verify not configured", self.entries("VERDICT")[0]["text"])
-        self.assertEqual(self.board.get_task(tid).state, "verified")
+        self.assertEqual(self.board.get_task(tid).state, "awaiting_accept")   # PD-14: nothing ran, a human merges
 
     def test_merge_ask_goes_to_awaiting_accept(self):
         self.configure(merge="ask")
@@ -549,6 +549,9 @@ class IntegrateTaskTest(IntegrateCase):
         tr = self.finish(tid, broken)
         self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31b", "awaiting_accept"))
         self.assertIn("<git error>", tr.cause)
+        self.assertRegex(tr.cause, r"git failed while looking for protected paths: \S")   # git's own line, not a stub
+        self.assertNotIn("no message", tr.cause)
+        self.assertNotIn("test_paths", tr.cause)   # one git failure, named once (not again by the test guard)
 
     def test_protected_hit_with_merge_ask_keeps_plain_cause(self):
         """Mutation caught: the protected reason replacing the cause of a task that was `merge = ask` anyway."""
@@ -1004,9 +1007,13 @@ class RerunTest(IntegrateCase):
             "if first: sys.exit(1)\n"
             "time.sleep(30)\n"), "kill_grace": "1s"})
         tid = self.task_with_commit("verifying", "a.txt")
-        stop = threading.Event()
-        threading.Timer(2.0, stop.set).start()
-        result = self.verify(tid, stop_event=stop)
+        stop, starts = threading.Event(), []
+
+        def on_start(kind, pid, group, fingerprint):   # the rerun's process is up: stop it, no wall clock involved
+            starts.append(kind)
+            if len(starts) == 2:
+                stop.set()
+        result = self.verify(tid, stop_event=stop, on_start=on_start)
         self.assertEqual(result.kind, "stopped")
         self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red", "stopped"])
         self.assertTrue(self.board.get_task(tid).red_seen)
@@ -1026,6 +1033,64 @@ class RerunTest(IntegrateCase):
             with self.assertRaises(RuntimeError):
                 self.verify(tid)
         self.assertTrue(self.board.get_task(tid).red_seen)
+
+    def test_not_started_does_not_set_red_seen(self):
+        """Mutation caught: a verify command that cannot start counting as a red run (PD-72: only `red` and
+        `timeout` do; an environment error says nothing about the tree)."""
+        self.configure(**{"commands.verify": ["artel-no-such-program-xyz"]})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.assertEqual(self.verify(tid).kind, "setup_failed")
+        self.assertFalse(self.board.get_task(tid).red_seen)
+
+    def test_internal_error_does_not_set_red_seen(self):
+        """Mutation caught: an exception inside the run (the row still ends `red`) setting red_seen."""
+        tid = self.task_with_commit("verifying", "a.txt")
+        with mock.patch.object(integrate, "_verify_command", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                self.verify(tid)
+        self.assertFalse(self.board.get_task(tid).red_seen)
+        self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red"])
+
+    def test_timeout_sets_red_seen(self):
+        """Mutation caught: only `red` setting the flag (a timed-out verify is the verify_red event, PD-72)."""
+        self.configure(**{"commands.verify": py_cmd("import time; time.sleep(30)"), "verify_timeout": "1s",
+                          "kill_grace": "1s"})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.assertEqual(self.verify(tid).kind, "timeout")
+        self.assertTrue(self.board.get_task(tid).red_seen)
+
+    def test_red_seen_write_keeps_the_version(self):
+        """Mutation caught: the flag bumping `version`, which the runner reads as `a result was applied`."""
+        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        before = self.board.get_task(tid).version
+        self.verify(tid)
+        task = self.board.get_task(tid)
+        self.assertTrue(task.red_seen)
+        self.assertEqual(task.version, before)
+
+    def test_stop_before_rerun_skips_it(self):
+        """Mutation caught: `if i and stop_event` (an Event object is always truthy: every rerun skipped) or no
+        check at all (a stopped job still starting a process and taking the lock)."""
+        flag, heads = self.tmp / "flag", self.tmp / "heads"
+        self.configure(**{"commands.verify": self.flaky_script(flag, heads)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        quiet = self.verify(tid, stop_event=threading.Event())   # a stop_event that is not set: the rerun happens
+        self.assertEqual((quiet.kind, [r.outcome for r in quiet.runs]), ("green_flaky", ["red", "green"]))
+        flag.unlink()
+        stop, starts = threading.Event(), []
+        real = integrate._verify_command
+
+        def stop_after_first(*a, **kw):
+            starts.append(1)
+            result = real(*a, **kw)
+            stop.set()
+            return result
+        other = self.task_with_commit("verifying", "b.txt")
+        with mock.patch.object(integrate, "_verify_command", stop_after_first):
+            result = self.verify(other, stop_event=stop)
+        self.assertEqual((result.kind, len(starts)), ("stopped", 1))
+        self.assertEqual([r.outcome for r in self.verify_rows(other)], ["red"])   # no second row, no second process
 
     def test_flaky_touching_protected_paths_names_them(self):
         """Mutation caught: protect.hits skipped for a flaky task (the human accepts it as 'flaky' only)."""
@@ -1064,6 +1129,298 @@ class RerunTest(IntegrateCase):
                        "tests/t.py::test_x[a b] FAILED [ 90%]\n", encoding="utf-8", newline="")
         self.assertEqual(integrate.failed_tests(log),
                          ["tests/t.py::test_a", "tests/t.py::test_b", "tests/t.py::test_x[a b]"])
+
+
+def ok_lines(*names):
+    """What `unittest -v` prints for passed tests."""
+    return "".join(f"{n} (tests.t.A.{n}) ... ok\n" for n in names)
+
+
+PRINT_IDS = py_cmd("import pathlib\np = pathlib.Path('ids.txt')\nprint(p.read_text(encoding='utf-8') if p.exists() else '')")
+
+
+class GuardGatesTest(IntegrateCase):
+    """PD-64, PD-14: what keeps a green verify from merging on its own (T38)."""
+
+    def setUp(self):
+        super().setUp()
+        self.configure(**{"commands.verify": PRINT_IDS})
+
+    def baseline(self, *names, sha=None):
+        sha = sha or git(self.repo_path, "rev-parse", INTEGRATION)
+        testguard.write_ids(self.repo, sha, frozenset(f"{n} (tests.t.A.{n})" for n in names))
+        return sha
+
+    def task_passing(self, *passed, skipped=(), extra=None):
+        files = {"ids.txt": ok_lines(*passed) + "".join(f"{n} (tests.t.A.{n}) ... skipped 'x'\n" for n in skipped)}
+        files.update(extra or {})
+        tid = self.task_with_commit("verifying", "ids.txt", files["ids.txt"])
+        for rel, content in files.items():
+            if rel != "ids.txt":
+                path = self.temp_worktree(task_branch(tid))
+                self.commit_file(rel, content, f"task {rel}", cwd=path)
+                git(self.repo_path, "worktree", "remove", "--force", str(path))
+        return tid
+
+    def verdicts(self):
+        return [e["text"] for e in self.entries("VERDICT")]
+
+    def test_missing_test_id_goes_awaiting_accept(self):
+        """Mutation caught: comparing totals (a new test hides a removed one), or not naming the test and the
+        setting."""
+        self.baseline("a", "b")
+        tid = self.task_passing("a", "c")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31b", "awaiting_accept"))
+        text = self.verdicts()[0]
+        self.assertIn("1 tests passed on", text)
+        self.assertIn("b (tests.t.A.b)", text)
+        self.assertNotIn("c (tests.t.A.c)", text)
+        self.assertIn("verify_test_id_regex", text)
+
+    def test_skipped_test_counts_as_missing(self):
+        """Mutation caught: reading `Ran N tests` or any line with the name (a skipped test is not passed)."""
+        self.baseline("a", "b")
+        tid = self.task_passing("a", skipped=("b",))
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "awaiting_accept")
+
+    def test_no_ids_in_task_log_is_missing_all(self):
+        """Mutation caught: treating a log without ids as `nothing to compare`."""
+        self.baseline("a", "b")
+        tid = self.task_with_commit("verifying", "a.txt")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "awaiting_accept")
+        self.assertIn("2 tests passed on", self.verdicts()[0])
+
+    def test_all_baseline_ids_present_merges(self):
+        """Mutation caught: an id rule that asks on every verify (new tests are free)."""
+        self.baseline("a", "b")
+        tid = self.task_passing("a", "b", "c")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "verified")
+
+    def test_no_base_ids_means_no_id_check(self):
+        """Mutation caught: asking when nothing is recorded, or the silent skip (the VERDICT tells the controller)."""
+        tid = self.task_passing("a")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "verified")
+        off = [t for t in self.verdicts() if t.startswith("test-id check off")]
+        self.assertEqual(len(off), 1)
+        self.assertIn("verify_test_id_regex", off[0])
+
+    def test_red_base_record_keeps_id_baseline(self):
+        """Mutation caught: a red result for the same sha dropping the id baseline (N2)."""
+        sha = git(self.repo_path, "rev-parse", INTEGRATION)
+        ids = frozenset({"a (tests.t.A.a)"})
+        testguard.write_base(self.board, self.repo, sha=sha, green=True, at=1.0, log="", ids=ids)
+        testguard.write_base(self.board, self.repo, sha=sha, green=False, at=2.0, log="", ids=None)
+        self.assertEqual(testguard.base_ids(self.repo, sha), ids)
+        self.assertFalse(testguard.read_base(self.board)["green"])
+
+    def test_cache_delete_keeps_id_baseline(self):
+        """Mutation caught: the id baseline kept in meta `base_verify`, which `resume` deletes (N2)."""
+        sha = self.baseline("a", "b")
+        testguard.write_base(self.board, self.repo, sha=sha, green=True, at=1.0, log="",
+                             ids=testguard.base_ids(self.repo, sha))
+        self.board.del_meta("base_verify")
+        tid = self.task_passing("a")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "awaiting_accept")
+
+    def test_ids_not_compared_with_other_tip(self):
+        """Mutation caught: the latest recorded ids used whatever the tip (an old baseline for a moved tip)."""
+        self.baseline("a", "b")
+        self.commit_on_integration("moved.txt")
+        tid = self.task_passing("a")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "verified")
+        self.assertTrue(any(t.startswith("test-id check off") for t in self.verdicts()))
+
+    def test_baseline_is_the_tip_the_verify_merged(self):
+        """Mutation caught: base_sha read after the verify (a tip moved meanwhile) or the branch's own tip."""
+        sha = self.baseline("a", "b")
+        tid = self.task_passing("a", "b")
+        result = self.verify(tid)
+        self.assertEqual(result.base_sha, sha)
+        self.assertEqual(result.ids, frozenset({"a (tests.t.A.a)", "b (tests.t.A.b)"}))
+
+    def test_empty_id_regex_disables_the_id_check(self):
+        """Mutation caught: the id rule running with `verify_test_id_regex = []` (spec §4: empty disables it)."""
+        self.baseline("a", "b")
+        self.configure(**{"commands.verify": PRINT_IDS, "verify_test_id_regex": "[]"})
+        tid = self.task_passing("a")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "verified")
+        self.assertFalse(any(t.startswith("test-id check off") for t in self.verdicts()))
+
+    def test_empty_verify_forces_ask(self):
+        """Mutation caught: PD-14 as before round 2 (an empty verify auto-merging)."""
+        self.configure(**{"commands.verify": ""})
+        tid = self.task_with_commit("verifying", "a.txt")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31b", "awaiting_accept"))
+        self.assertIn('verify not configured (commands.verify="")', tr.cause)
+        self.assertIn("(commands.verify)", tr.cause)
+
+    def test_soft_hit_does_not_ask(self):
+        """Mutation caught: a soft hit (a changed test line) treated as hard — the round-2 rule."""
+        self.commit_on_integration("tests/test_old.py", "x = 1\n")
+        tid = self.task_with_commit("verifying", "tests/test_old.py", "x = 2\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31a", "verified"))
+
+    def test_hard_hit_without_ids_still_asks(self):
+        """Mutation caught: the diff checks tied to recorded ids (a deleted test file with no baseline)."""
+        self.commit_on_integration("tests/test_old.py", "x = 1\n")
+        tid = self.task_with_commit("verifying", "a.txt")
+        path = self.temp_worktree(task_branch(tid))
+        git(path, "rm", "-q", "tests/test_old.py")
+        git(path, "commit", "-q", "-m", "drop")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "awaiting_accept")
+        self.assertIn("tests/test_old.py deleted (test_paths)", tr.cause)
+
+    def test_gates_merge_into_one_verdict(self):
+        """Mutation caught: one VERDICT per guard, more than three reasons, or a missing `+N more`."""
+        self.commit_on_integration("tests/test_gone.py", "x = 1\n")
+        self.commit_on_integration("tests/test_keep.py", "y = 1\n")
+        self.baseline("a", "b")
+        tid = self.task_passing("a", extra={"CLAUDE.md": "rules\n", "tests/test_keep.py": "y = 1\n@unittest.skip('x')\n"})
+        path = self.temp_worktree(task_branch(tid))
+        git(path, "rm", "-q", "tests/test_gone.py")
+        git(path, "commit", "-q", "-m", "drop")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        tr = self.finish(tid, self.verify(tid))
+        greens = [t for t in self.verdicts() if t.startswith("verify green")]
+        self.assertEqual(len(greens), 1)
+        self.assertIn("merge=ask: touches protected path(s) CLAUDE.md; tests/test_gone.py deleted; "
+                      "tests/test_keep.py adds", greens[0])
+        self.assertIn("; +1 more (", greens[0])
+        for source in ("protected_paths", "test_markers", "test_paths", "verify_test_id_regex"):
+            self.assertIn(source, tr.cause)
+
+    def test_accepted_task_passes_gates(self):
+        """Mutation caught: a loop accept -> re-verify -> awaiting_accept for a guard hit (PD-36)."""
+        self.commit_on_integration("tests/test_gone.py", "x = 1\n")
+        tid = self.task_with_commit("verifying", "a.txt")
+        path = self.temp_worktree(task_branch(tid))
+        git(path, "rm", "-q", "tests/test_gone.py")
+        git(path, "commit", "-q", "-m", "drop")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        self.finish(tid, self.verify(tid))
+        self.assertEqual(self.board.get_task(tid).state, "awaiting_accept")
+        T.apply(self.board, tid, "accept", T.Limits.from_cfg(self.board.get_task(tid), self.cfg))
+        self.commit_on_integration("b.txt")
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "reverify")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31a", "verified"))
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "done")
+
+    def test_integrate_writes_base_verify_and_ids(self):
+        """Mutation caught: the baseline never advancing (the next task compared with a stale tip), or the cache
+        record written for the wrong sha."""
+        tid = self.task_passing("a", "b")
+        self.finish(tid, self.verify(tid))
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "done")
+        tip = git(self.repo_path, "rev-parse", INTEGRATION)
+        record = testguard.read_base(self.board)
+        self.assertEqual((record["sha"], record["green"]), (tip, True))
+        self.assertTrue(record["log"].endswith("verify-1.log"))
+        self.assertEqual(testguard.base_ids(self.repo, tip), frozenset({"a (tests.t.A.a)", "b (tests.t.A.b)"}))
+
+    def test_baseline_survives_task_verifies_of_the_same_tip(self):
+        """Mutation caught: pruning the ids file of the current integration tip after 20 task verifies (the id
+        rule would turn itself off, T38 review 1)."""
+        tip = self.baseline("a", "b")
+        for i in range(testguard.KEEP_IDS + 3):
+            testguard.write_ids(self.repo, f"{i + 1:040x}", frozenset({"x"}))
+        self.assertEqual(testguard.base_ids(self.repo, tip), frozenset({"a (tests.t.A.a)", "b (tests.t.A.b)"}))
+
+    def test_integration_moved_after_verify_keeps_the_merged_baseline(self):
+        """Mutation caught: the baseline read at finish time (a tip that moved after the verify merged) instead of
+        the tip the verify merged; and a merge of the ref name instead of that sha."""
+        old = self.baseline("a", "b")
+        tid = self.task_passing("a", "b")
+        result = self.verify(tid)
+        self.assertEqual(result.base_sha, old)
+        parents = git(self.repo_path, "rev-list", "--parents", "-n", "1", result.commit).split()
+        self.assertIn(old, parents[1:])                                     # the merge's second parent is `old`
+        self.commit_on_integration("moved.txt")
+        self.assertEqual(self.finish(tid, result).to_state, "verified")     # still compared with `old`: all there
+        other = self.task_passing("a")
+        late = self.verify(other)
+        self.assertNotEqual(late.base_sha, old)
+        self.assertEqual(self.finish(other, late).to_state, "verified")    # no baseline for the new tip: check off
+
+    def test_empty_verify_names_only_itself(self):
+        """Mutation caught: an empty verify also reporting every baseline test as missing."""
+        self.baseline("a", "b")
+        self.configure(**{"commands.verify": ""})
+        tid = self.task_with_commit("verifying", "a.txt")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertNotIn("tests passed on", tr.cause)
+
+    def test_green_verify_writes_ids_for_its_sha_only(self):
+        """Mutation caught: ids written for a red verify, or before the commit is known."""
+        tid = self.task_passing("a")
+        result = self.verify(tid)
+        self.finish(tid, result)
+        self.assertEqual(testguard.base_ids(self.repo, result.commit), frozenset({"a (tests.t.A.a)"}))
+        red = self.task_with_commit("verifying", "r.txt")
+        self.configure(**{"commands.verify": py_cmd("print('x (tests.t.A.x) ... ok'); import sys; sys.exit(1)")})
+        bad = self.verify(red)
+        self.finish(red, bad)
+        self.assertIsNone(testguard.base_ids(self.repo, git(self.repo_path, "rev-parse", task_branch(red))))
+
+    def test_base_update_writes_base_verify(self):
+        """Mutation caught: a merged base never becoming the id baseline (every later task would run with the
+        check off)."""
+        self.configure(**{"commands.verify": py_cmd("print('a (tests.t.A.a) ... ok')")})
+        self.commit_on_integration("task.txt")
+        self.commit_file("b.txt", "b\n", "base b")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(bu.kind, "merged")
+        self.assertEqual(bu.ids, frozenset({"a (tests.t.A.a)"}))
+        self.assertEqual(integrate.finish_base_update(self.repo, self.board, self.cfg, bu, now=42.0), "applied")
+        record = testguard.read_base(self.board)
+        self.assertEqual((record["sha"], record["green"], record["at"]), (bu.new, True, 42.0))
+        self.assertEqual(testguard.base_ids(self.repo, bu.new), bu.ids)
+
+    def test_fast_forward_base_update_records_nothing(self):
+        """Mutation caught: an unverified base tip recorded as green."""
+        self.commit_file("b.txt", "b\n", "base b")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(bu.kind, "fast_forward")
+        integrate.finish_base_update(self.repo, self.board, self.cfg, bu)
+        self.assertIsNone(testguard.read_base(self.board))
+
+    def test_missing_required_test_is_hard_hit(self):
+        """Mutation caught: a missing required test treated as soft."""
+        tid = self.task_with_commit("verifying", "ids.txt", ok_lines("test_a"), body="Tests: test_a, test_b\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "awaiting_accept")
+        self.assertIn("required tests did not pass: test_b", tr.cause)
+        self.assertNotIn("test_a", tr.cause.replace("test_a, test_b", ""))
+
+    def test_required_test_present_merges(self):
+        """Mutation caught: the dotted part of a unittest id never matching (every unittest task would ask)."""
+        tid = self.task_with_commit("verifying", "ids.txt", ok_lines("test_a"), body="Tests: test_a\n")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "verified")
+
+    def test_required_without_ids_is_hard_hit(self):
+        """Mutation caught: a task that names tests merging when verify printed no ids."""
+        tid = self.task_with_commit("verifying", "a.txt", body="Tests: test_a\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "awaiting_accept")
+        self.assertIn("required tests unconfirmed: verify printed no test ids", tr.cause)
+
+    def test_required_checked_without_tip_ids(self):
+        """Mutation caught: the required check tied to the id baseline (no recorded ids for the tip)."""
+        self.assertIsNone(testguard.base_ids(self.repo, git(self.repo_path, "rev-parse", INTEGRATION)))
+        tid = self.task_with_commit("verifying", "ids.txt", ok_lines("test_a"), body="Tests: test_zzz\n")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "awaiting_accept")
+
+    def test_no_tests_line_no_required_check(self):
+        """Mutation caught: a task without `Tests:` asking because verify printed no ids."""
+        tid = self.task_with_commit("verifying", "a.txt", body="just text\n")
+        self.assertEqual(self.finish(tid, self.verify(tid)).to_state, "verified")
 
 
 if __name__ == "__main__":

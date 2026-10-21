@@ -416,6 +416,13 @@ class Board:
                 (*values, time.time(), task_id, expect_state, expect_version))
             return cur.rowcount == 1
 
+    def set_red_seen(self, task_id: int, *, expect_state: str) -> bool:
+        """red_seen = 1 (PD-72) while the task is in `expect_state`. Does not bump `version`: a verify job writes
+        it between its start and its result, and the runner reads an unchanged version as "nothing applied yet"."""
+        with self.tx() as conn:
+            cur = conn.execute("UPDATE tasks SET red_seen = 1 WHERE id = ? AND state = ?", (task_id, expect_state))
+            return cur.rowcount == 1
+
     def set_running(self, task_id: int, *, kind: str, pid: int, group: int,
                     fingerprint: str | None, slot: int | None) -> None:
         """Marks a process as running. Does not bump `version` or touch state and counters."""

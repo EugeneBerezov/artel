@@ -10,7 +10,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import journal, pauses, procs, protect, slots, transitions
+from artel import journal, pauses, procs, protect, slots, testguard, transitions
 from artel.board import Task
 from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
@@ -42,6 +42,7 @@ class VerifyRun:
     outcome: str         # "green" | "red" | "timeout" | "stopped" ("conflict" for Task 40, never a runs row)
     duration_ms: int
     log_path: Path
+    ids: frozenset[str] | None = None   # passed test ids read from the log (green runs only, PD-64)
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,8 @@ class VerifyResult:
     log_path: Path
     detail: str
     runs: tuple[VerifyRun, ...] = ()
+    ids: frozenset[str] | None = None   # the deciding green run's passed test ids
+    base_sha: str | None = None         # the integration tip this verify merged (the id baseline, PD-64)
 
 
 def _rel(repo: Repo, path: Path) -> str:
@@ -101,13 +104,10 @@ def _verify_command(cfg, repo: Repo, path: Path, *, log_path: Path, env, on_star
 
 
 def _mark_red_seen(board, task_id: int) -> None:
-    """red_seen=1 as soon as a verify run came back red (PD-72), whatever the job's end. A task that moved on
-    (rejected, terminated) needs no flag."""
-    for _ in range(3):
-        cur = board.get_task(task_id)
-        if cur.red_seen or board.update_task(task_id, expect_state=cur.state, expect_version=cur.version,
-                                             red_seen=True):
-            return
+    """red_seen=1 as soon as a run came back `red` or `timeout` (PD-72), whatever the job's end. `not_started` and
+    an internal error are no red tree. A task that moved on (rejected, terminated) needs no flag. The write keeps
+    `version`: the runner tells "result already applied" by it."""
+    board.set_red_seen(task_id, expect_state="verifying")
 
 
 def _verify_job(repo: Repo, board, cfg, task: Task, slot_n: int, path: Path, commit: str, *, env, on_start,
@@ -126,19 +126,20 @@ def _verify_job(repo: Repo, board, cfg, task: Task, slot_n: int, path: Path, com
         log_path = repo.logs_dir / str(task.id) / f"verify-{n}.log"
         run = board.start_run(task_id=task.id, stage="verify", round=task.round, model=None, model_reason=None,
                               slot=slot_n, log_path=str(log_path), queued_at=queued_at)
-        kind, detail, code = "red", "internal error", None
+        kind, detail, code = "error", "internal error", None
         started = time.monotonic()
         try:
             kind, detail, code = _verify_command(cfg, repo, path, log_path=log_path, env=env, on_start=on_start,
                                                  stop_event=stop_event)
         finally:
-            outcome = "red" if kind == "not_started" else kind
+            outcome = "red" if kind in ("not_started", "error") else kind   # the runs vocabulary has no other
             duration_ms = int((time.monotonic() - started) * 1000)
             board.finish_run(run.id, outcome=outcome, usage={}, exit_code=code, timed_out=kind == "timeout",
                              killed=kind in ("timeout", "stopped"), duration_ms=duration_ms)
-            if outcome == "red":   # persist the evidence now: a stop, an error or a crash in the rerun must not forget it
+            if kind in ("red", "timeout"):   # persist the evidence now: a stop, an error or a crash in the rerun must not forget it
                 _mark_red_seen(board, task.id)
-        runs.append(VerifyRun(outcome, duration_ms, log_path))
+        ids = testguard.ids_from_log(log_path, cfg["verify_test_id_regex"]) if outcome == "green" else None
+        runs.append(VerifyRun(outcome, duration_ms, log_path, ids))
         if kind == "not_started":   # like a failing setup: pause the board, burn no fix and no agent
             return VerifyResult("setup_failed", None, log_path, detail, tuple(runs))
         if kind in ("timeout", "stopped"):   # never rerun
@@ -147,14 +148,15 @@ def _verify_job(repo: Repo, board, cfg, task: Task, slot_n: int, path: Path, com
             break
     outcomes = [r.outcome for r in runs]
     last = runs[-1].log_path
+    deciding = next((r.ids for r in reversed(runs) if r.outcome == "green"), None)
     if all(o == "green" for o in outcomes):
-        return VerifyResult("green", commit, last, detail, tuple(runs))
+        return VerifyResult("green", commit, last, detail, tuple(runs), deciding)
     if all(o == "red" for o in outcomes):
         return VerifyResult("red", None, last, detail, tuple(runs))
     first_red = next(r for r in runs if r.outcome == "red")
     return VerifyResult("green_flaky", commit, first_red.log_path,
                         f"mixed results ({', '.join(outcomes)}; verify_reruns {cfg['verify_reruns']})",
-                        tuple(runs))
+                        tuple(runs), deciding)
 
 
 def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: OnStart | None = None,
@@ -167,7 +169,10 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
     slots.prepare_slot(repo, board, cfg, slot_n, task.id)
     path = slots.slot_path(repo, cfg, slot_n)
     try:
-        files = _merge_into_slot(repo, path, INTEGRATION)
+        base_sha = repo.rev(INTEGRATION)   # merged by sha: the id baseline is exactly what the tree contains
+        if base_sha is None:
+            raise ArtelError(f"cannot verify task {task.id}: {INTEGRATION} does not exist (internal error)")
+        files = _merge_into_slot(repo, path, base_sha)
         if files is not None:
             detail = "conflict in " + ", ".join(files)
             log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -184,15 +189,53 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
                                 f"setup {setup}")
         commit = slots._git(repo, "rev-parse", "HEAD", cwd=path).stdout.strip()
         if not cfg["commands.verify"]:
-            return VerifyResult("green", commit, log_path, 'verify not configured (commands.verify="")')   # PD-14
-        return _verify_job(repo, board, cfg, task, slot_n, path, commit, env=env, on_start=on_start,
-                           stop_event=stop_event, queued_at=queued_at)
+            return VerifyResult("green", commit, log_path, 'verify not configured (commands.verify="")',   # PD-14
+                                base_sha=base_sha)
+        result = _verify_job(repo, board, cfg, task, slot_n, path, commit, env=env, on_start=on_start,
+                             stop_event=stop_event, queued_at=queued_at)
+        return dataclasses.replace(result, base_sha=base_sha)
     finally:
         slots.leave_slot(repo, board, cfg, slot_n)
 
 
 _EVENT = {"green": "verify_green", "green_flaky": "verify_green_flaky", "red": "verify_red",
           "timeout": "verify_red", "conflict": "verify_conflict", "setup_failed": "setup_failed"}
+
+
+def gates(repo: Repo, board, cfg, task: Task, result: VerifyResult) -> list[protect.Hit]:
+    """What stops a green verify from merging on its own: protected paths, the test guard's hard hits, a passed
+    test that went missing, required tests, an empty verify (PD-47, PD-64, PD-14). The verified commit is
+    inspected, not a later one (PD-45)."""
+    commit = result.commit or task_branch(task.id)
+    found = protect.hits(repo, cfg, commit)
+    if not any(h.path == protect.GIT_ERROR for h in found):   # the same git failure would only repeat
+        found += testguard.hard_hits(repo, cfg, commit)
+    hit = testguard.id_hit(repo, board, cfg, result)
+    if hit is not None:
+        found.append(hit)
+    found += testguard.required_hits(testguard.required_tests(task.body), result.ids)
+    if not cfg["commands.verify"]:
+        found.append(protect.Hit(testguard.VERIFY, "commands.verify", 'verify not configured (commands.verify="")'))
+    return found
+
+
+_PROTECT_SOURCES = ("protected_paths", "templates_dir", "commands.verify", "commands.setup", "commands.setup_inputs")
+
+
+def _gate_reason(guarded: list[protect.Hit]) -> str:
+    """`<reason>; <reason>; <reason>; +N more (<settings>)`, protected paths first (PD-47), then one reason per
+    other hit; the first line git printed for a failed protected-path check follows the settings."""
+    protected = [h for h in guarded if h.source in _PROTECT_SOURCES and h.path != testguard.VERIFY]
+    reasons = [f"touches protected path(s) {protect.summary(protected)}"] if protected else []
+    for h in guarded:
+        if h not in protected:
+            reasons.append(h.note if h.path == testguard.VERIFY else f"{h.path} {h.note}")
+    text = "; ".join(reasons[:protect.SHOWN])
+    if len(reasons) > protect.SHOWN:
+        text += f"; +{len(reasons) - protect.SHOWN} more"
+    text += f" ({', '.join(sorted({h.source for h in guarded}))})"
+    why = "; ".join(sorted({h.note for h in protected if h.path == protect.GIT_ERROR}))
+    return text + (f"; {why}" if why else "")
 
 
 def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
@@ -204,7 +247,7 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
     tip = repo.rev(task_branch(task_id))   # after the verify merge: the base of a verify fix (PD-35)
     guarded: list[protect.Hit] = []
     if (result.kind == "green" and limits.merge == "auto") or result.kind == "green_flaky":
-        guarded = protect.hits(repo, cfg, result.commit or tip)   # the verified commit, not a later one (PD-45)
+        guarded = gates(repo, board, cfg, task, result)
         if guarded and result.kind == "green":
             limits = dataclasses.replace(limits, merge="ask")   # R31b unless accepted (R31a, PD-36)
     flaky_text = ""
@@ -214,6 +257,11 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
         if failed:
             flaky_text += "; failed: " + ", ".join(failed)
     transitions.decide(task, _EVENT[result.kind], limits, tip=tip)   # refuse before writing anything
+    if result.kind in ("green", "green_flaky") and result.commit and result.ids is not None:
+        try:   # the id baseline of this sha, for a later integrate_task; a failed write only turns the check off
+            testguard.write_ids(repo, result.commit, result.ids)
+        except OSError:
+            pass
     with board.tx():   # the transition, the verified commit and the journal lines land together
         if result.kind != "setup_failed":
             if not board.update_task(task_id, expect_state=task.state, expect_version=task.version,
@@ -221,13 +269,8 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
                 raise transitions.StaleTask(f"task {task_id} changed under us (verify result)")
         tr = transitions.apply(board, task_id, _EVENT[result.kind], limits, tip=tip)
         if guarded and tr.rid in ("R31b", "R31c"):
-            sources = ", ".join(sorted({h.source for h in guarded}))
-            reason = f"touches protected path(s) {protect.summary(guarded)} ({sources})"
-            why = "; ".join(sorted({h.note for h in guarded if h.path == protect.GIT_ERROR}))
-            if why:
-                reason += f"; {why}"
             lead = "merge=ask: flaky verify (verify_reruns); " if tr.rid == "R31c" else "merge=ask: "
-            tr = dataclasses.replace(tr, cause=lead + reason)
+            tr = dataclasses.replace(tr, cause=lead + _gate_reason(guarded))
         elif tr.rid == "R31c":
             tr = dataclasses.replace(tr, cause="merge=ask: flaky verify (verify_reruns)")
         if result.kind in ("green", "green_flaky") and result.commit:
@@ -240,6 +283,10 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
             verdict += f" ({tr.cause})"
         journal.append(board, "VERDICT", journal.truncate_utf8(verdict, journal.TEXT_LIMIT), author=_RUNNER,
                        task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
+        off = testguard.id_check_off(repo, cfg, result) if result.kind in ("green", "green_flaky") else None
+        if off:   # phase 1: the controller must see that the id rule did not run
+            journal.append(board, "VERDICT", journal.truncate_utf8(off, journal.TEXT_LIMIT), author=_RUNNER,
+                           task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
         if result.kind in ("red", "timeout"):
             journal.append(board, "FAIL", journal.truncate_utf8(
                 f"verify {result.kind} ({result.detail}); log: {log}", journal.TEXT_LIMIT),
@@ -318,6 +365,22 @@ def _usage_summary(board, task_id: int) -> str:
     return ", ".join(f"{stage} {_count(a)}/{_count(b)}" for stage, (a, b) in per_stage.items())
 
 
+def _last_verify_log(repo: Repo, board, task_id: int) -> str:
+    logs = [r.log_path for r in board.list_runs(task_id) if r.stage == "verify" and r.log_path]
+    return _rel(repo, Path(logs[-1])) if logs else ""
+
+
+def _record_base(repo: Repo, board, sha: str, *, ids: frozenset[str] | None, log: str,
+                 at: float | None = None) -> None:
+    """The integration tip `sha` has a green verify: the base-check cache and the id baseline (PD-64). The ref
+    has moved already; a failed write only turns the id check off."""
+    try:
+        testguard.write_base(board, repo, sha=sha, green=True, at=time.time() if at is None else at, log=log,
+                             ids=ids)
+    except OSError:
+        pass
+
+
 def integrate_task(repo: Repo, board, cfg, task_id: int) -> str:
     """-> "done" | "held" | "retry" | "reverify"."""
     task = board.get_task(task_id)
@@ -349,6 +412,7 @@ def integrate_task(repo: Repo, board, cfg, task_id: int) -> str:
         text += f" usage: {usage}"
     journal.append(board, "DONE", journal.truncate_utf8(text, journal.TEXT_LIMIT), author=_RUNNER, task_id=task_id)
     slots.apply_git_effects(repo, board, cfg, task_id, tr.effects)
+    _record_base(repo, board, tip, ids=testguard.base_ids(repo, tip), log=_last_verify_log(repo, board, task_id))
     return "done"
 
 
@@ -361,6 +425,7 @@ class BaseUpdate:
     new: str | None
     log_path: Path | None
     detail: str
+    ids: frozenset[str] | None = None   # passed test ids of a green base verify (PD-64)
 
 
 def base_needs_update(repo: Repo, cfg) -> bool:
@@ -405,7 +470,8 @@ def base_update(repo: Repo, board, cfg, slot_n: int, *, on_start: OnStart | None
         kind, detail, _ = _verify_command(cfg, repo, path, log_path=log_path, env=env, on_start=on_start,
                                           stop_event=stop_event)
         if kind == "green":
-            return BaseUpdate("merged", old, new, log_path, detail)
+            return BaseUpdate("merged", old, new, log_path, detail,
+                              testguard.ids_from_log(log_path, cfg["verify_test_id_regex"]))
         return BaseUpdate("red" if kind == "not_started" else kind, old, None, log_path, detail)
     finally:
         slots.leave_slot(repo, board, cfg, slot_n)
@@ -421,6 +487,9 @@ def finish_base_update(repo: Repo, board, cfg, bu: BaseUpdate, *, now: float | N
             return "retry"
         merged_base = bu.new if bu.kind == "fast_forward" else repo.rev(f"{bu.new}^2")   # the base tip that was merged
         board.set_meta("last_base", merged_base or bu.new)
+        if bu.kind == "merged":   # a verified tree; a fast-forward to the base tip was never verified here
+            _record_base(repo, board, bu.new, ids=bu.ids, log=_rel(repo, bu.log_path) if bu.log_path else "",
+                         at=now)
         return "applied"
     if bu.kind in ("conflict", "red", "timeout"):
         detail = journal.truncate_utf8(f"{bu.kind}: {bu.detail}", journal.TEXT_LIMIT)

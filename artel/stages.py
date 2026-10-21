@@ -9,7 +9,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import agent_claude, cmd_agent, journal, procs, prompts, protect, slots, templates, transitions
+from artel import agent_claude, cmd_agent, journal, procs, prompts, protect, slots, templates, testguard, transitions
 from artel.agent_claude import RateLimit, StreamParser, validate_result
 from artel.board import Task
 from artel.errors import ArtelError
@@ -54,8 +54,11 @@ def choose_model(cfg, task: Task, stage: str, diff: int, *, protected: Sequence[
         return cfg["models.strong"], "task --attack"
     if task.risky:
         return cfg["models.strong"], "task risky (vet)"                             # PD-37
-    if protected:                                                                   # PD-47, PD-67
-        return cfg["models.strong"], f"touches protected path {protected[0].path} ({protected[0].source})"
+    if protected:                                                                   # PD-47, PD-64, PD-67
+        first = protected[0]
+        if first.source in testguard.SOURCES:
+            return cfg["models.strong"], f"test change: {first.path} ({first.source})"
+        return cfg["models.strong"], f"touches protected path {first.path} ({first.source})"
     if diff > cfg["models.strong_diff_lines"]:
         return cfg["models.strong"], f"diff {diff} lines > strong_diff_lines {cfg['models.strong_diff_lines']}"
     return cfg["models.review"], "models.review"
@@ -173,7 +176,10 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
     if stage not in SUPPORTED_STAGES:
         raise ArtelError(f"task {task.id} in state {task.state} has no supported stage")
     agent_claude.agent_argv(cfg)   # CannotStartAgent before any slot command: the stage is agent_unavailable
-    guarded = protect.hits(repo, cfg, task_branch(task.id)) if stage == "review" else []
+    guarded = []
+    if stage == "review":   # protected paths first, then the test guard's hard and soft hits (PD-64)
+        tip = task_branch(task.id)
+        guarded = protect.hits(repo, cfg, tip) + testguard.hard_hits(repo, cfg, tip) + testguard.soft_hits(repo, cfg, tip)
     model, model_reason = choose_model(cfg, task, stage, diff_lines(repo, task.id) if stage == "review" else 0,
                                        protected=guarded)
     conflict_paths: tuple[str, ...] = ()
