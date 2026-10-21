@@ -348,9 +348,20 @@ attack or review stage the task's own branch and the slot's `HEAD` must
 also be unchanged; a writer or fixer may only add commits to its own
 branch. On any other change the runner restores what it can (refs set back
 or deleted, the files rewritten from the snapshot, an idle slot cleaned),
-writes a runner `FAIL` entry naming what changed, counts the run as a
-failed stage and notifies (`error`). Then the slot is left as after every
-stage (§3.1 "Leaving a slot"), so every probe file is gone.
+writes a runner `FAIL` entry naming what changed and notifies (`error`).
+A person may act on the same `.git` while a stage runs (owner,
+2026-10-21), so: `refs/stash` is never set back — a new stash is reported
+only, because deleting it would lose the person's work; before a file is
+rewritten, its changed version is kept under
+`<git-common-dir>/artel/repo-changes/` and the FAIL entry names that
+copy; and the run counts as a failed stage only when no other agent stage
+or setup ran during any part of its window — otherwise the change is
+reported and restored, the FAIL entry names every overlapping task, and
+no stage is charged (so one person's `git remote add` cannot trip the
+failure breaker). The check itself never runs hooks or a file-system
+monitor an agent may have planted (`core.hooksPath` and `core.fsmonitor`
+are overridden for the runner's own git calls). Then the slot is left as
+after every stage (§3.1 "Leaving a slot"), so every probe file is gone.
 
 **Protected paths.** A task whose diff `artel/integration...artel/<id>`
 (renames on both sides, deletions included) changes a path matching
@@ -1001,9 +1012,21 @@ minutes. Sections:
       the limits of §3.1;
    7. if the code it runs is hostile: write the board directly — fake
       approvals, accepts or answers in your name.
+   **Working beside a running artel** (owner, 2026-10-21): your own
+   checkout shares `.git` with the slots, so while a stage runs, artel
+   treats a change to the shared `config`, `hooks/`, `info/` or a
+   `config.worktree` as possibly an agent's: it **puts the file back** and
+   keeps your version under `<git-common-dir>/artel/repo-changes/` (the
+   FAIL entry and the notification name the copy; copy it back after
+   `artel pause` or when the runner is idle). A new `git stash` is
+   reported and kept. Branches under `artel/` belong to the runner — use
+   `artel reject` / `rework`, never `git branch -D`. Install hooks
+   (`pre-commit install`, husky), add remotes or change git config while
+   artel is paused or stopped.
    The first `artel run` on a board prints one line before the runner
    starts — `artel: agents run as <user> with that user's files and
-   credentials; see README "Safety"` — and records board meta
+   credentials; do not change .git config or hooks while it runs; see
+   README "Safety"` — and records board meta
    `trust_notice_shown`; later runs stay quiet.
 8. Troubleshooting: stuck tasks, stale heavy lock, disk guard, a second
    runner, reading logs.
