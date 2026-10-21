@@ -452,7 +452,8 @@ class RunnerRequestsTest(RequestsCase):
             self.assertEqual(self.board.get_task(tid).state, "open")
         finally:
             r.shutdown()
-        self.assertEqual([(e.kind, e.text) for e in self.events], [("paused", "artel pause")])
+        # §7: the kind, then the cause
+        self.assertEqual([(e.kind, e.text) for e in self.events], [("paused", "manual: artel pause")])
 
     def test_legacy_pause_meta_converted_once(self):
         # catches: reading pause_reason after start (the gate must read the pause set only)

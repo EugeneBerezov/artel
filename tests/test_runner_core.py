@@ -283,7 +283,8 @@ class RunnerCoreTest(E2ECase):
                 self.drive(r, lambda: "base_conflict" in pauses.active(self.board))
             finally:
                 r.shutdown()
-        self.assertTrue(pauses.active(self.board)["base_conflict"].detail.startswith("internal error:"))
+        # T22: the pause stays one line; the traceback is only in the runner FAIL entry
+        self.assertEqual(pauses.active(self.board)["base_conflict"].detail, "base update failed, see the FAIL entry")
         row = self.board.conn.execute("SELECT task_id, kind, text FROM entries WHERE kind = 'FAIL'").fetchone()
         self.assertIsNone(row["task_id"])
         self.assertIn("base broke", row["text"])
