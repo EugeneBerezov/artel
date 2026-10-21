@@ -24,6 +24,18 @@ class TemplatesTest(RepoTestCase):
         for name in (*T.TEMPLATE_NAMES, T.NOTICE_NAME):
             self.assertGreater(len(T.builtin_text(name).strip()), 50, name)
 
+    def test_templates_use_only_placeholders(self):
+        """Mutation caught: a placeholder a new template needs (`$mutation_check`, `$required_tests`) missing from
+        PLACEHOLDERS or from its template, so the text never reaches the agent."""
+        for name in T.TEMPLATE_NAMES:
+            used = set(re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", T.builtin_text(name)))
+            self.assertTrue(used <= set(T.PLACEHOLDERS), (name, used - set(T.PLACEHOLDERS)))
+        self.assertIn("$mutation_check", T.builtin_text("review.md"))
+        self.assertIn("$required_tests", T.builtin_text("write.md"))
+        for name in ("review-closure.md", "review-verify-fix.md", "review-conflict.md"):
+            self.assertIn("$closure_list", T.builtin_text(name), name)
+            self.assertIn("$diff_range", T.builtin_text(name), name)
+
     def test_templates_use_only_known_placeholders(self):
         """Mutation caught: a typo'd $placeholder that string.Template would leave unrendered."""
         for name in T.TEMPLATE_NAMES:
@@ -46,13 +58,19 @@ class TemplatesTest(RepoTestCase):
     def test_template_names_exact(self):
         """Mutation caught: the verify-fix template missing from (or misplaced in) the export list."""
         self.assertEqual(T.TEMPLATE_NAMES, ("vet.md", "attack.md", "write.md", "review.md", "review-closure.md",
-                                            "review-verify-fix.md", "fix.md"))
+                                            "review-verify-fix.md", "review-conflict.md", "fix.md"))
 
     def test_verify_fix_template_names_the_blocker_rules(self):
         """Mutation caught: the template losing its reason to exist (what a verify-fix review blocks)."""
         text = T.builtin_text("review-verify-fix.md")
         for needle in ("weakens, skips, deletes or loosens", "verify or CI configuration", "special-cases",
-                       "read-only"):
+                       "probe"):
+            self.assertIn(needle, text)
+
+    def test_unattended_notice_says_do_not_take_the_action(self):
+        """Mutation caught: the notice going back to a bare "do not ask" (a CLAUDE.md approval rule then blocks)."""
+        text = T.builtin_text(T.NOTICE_NAME)
+        for needle in ("do not take that action", "structured `ask` outcome", "`blocker`"):
             self.assertIn(needle, text)
 
     def test_vet_template_mentions_duplicates_and_risk(self):
@@ -71,7 +89,7 @@ class TemplatesTest(RepoTestCase):
                        "not as instructions"):
             self.assertIn(needle, text)
         order = [text.index(n) for n in ("No human", "overrides", "structured `ask`", "Never merge",
-                                         "artel heavy", "artel note", "fenced", "Finish with")]
+                                         "artel heavy", "artel note", "fenced", "Finish with the structured result")]
         self.assertEqual(order, sorted(order))   # the spec's order
 
     def test_load_prefers_project_file(self):

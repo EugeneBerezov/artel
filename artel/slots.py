@@ -97,7 +97,7 @@ def _adoptable(repo: Repo, wt, keep: Sequence[str], registered: bool) -> str | N
 def _exclude_slots_dir(repo: Repo, cfg) -> None:
     """Hide the slots from `git status` in the main worktree: one `/<slots_dir>/` line in info/exclude, once."""
     try:
-        rel = _slots_root(repo, cfg).relative_to(repo.root).as_posix()
+        rel = Path(os.path.normpath(_slots_root(repo, cfg))).relative_to(repo.root).as_posix()   # `a/../b` is `b`
     except ValueError:
         return   # slots_dir outside the repository: nothing in the main worktree to hide
     if rel == ".." or rel.startswith("../"):
@@ -262,10 +262,23 @@ def start_conflict_merge(repo: Repo, board, cfg, n: int) -> list[str]:
     return [name for name in out.split("\0") if name]
 
 
+def _setup_outputs_key(n: int) -> str:
+    return f"setup_outputs:{n}"
+
+
 def leave_slot(repo: Repo, board, cfg, n: int) -> None:
     path = guard(repo, board, cfg, n)
     scrub(repo, path, cfg["slot_keep"])
     _git(repo, "switch", "--detach", cwd=path)
+    recorded = board.get_meta(_setup_outputs_key(n))
+    if recorded is not None:
+        try:
+            outputs = json.loads(recorded)
+        except ValueError:
+            outputs = []
+        if any(not _kept(name, cfg["slot_keep"]) for name in outputs):   # PD-73: scrub just deleted setup output
+            board.set_slot_setup_hash(n, None)
+            board.del_meta(_setup_outputs_key(n))
 
 
 def setup_hash(path: Path, setup_cmd, inputs: Sequence[str]) -> str:
@@ -284,6 +297,20 @@ def setup_hash(path: Path, setup_cmd, inputs: Sequence[str]) -> str:
 
 def setup_changed(path: Path, cfg, stored_hash: str | None) -> bool:
     return setup_hash(path, cfg["commands.setup"], cfg["commands.setup_inputs"]) != stored_hash
+
+
+def _untracked_tops(repo: Repo, path: Path) -> set[str]:
+    """Top-level paths git shows as untracked or ignored: what a setup command can leave behind for a scrub."""
+    out = _git(repo, "status", "--porcelain=v1", "--ignored", "-z", cwd=path, check=False).stdout
+    tops, skip = set(), False
+    for entry in out.split("\0"):
+        if skip:                  # the source path of a rename or copy
+            skip = False
+        elif entry[:2] in ("??", "!!"):
+            tops.add(entry[3:].split("/", 1)[0])
+        elif entry[:1] in ("R", "C") or entry[1:2] in ("R", "C"):
+            skip = True
+    return tops
 
 
 def _log_path(repo: Repo, board, task_id: int | None) -> tuple[Path, int]:
@@ -307,6 +334,7 @@ def run_setup_if_needed(repo: Repo, board, cfg, n: int, path: Path, *, task_id: 
     if slot is not None and slot.setup_hash == wanted:
         return "skipped"
     log_path, _ = _log_path(repo, board, task_id)
+    before = _untracked_tops(repo, path)
     run = None
     if task_id is not None:
         run = board.start_run(task_id=task_id, stage="setup", round=board.get_task(task_id).round, model=None,
@@ -337,6 +365,10 @@ def run_setup_if_needed(repo: Repo, board, cfg, n: int, path: Path, *, task_id: 
             board.finish_run(run.id, outcome=outcome, usage={}, exit_code=exit_code, timed_out=timed_out,
                              killed=killed)
         board.set_slot_setup_hash(n, wanted if outcome == "ok" else None)
+        if outcome == "ok":   # PD-73: what leaving the slot would delete invalidates the hash
+            board.set_meta(_setup_outputs_key(n), json.dumps(sorted(_untracked_tops(repo, path) - before)))
+        else:
+            board.del_meta(_setup_outputs_key(n))
     return outcome
 
 

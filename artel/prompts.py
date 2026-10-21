@@ -34,6 +34,8 @@ def template_name(stage: str, task: Task) -> str:
     if stage == "review":
         if task.review_closure == 2:                                                              # PD-48
             return "review-verify-fix.md"
+        if task.review_closure == 1:                                                              # PD-29, PD-67
+            return "review-conflict.md"
         return "review-closure.md" if task.round >= 2 or task.review_closure else "review.md"   # PD-29
     if stage in ("vet", "attack", "write", "fix"):
         return f"{stage}.md"
@@ -88,6 +90,19 @@ class PromptInputs:
     open_tasks: Sequence[tuple[int, str, str]] = ()   # (id, state, title)
     risk_signals: Sequence[str] = ()
     diff_range: str = ""
+    mutation_check: str = ""                    # the round-1 review of a risky or attacked task (spec §4)
+    required_tests: str = ""                    # `Tests:` lines of the task (spec §4 test guard)
+
+
+MUTATION_CHECK = (
+    "## Mutation check\n"
+    "This task is risky. Also test its tests: change two or three lines the task is about (a condition, a "
+    "boundary, a returned value) one at a time, run the tests that cover them, and restore each file before the "
+    "next change (put the line back with the editor; `git checkout -- <file>` is not among your allowed commands). "
+    "Leave no change to a tracked file at the end. A change the tests do not catch is a finding: `minor`, "
+    "unless it shows a real defect, with the changed line and the test command as the basis.\n")
+MUTATION_SKIPPED = ("## Mutation check\nSkip it: `commands.project_tools` is empty, so no test command can be run. "
+                    "Say so in your summary.\n")
 
 
 def _entries(entries: Sequence[Entry], source: str) -> str:
@@ -124,5 +139,7 @@ def render(template_text: str, inputs: PromptInputs, *, budget: int) -> str:
                              "open tasks") if inputs.open_tasks else "(none)"),
         "risk_signals": ", ".join(inputs.risk_signals) if inputs.risk_signals else "(none)",
         "answer": fence(answers[-1].text, "human answer") if answers else "(none)",
+        "mutation_check": inputs.mutation_check,
+        "required_tests": inputs.required_tests,
     }
     return Template(template_text).safe_substitute(values)

@@ -72,11 +72,11 @@ class StagesCase(RepoTestCase):
         slots.leave_slot(self.repo, self.board, self.cfg, 1)
         return sha
 
-    def go(self, tid, *, stop=None, on_start=noop):
+    def go(self, tid, *, stop=None, on_start=noop, **run_kw):
         task = self.board.get_task(tid)
         plan = stages.plan_stage(self.repo, self.board, self.cfg, task, 1, base_env=self.base_env)
         run = stages.run_stage(self.repo, self.board, self.cfg, plan, 1, on_start=on_start,
-                               on_rate_limit=self.limits.append, stop_event=stop or threading.Event())
+                               on_rate_limit=self.limits.append, stop_event=stop or threading.Event(), **run_kw)
         tr = stages.finish_stage(self.repo, self.board, self.cfg, tid, plan, run)
         return plan, run, tr
 
@@ -153,12 +153,23 @@ class PureTest(StagesCase):
                 self.assertEqual(stages.choose_model(cfg, task, "review", 10_000, protected=hit),
                                  (cfg["models.review"], "closure check (models.review)"))
 
-    def test_conflict_closure_review_uses_round1_range(self):
-        """Mutation caught: `review_closure == 2` widened to truthy (a stale fix_base narrows a conflict check)."""
-        stale = make_task(id=7, review_closure=1, fix_base="a" * 40)
-        self.assertEqual(stages._diff_range(stale), f"{INTEGRATION}...artel/7")
-        verify_fix = make_task(id=7, review_closure=2, fix_base="a" * 40)
-        self.assertEqual(stages._diff_range(verify_fix), f"{'a' * 40}..artel/7")
+    def test_closure_review_diff_is_fix_only(self):
+        """Mutation caught: the fix-only range kept for the verify-fix review alone (a conflict resolution or a
+        round-2 review re-reads the whole branch), or applied without a fix_base / to a round-1 review (PD-67)."""
+        base = "a" * 40
+        for fields in ({"review_closure": 2}, {"review_closure": 1}, {"round": 2}):
+            with self.subTest(fields=fields):
+                task = make_task(id=7, fix_base=base, **fields)
+                self.assertEqual(stages._diff_range(task), f"{base}..artel/7")
+        for fields in ({"round": 1, "fix_base": base}, {"round": 2, "fix_base": None},
+                       {"review_closure": 1, "fix_base": None}):
+            with self.subTest(whole=fields):
+                self.assertEqual(stages._diff_range(make_task(id=7, **fields)), f"{INTEGRATION}...artel/7")
+
+    def test_downgrade_prefix_keeps_severity(self):
+        """Mutation caught: the prefix losing the original severity (finding fates cannot show it, PD-69)."""
+        self.assertEqual(stages.downgrade_prefix("major"), "[downgraded from major: closure round] ")
+        self.assertEqual(stages.downgrade_prefix("blocker"), "[downgraded from blocker: closure round] ")
 
     def test_diff_lines(self):
         tid = self.task_in("reviewing", round=1)
@@ -850,7 +861,7 @@ class ReviewTest(StagesCase):
             self.finding("major", "new topic"), self.finding("blocker", "real blocker")]}}]})
         self.go(tid)
         found = {e.text: e.severity for e in journal.open_findings(self.board, tid)}
-        self.assertEqual(found, {"[downgraded: closure round] new topic": "minor", "real blocker": "blocker"})
+        self.assertEqual(found, {"[downgraded from major: closure round] new topic": "minor", "real blocker": "blocker"})
         self.assertEqual(self.task(tid).state, "fixing")   # the blocker still blocks
 
     def test_closure_round_only_downgraded_findings_do_not_block(self):
@@ -1238,3 +1249,182 @@ class NightGuardTest(StagesCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RepoCheckStageTest(StagesCase):
+    """PD-66, PD-67, PD-73, PD-74 around `run_stage`."""
+    PASS = {"result": {"outcome": "pass", "summary": "fine"}}
+
+    def review_task(self, **fields):
+        fields.setdefault("round", 1)
+        return self.task_in("reviewing", with_commit=True, **fields)
+
+    def plan(self, tid):
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        return plan
+
+    def fail_entries(self, tid):
+        return [e.text for e in self.entries(tid, "FAIL")]
+
+    def test_review_uses_reviewer_profile_vet_attack_use_attacker(self):
+        """Mutation caught: every non-writer stage on the reviewer profile (attack could then write files)."""
+        review = self.plan(self.review_task())
+        attack = self.plan(self.task_in("attacking", attack=True))
+        self.assertEqual((review.profile, attack.profile), ("reviewer", "attacker"))
+        self.assertEqual(attack.argv[attack.argv.index("--permission-mode") + 1], "default")
+        self.assertEqual(review.argv[review.argv.index("--permission-mode") + 1], "acceptEdits")
+
+    def test_reviewer_probe_file_is_removed(self):
+        """Mutation caught: a probe left in the slot (the next stage would start from it)."""
+        tid = self.review_task()
+        self.scenario({f"{tid}:review": [{"write_file": "probe_test.py"}, self.PASS]})
+        plan, run, tr = self.go(tid)
+        self.assertEqual((run.repo_changes, run.left_tracked), ((), False))
+        self.assertEqual(self.task(tid).state, "verifying")
+        self.assert_slot_left()
+        self.assertFalse((self.slot_dir() / "probe_test.py").exists())
+
+    test_review_probe_file_allowed = test_reviewer_probe_file_is_removed   # the name the task plan pins
+
+    def test_reviewer_commit_fails_and_is_restored(self):
+        """Mutation caught: trusting a reviewer that committed (its verdict describes code that is not the
+        branch the runner would merge)."""
+        tid = self.review_task()
+        tip = git(self.repo_path, "rev-parse", f"artel/{tid}")
+        self.scenario({f"{tid}:review": [*self.commit_action("extra.txt", "sneaky"), self.PASS]})
+        plan, run, tr = self.go(tid)
+        self.assertEqual(run.repo_changes, (f"ref refs/heads/artel/{tid} moved",))
+        self.assertEqual(run.unrestored, ())
+        self.assertEqual(tr.event, "stage_failed")
+        self.assertEqual(git(self.repo_path, "rev-parse", f"artel/{tid}"), tip)
+        (fail,) = self.fail_entries(tid)
+        self.assertIn("review changed the shared repository", fail)
+        self.assertIn("(restored)", fail)
+        self.assert_slot_left()
+
+    def test_writer_moving_integration_or_other_branch_fails(self):
+        """Mutation caught: checking reviewers only (a writer rewinding another task's branch)."""
+        other = self.task_in("reviewing", round=1, with_commit=True)
+        other_tip = git(self.repo_path, "rev-parse", f"artel/{other}")
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [*self.commit_action(), {"git": ["branch", "-f", f"artel/{other}", "HEAD"]},
+                                        {"result": READY}]})
+        plan, run, tr = self.go(tid)
+        self.assertEqual(run.repo_changes, (f"ref refs/heads/artel/{other} moved",))
+        self.assertEqual(git(self.repo_path, "rev-parse", f"artel/{other}"), other_tip)
+        task = self.task(tid)
+        self.assertEqual((tr.event, task.attempts), ("stage_failed", 1))
+        self.assertIn("write changed the shared repository", self.fail_entries(tid)[0])
+
+    def test_writer_adding_commits_to_its_own_branch_passes(self):
+        """Mutation caught: the own branch counted as a foreign ref for a writer."""
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [*self.commit_action(), {"result": READY}]})
+        plan, run, tr = self.go(tid)
+        self.assertEqual((run.repo_changes, tr.event), ((), "ready"))
+
+    def test_skip_refs_reach_the_check(self):
+        """Mutation caught: run_stage ignoring the runner's skip_refs (its own branch move reported as foreign)."""
+        other = self.task_in("reviewing", round=1, with_commit=True)
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [*self.commit_action(), {"git": ["branch", "-f", f"artel/{other}", "HEAD"]},
+                                        {"result": READY}]})
+        plan, run, tr = self.go(tid, skip_refs=lambda: [f"refs/heads/artel/{other}"])
+        self.assertEqual((run.repo_changes, tr.event), ((), "ready"))
+
+    def test_review_leaving_tracked_change_fails_and_restores(self):
+        """Mutation caught: trusting the verdict of a reviewer that edited the code under review."""
+        tid = self.review_task()
+        self.scenario({f"{tid}:review": [{"write": ["work.txt", "edited by the reviewer\n"]}, self.PASS]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.left_tracked)
+        self.assertEqual((tr.event, self.task(tid).state), ("stage_failed", "reviewing"))
+        self.assertEqual(self.fail_entries(tid), ["review left tracked changes in its slot; restored"])
+        self.assert_slot_left()
+        self.assertEqual(git(self.repo_path, "show", f"artel/{tid}:work.txt"), "x")
+
+    def test_review_staged_change_is_caught_too(self):
+        """Mutation caught: no `git diff --cached` (an index changed and the file put back equals HEAD)."""
+        tid = self.review_task()
+        self.scenario({f"{tid}:review": [{"write": ["work.txt", "staged\n"]}, {"git": ["add", "work.txt"]},
+                                         {"write": ["work.txt", "x\n"]}, self.PASS]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.left_tracked)
+        self.assert_slot_left()
+
+    def test_review_setup_rewriting_a_tracked_file_is_not_the_reviewers_change(self):
+        """Mutation caught: comparing with HEAD instead of the state before the agent (a setup that rewrites a
+        tracked file fails every review)."""
+        code = "open('work.txt', 'w', encoding='utf-8').write('by setup\\n')"
+        self.configure(**{"commands.setup": py_cmd(code)})
+        tid = self.review_task()
+        self.scenario({f"{tid}:review": [self.PASS]})
+        plan, run, tr = self.go(tid)
+        self.assertEqual((run.left_tracked, tr.event), (False, "review_clear"))
+
+    def test_closure_list_filled_for_every_closure_template(self):
+        """Mutation caught: the open findings listed for review-closure.md only (the conflict and verify-fix
+        reviews then close nothing)."""
+        for fields in ({"round": 2}, {"review_closure": 1}, {"review_closure": 2}):
+            with self.subTest(fields=fields):
+                tid = self.review_task(**fields)
+                found = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
+                                            text="open one", basis="", author="agent:review")
+                plan = self.plan(tid)
+                self.assertIn(f"#{found} [major] open one", plan.prompt)
+
+    def test_verify_fix_review_gets_verify_log(self):
+        """Mutation caught: the verify log given to the fix stage only."""
+        tid = self.review_task(review_closure=2)
+        log = self.repo.logs_dir / str(tid)
+        log.mkdir(parents=True)
+        (log / "verify-1.log").write_text("FAILED test_marker_9\n", encoding="utf-8", newline="\n")
+        self.assertIn("FAILED test_marker_9", self.plan(tid).prompt)
+        plain = self.review_task()
+        (self.repo.logs_dir / str(plain)).mkdir(parents=True)
+        (self.repo.logs_dir / str(plain) / "verify-1.log").write_text("FAILED test_marker_9\n", encoding="utf-8",
+                                                                      newline="\n")
+        self.assertNotIn("FAILED test_marker_9", self.plan(plain).prompt)
+
+    def test_conflict_review_uses_conflict_template(self):
+        """Mutation caught: a conflict resolution reviewed with the round-based template."""
+        tid = self.review_task(review_closure=1, fix_base=git(self.repo_path, "rev-parse", INTEGRATION))
+        plan = self.plan(tid)
+        self.assertIn("git log --merges", plan.prompt)
+        self.assertIn(f"..artel/{tid}", plan.prompt)
+        self.assertEqual(plan.model, self.cfg["models.review"])
+
+    def test_mutation_check_only_for_risky_round1(self):
+        """Mutation caught: the check asked of every review, of a closure round, or of a plain task."""
+        self.configure(**{"commands.project_tools": ["Bash(python3 -m unittest *)"]})
+        for name, fields, wanted in (("risky", {"risky": True}, True), ("attack", {"attack": True}, True),
+                                     ("plain", {}, False), ("round 2", {"risky": True, "round": 2}, False)):
+            with self.subTest(name):
+                plan = self.plan(self.review_task(**fields))
+                self.assertEqual("## Mutation check" in plan.prompt, wanted)
+                self.assertEqual("put the line back with the editor" in plan.prompt, wanted)
+
+    def test_mutation_check_skipped_without_project_tools(self):
+        """Mutation caught: asking for test runs when no test command is allowed."""
+        plan = self.plan(self.review_task(risky=True))
+        self.assertIn("Skip it: `commands.project_tools` is empty", plan.prompt)
+        self.assertNotIn("put the line back", plan.prompt)
+
+    def test_write_prompt_lists_required_tests(self):
+        """Mutation caught: the required tests not reaching the writer."""
+        tid = self.task_in("writing", body="Do it.\nTests: test_alpha_case, test_beta_case\n")
+        prompt = self.plan(tid).prompt
+        self.assertIn("test_alpha_case", prompt)
+        self.assertIn("must exist and pass", prompt)
+        plain = self.plan(self.task_in("writing"))
+        self.assertNotIn("must exist and pass", plain.prompt)
+
+    def test_stage_deadline_extended_by_extra_time(self):
+        """Mutation caught: a fixed stage_timeout (a stage waiting for the heavy lock is killed for it, PD-74)."""
+        self.configure(stage_timeout="2s")
+        tid = self.review_task()
+        self.scenario({f"{tid}:review": [{"sleep": 3}, self.PASS]})
+        plan, run, tr = self.go(tid, extra_time=lambda: 2.0)
+        self.assertFalse(run.timed_out)
+        self.assertEqual(tr.event, "review_clear")

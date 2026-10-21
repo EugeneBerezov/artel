@@ -25,4 +25,4 @@ $answer
 $context
 
 ## How to work
-Fix what is listed, run the checks for what you touched, commit on the current branch and return `ready`. If only a human can decide, return `ask`.
+Fix what is listed, run the checks for what you touched, commit on the current branch (only add commits: never amend, rebase or reset it, never touch another branch, a stash or the git configuration) and return `ready`. If only a human can decide, return `ask`.
