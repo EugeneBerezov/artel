@@ -257,6 +257,7 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
         if failed:
             flaky_text += "; failed: " + ", ".join(failed)
     transitions.decide(task, _EVENT[result.kind], limits, tip=tip)   # refuse before writing anything
+    off = testguard.id_check_off(repo, cfg, result) if result.kind in ("green", "green_flaky") else None
     if result.kind in ("green", "green_flaky") and result.commit and result.ids is not None:
         try:   # the id baseline of this sha, for a later integrate_task; a failed write only turns the check off
             testguard.write_ids(repo, result.commit, result.ids)
@@ -283,7 +284,6 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
             verdict += f" ({tr.cause})"
         journal.append(board, "VERDICT", journal.truncate_utf8(verdict, journal.TEXT_LIMIT), author=_RUNNER,
                        task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
-        off = testguard.id_check_off(repo, cfg, result) if result.kind in ("green", "green_flaky") else None
         if off:   # phase 1: the controller must see that the id rule did not run
             journal.append(board, "VERDICT", journal.truncate_utf8(off, journal.TEXT_LIMIT), author=_RUNNER,
                            task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))

@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from artel import config as C, testguard
+from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 from artel.protect import Hit
 from tests.helpers import RepoTestCase, git
@@ -109,7 +110,7 @@ class DiffHitsTest(GuardCase):
                  "os._exit(0)\n", "@unittest.skip\n", "@unittest.skip ('x')\n", "@skip ('x')\n",
                  "pytestmark = pytest.mark.skip\n", 'pytestmark = [pytest.mark.skip(reason="x")]\n',
                  '@unittest.skipIf(True, "x")\n', '@unittest.skipUnless(False, "x")\n', "xfail(reason)\n",
-                 "xit('x', f)\n", "@unittest.expectedFailure\n", "@mark.skip\n"]
+                 "xit('x', f)\n", "@unittest.expectedFailure\n", "@mark.skip\n", "@pytest.mark.skipif(True, reason='x')\n"]
         for line in cases:
             with self.subTest(line=line):
                 tip = self.task({"tests/test_old.py": TESTS + line})
@@ -185,12 +186,12 @@ class DiffHitsTest(GuardCase):
         self.integration_with(files)
         tip = self.task({rel: TESTS + "x = 1\n" for rel in files})
         calls = []
-        real = Repo.git
+        real = Repo.git_bytes
 
         def counting(repo, *args, **kw):
             calls.append(args)
             return real(repo, *args, **kw)
-        with mock.patch.object(Repo, "git", counting):
+        with mock.patch.object(Repo, "git_bytes", counting):
             scanned = testguard.scan(self.repo, self.cfg(), tip)
             testguard.hard_hits(self.repo, self.cfg(), tip, scanned)
             testguard.soft_hits(self.repo, self.cfg(), tip, scanned)
@@ -269,9 +270,9 @@ class DiffHitsTest(GuardCase):
     def test_non_utf8_path_round_trips(self):
         """Mutation caught: a path git prints that is not UTF-8 decoded lossily, so its own diff comes back
         empty and the assertion and marker checks silently pass (Linux file systems only)."""
-        name = os.fsdecode(b"tests/test_\xff.py")
         self.integration_with({})
-        try:
+        try:   # decoding is inside the try: Windows refuses the bytes already here
+            name = os.fsdecode(b"tests/test_\xff.py")
             (self.repo_path / "tests").mkdir()
             (self.repo_path / name).write_text(TESTS, encoding="utf-8", newline="\n")
         except (OSError, UnicodeError):
@@ -288,6 +289,88 @@ class DiffHitsTest(GuardCase):
         self.assertEqual({h.source for h in hits}, {"test_assert_markers", "test_markers"})
         for hit in hits:
             hit.path.encode("utf-8")   # shown with U+FFFD, never a lone surrogate
+
+    def test_lone_cr_cannot_hide_marker(self):
+        """Mutation caught: the diff read in text mode (a lone CR became a newline or hid what follows it), or
+        markers and assertions matched against the whole line only. A CR followed by `diff --git` must not open
+        a fake section either: the lines after it still belong to their own file."""
+        self.integration_with({"tests/test_a.py": TESTS + "assert a\rassert b\n", "tests/test_b.py": TESTS,
+                               "tests/test_c.py": TESTS})
+        path = self.tmp / "cr"
+        git(self.repo_path, "worktree", "add", "-q", "-b", task_branch(1), str(path), INTEGRATION)
+        (path / "tests" / "test_a.py").write_bytes(TESTS.encode("utf-8") + b"x = 1\r@unittest.skip('x')\r"
+                                                   b"diff --git a/tests/test_b.py b/tests/test_b.py\n")
+        (path / "tests" / "test_b.py").write_bytes(TESTS.encode("utf-8") + b"os._exit(0)\n")
+        (path / "tests" / "test_c.py").write_bytes(TESTS.encode("utf-8") + b"x = 1\rdef load_tests(a, b, c):\r")
+        git(path, "commit", "-q", "-am", "cr")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        hits = {(h.path, h.source, h.note) for h in self.hard(task_branch(1))}
+        self.assertEqual({(p, s) for p, s, _ in hits},
+                         {("tests/test_a.py", "test_markers"), ("tests/test_a.py", "test_assert_markers"),
+                          ("tests/test_b.py", "test_markers")})
+        self.assertIn(("tests/test_a.py", "test_assert_markers", "2 fewer assertion lines"), hits)
+        self.assertEqual([h.note for h in self.soft(task_branch(1)) if h.path == "tests/test_c.py"],
+                         ["adds load_tests"])   # also behind a lone CR
+
+    def test_cr_in_a_path_does_not_hide_changes(self):
+        """Mutation caught: `--raw -z` read in text mode (a CR inside a name turned into a newline, the path no
+        longer matched `test_paths` and its markers were never looked at). Windows cannot hold such a name."""
+        name = "tests/test_\rb.py"
+        self.integration_with({})
+        try:
+            (self.repo_path / "tests").mkdir()
+            (self.repo_path / name).write_text(TESTS, encoding="utf-8", newline="\n")
+        except (OSError, ValueError):
+            self.skipTest("this file system cannot hold a CR in a name")
+        git(self.repo_path, "add", "-A")
+        git(self.repo_path, "commit", "-q", "-m", "cr name")
+        git(self.repo_path, "branch", "-f", INTEGRATION, "main")
+        path = self.tmp / "cr-name"
+        git(self.repo_path, "worktree", "add", "-q", "-b", task_branch(5), str(path), INTEGRATION)
+        (path / name).write_text(TESTS + "@unittest.skip('x')\n", encoding="utf-8", newline="\n")
+        git(path, "commit", "-q", "-am", "skip it")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        (hit,) = self.hard(task_branch(5))
+        self.assertEqual(hit.source, "test_markers")
+        self.assertNotIn("\r", hit.path)   # shown without the control character
+
+    def test_marker_in_conftest_is_hard(self):
+        """Mutation caught: markers looked for in test files only (a matching file that is not a test file, such
+        as conftest.py, can disable tests too)."""
+        self.integration_with({"conftest.py": "import pytest\n"})
+        tip = self.task({"conftest.py": "import pytest\npytestmark = pytest.mark.skip\n"})
+        self.assertEqual([(h.path, h.source) for h in self.hard(tip)], [("conftest.py", "test_markers")])
+
+    def test_chunks_are_bounded_by_length_and_count(self):
+        """Mutation caught: only the path count bounding a command line (long paths overflow Windows' 32 767)."""
+        long = ["d" * 3000 + str(i) for i in range(7)]
+        groups = testguard._chunks(long)
+        self.assertEqual([p for g in groups for p in g], long)
+        self.assertTrue(all(sum(len(p) + 1 for p in g) <= testguard._ARGV_CHARS for g in groups))
+        self.assertGreater(len(groups), 2)
+        short = [f"t{i}" for i in range(250)]
+        self.assertEqual([len(g) for g in testguard._chunks(short)], [100, 100, 50])
+        self.assertEqual(testguard._chunks([]), [])
+        self.assertEqual(testguard._chunks(["x" * 9000]), [["x" * 9000]])   # one path is never dropped
+
+    def test_windows_command_line_error_fails_closed(self):
+        """Mutation caught: Windows reporting a too-long command line as FileNotFoundError, which `_run_bytes`
+        turns into `git not found`: that ArtelError must not escape `scan` into the runner."""
+        self.integration_with({"tests/test_old.py": TESTS})
+        tip = self.task({"tests/test_old.py": TESTS + "x = 1\n"})
+        with mock.patch.object(Repo, "git_bytes", side_effect=ArtelError("git not found on PATH")):
+            (hit,) = self.hard(tip)
+        self.assertEqual(hit.source, "test_paths")
+
+    def test_oserror_spawning_git_fails_closed(self):
+        """Mutation caught: an OSError (command line too long, no process slots) escaping `scan` into the
+        runner, or reading as `no changes`."""
+        self.integration_with({"tests/test_old.py": TESTS})
+        tip = self.task({"tests/test_old.py": TESTS + "x = 1\n"})
+        with mock.patch.object(Repo, "git_bytes", side_effect=OSError("[WinError 206] too long")):
+            (hit,) = self.hard(tip)
+        self.assertEqual((hit.path, hit.source), ("<git error>", "test_paths"))
+        self.assertIn("too long", hit.note)
 
     def test_marker_outside_test_paths_ignored(self):
         """Mutation caught: scanning every changed file (a `@skip` in product code is not a disabled test)."""
@@ -437,6 +520,16 @@ class BaseRecordTest(GuardCase):
         self.assertEqual(testguard.base_ids(self.repo, tip), frozenset({"keep"}))
         self.assertEqual(len(list(old.parent.glob("*.txt"))), testguard.KEEP_IDS)
 
+    def test_prune_keeps_newest(self):
+        """Mutation caught: the pruning order reversed (the newest files deleted, the oldest kept)."""
+        for i in range(25):
+            sha = f"{i + 1:040x}"
+            testguard.write_ids(self.repo, sha, frozenset({f"t{i}"}))
+            stamp = 1_000_000_000 + i * 10
+            os.utime(self.repo.artel_dir / "verify-ids" / f"{sha}.txt", ns=(stamp * 10**9, stamp * 10**9))
+        kept = sorted(p.stem for p in (self.repo.artel_dir / "verify-ids").glob("*.txt"))
+        self.assertEqual(kept, [f"{i + 1:040x}" for i in range(5, 25)])   # files 0-4, the oldest, are gone
+
     def test_existing_ids_file_never_replaced(self):
         """Mutation caught: a second green record shrinking a sha's baseline (a verify that merged nothing)."""
         sha = "2" * 40
@@ -476,8 +569,8 @@ class RequiredTest(unittest.TestCase):
 
     def test_required_tests_bulleted_and_indented(self):
         """Mutation caught: a `Tests:` line in a markdown list or an indented block ignored (the check fails open)."""
-        body = "Steps:\n- Tests: test_a\n  * Tests: test_b, test_c\n    Tests: test_d\n"
-        self.assertEqual(testguard.required_tests(body), ["test_a", "test_b", "test_c", "test_d"])
+        body = "Steps:\n- Tests: test_a\n  * Tests: test_b, test_c\n    Tests: test_d\n\tTests: test_e\n\t- Tests: test_f\n"
+        self.assertEqual(testguard.required_tests(body), ["test_a", "test_b", "test_c", "test_d", "test_e", "test_f"])
         self.assertEqual(testguard.required_tests("see Tests: test_x\n"), [])
 
     def test_required_name_matches_parametrized_id(self):
@@ -487,6 +580,24 @@ class RequiredTest(unittest.TestCase):
         self.assertEqual(testguard.missing_required(names=["test_z"], passed_ids={"t.py::test_x"}), ["test_z"])
         self.assertEqual(testguard.missing_required(["test_x"], {"t.py::test_x[[1, 2]]", "t.py::test_y[a"}), [])
         self.assertEqual(testguard.missing_required(["test_y"], {"t.py::test_y[a"}), [])   # `PASSED (\S+)` cut it
+
+    def test_required_tests_none_and_punctuation(self):
+        """Mutation caught: `Tests: none`, `n/a` or a bare dash becoming a requirement nobody can meet."""
+        for line in ("none", "None.", "N/A", "n/a:", "-", "...", "\u2014"):
+            with self.subTest(line=line):
+                self.assertEqual(testguard.required_tests(f"Tests: {line}\n"), [])
+                self.assertEqual(len(testguard.required_ignored(f"Tests: {line}\n")), 1)
+        self.assertEqual(testguard.required_tests("Tests: none, test_a\n"), ["test_a"])
+        self.assertEqual(testguard.required_tests("Tests: nonexistent_ok\n"), ["nonexistent_ok"])
+        self.assertEqual(testguard.required_tests("Tests: - test_a, * test_b\n"), ["test_a", "test_b"])
+        self.assertEqual(testguard.required_tests("Intro\rTests: test_c\r"), ["test_c"])
+
+    def test_class_name_does_not_satisfy_required(self):
+        """Mutation caught: the bare class of an old-format unittest id (`test_x (pkg.mod.Retry)`) counting as a
+        passed test named `Retry` or `pkg.mod.Retry`."""
+        old = frozenset({"test_x (pkg.mod.Retry)"})
+        self.assertEqual(testguard.missing_required(["Retry", "pkg.mod.Retry"], old), ["Retry", "pkg.mod.Retry"])
+        self.assertEqual(testguard.missing_required(["test_x", "Retry.test_x", "pkg.mod.Retry.test_x"], old), [])
 
     def test_required_item_punctuation_and_nested_remarks(self):
         """Mutation caught: sentence punctuation or a nested remark leaving an unmeetable name (a false ask)."""

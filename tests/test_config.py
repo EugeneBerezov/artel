@@ -38,7 +38,7 @@ EXPECTED_DEFAULTS = {
     "protected_paths": PROTECTED_PATHS,
     "test_paths": ["tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
                    "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*"],
-    "test_markers": [r"^\s*@(unittest\.)?skip\b", r"\bmark\.skip\b", r"\bskip(If\(\s*True|Unless\(\s*False)\b",
+    "test_markers": [r"^\s*@(unittest\.)?skip\b", r"\bmark\.skip\b", r"\bskip([Ii]f\(\s*True|Unless\(\s*False)\b",
                      r"\b(it|test|describe)\.skip\(", r"\bx(it|describe|test)\(", r"\.only\(",
                      r"pytest\.mark\.xfail", r"\bxfail\(", r"@(unittest\.)?expectedFailure", r"os\._exit\("],
     "test_assert_markers": ["assert", "expect("],

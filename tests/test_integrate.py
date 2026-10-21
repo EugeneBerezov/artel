@@ -1366,6 +1366,20 @@ class GuardGatesTest(IntegrateCase):
         other = self.task_with_commit("verifying", "other.txt")
         self.assertEqual(self.finish(other, self.verify(other)).to_state, "awaiting_accept")   # still asks
 
+    def test_fast_forward_verify_still_reports_id_check_off(self):
+        """Mutation caught: the check-off message computed after the task sha's ids were written (a verify that
+        merged nothing has commit == base_sha, so the fresh file hid that nothing had been recorded before)."""
+        self.commit_on_integration("ids.txt", ok_lines("a"))
+        tid = self.board.insert_task(title="t", state="open", created_by="human")
+        git(self.repo_path, "branch", task_branch(tid), INTEGRATION)
+        task = self.board.get_task(tid)
+        self.assertTrue(self.board.update_task(tid, expect_state="open", expect_version=task.version,
+                                               state="verifying"))
+        result = self.verify(tid)
+        self.assertEqual(result.commit, result.base_sha)
+        self.finish(tid, result)
+        self.assertTrue(any(t.startswith("test-id check off") for t in self.verdicts()))
+
     def test_empty_verify_does_not_journal_id_check_off(self):
         """Mutation caught: `test-id check off` journaled for a verify that ran nothing (nothing to read ids from)."""
         self.configure(**{"commands.verify": ""})

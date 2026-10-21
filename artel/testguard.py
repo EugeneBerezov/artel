@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 from artel import protect
-from artel.errors import GitError
+from artel.errors import ArtelError, GitError
 from artel.gitutil import INTEGRATION, Repo
 from artel.protect import Hit
 
@@ -69,14 +69,15 @@ _ESCAPE = "surrogateescape"   # a path git prints that is not UTF-8 must still r
 
 def _shown(path: str) -> str:
     """A path for people and the journal: surrogate escapes cannot be encoded, so they become U+FFFD."""
-    return path.encode("utf-8", _ESCAPE).decode("utf-8", "replace")
-_CHUNK = 100                  # paths per `git diff` command line (Windows limits its length)
+    text = path.encode("utf-8", _ESCAPE).decode("utf-8", "replace")
+    return "".join(c if c.isprintable() else "\ufffd" for c in text)   # no CR or escape code in a journal line
+_CHUNK = 100                  # paths per `git diff` command line
+_ARGV_CHARS = 8000            # characters of paths per command line (Windows limits its length)
 
 
 def _statuses(repo: Repo, tip: str) -> list[tuple[str, str]]:
-    out = repo.git("diff", "--raw", "--no-renames", "--no-ext-diff", "-z", f"{INTEGRATION}...{tip}",
-                   errors=_ESCAPE).stdout
-    parts = out.split("\0")
+    out = repo.git_bytes("diff", "--raw", "--no-renames", "--no-ext-diff", "-z", f"{INTEGRATION}...{tip}")
+    parts = out.decode("utf-8", _ESCAPE).split("\0")
     found = []
     for i in range(0, len(parts) - 1, 2):   # `:mode mode sha sha S` NUL path NUL; no renames, so always pairs
         meta, path = parts[i], parts[i + 1]
@@ -110,6 +111,19 @@ def _sections(text: str) -> list[tuple[bool, list[str], list[str]]]:
     return found
 
 
+def _chunks(paths: list[str]) -> list[list[str]]:
+    """Paths in groups of at most _CHUNK whose command line stays under _ARGV_CHARS (Windows: 32 767)."""
+    groups: list[list[str]] = [[]]
+    size = 0
+    for path in paths:
+        if groups[-1] and (len(groups[-1]) >= _CHUNK or size + len(path) + 1 > _ARGV_CHARS):
+            groups.append([])
+            size = 0
+        groups[-1].append(path)
+        size += len(path) + 1
+    return [g for g in groups if g]
+
+
 def _merged(sections: list[tuple[bool, list[str], list[str]]]) -> tuple[bool, list[str], list[str]]:
     """All the sections git printed for one path (a type change prints a delete and an add)."""
     return (any(s[0] for s in sections), [line for s in sections for line in s[1]],
@@ -121,12 +135,12 @@ def _patches(repo: Repo, tip: str, paths: list[str]) -> dict[str, tuple[bool, li
     match (a type change prints two) every path is diffed on its own. The text is read lossily: its paths are
     never used, only its lines."""
     def diff(chosen: list[str]) -> str:
-        return repo.git("--literal-pathspecs", "diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
-                        "--no-textconv", "--submodule=short", f"{INTEGRATION}...{tip}", "--", *chosen).stdout
+        out = repo.git_bytes("--literal-pathspecs", "diff", "-U0", "--no-renames", "--no-color", "--no-ext-diff",
+                             "--no-textconv", "--submodule=short", f"{INTEGRATION}...{tip}", "--", *chosen)
+        return out.decode("utf-8", "replace")   # no newline translation: a lone CR stays inside its line
 
     found: dict[str, tuple[bool, list[str], list[str]]] = {}
-    for start in range(0, len(paths), _CHUNK):
-        chunk = paths[start:start + _CHUNK]
+    for chunk in _chunks(paths):
         sections = _sections(diff(chunk))
         if len(sections) != len(chunk):
             sections = [_merged(_sections(diff([path]))) for path in chunk]
@@ -152,6 +166,8 @@ def scan(repo: Repo, cfg, tip: str) -> Scan:
         texts = _patches(repo, tip, [path for status, path in matching if status != "D"])
     except GitError as error:
         return Scan(error=error)
+    except (OSError, ArtelError) as error:   # the command line was refused (Windows reports it as "git not found")
+        return Scan(error=GitError(["diff"], str(error)))
     found = []
     for status, path in matching:
         binary, removed, added = (False, [], []) if status == "D" else texts[path]
@@ -164,9 +180,16 @@ def _git_error(error: GitError) -> Hit:
     return Hit(protect.GIT_ERROR, "test_paths", f"git failed while looking at test changes: {why}")
 
 
+def _parts(lines: Iterable[str]) -> Iterable[str]:
+    """Every line split at what Python (and an editor) reads as a line break: a lone CR in a diff line must not
+    hide the text behind it from the marker and assertion checks."""
+    for line in lines:
+        yield from line.splitlines() or [""]
+
+
 def _assertions(lines: Iterable[str], markers: Sequence[str]) -> int:
     count = 0
-    for line in lines:
+    for line in _parts(lines):
         if line.strip().startswith(_COMMENT):   # a commented-out assertion is gone, a commented one is not new
             continue
         if any(marker in line for marker in markers):
@@ -190,7 +213,7 @@ def hard_hits(repo: Repo, cfg, tip: str, scanned: Scan | None = None) -> list[Hi
         if fewer > 0:
             found.append(Hit(change.path, "test_assert_markers", f"{fewer} fewer assertion lines"))
         seen: set[int] = set()
-        for line in change.added:   # added lines only: removing a marker is free
+        for line in _parts(change.added):   # added lines only: removing a marker is free
             for i, marker in enumerate(markers):
                 if i not in seen and marker.search(line):
                     seen.add(i)
@@ -210,7 +233,7 @@ def soft_hits(repo: Repo, cfg, tip: str, scanned: Scan | None = None) -> list[Hi
             found.append(Hit(change.path, "test_paths", "binary change"))
         elif change.removed:
             found.append(Hit(change.path, "test_paths", f"{len(change.removed)} lines changed"))
-        if change.is_test and any(_LOAD_TESTS.match(line) for line in change.added):
+        if change.is_test and any(_LOAD_TESTS.match(line) for line in _parts(change.added)):
             found.append(Hit(change.path, "test_paths", "adds load_tests"))   # can change which tests run
     return found
 
@@ -332,7 +355,7 @@ def _items(body: str) -> tuple[list[str], list[str]]:
     surrounding backticks and quotes and is reduced to its first test-name token."""
     names: list[str] = []
     dropped: list[str] = []
-    for match in _TESTS_LINE.finditer(body or ""):
+    for match in _TESTS_LINE.finditer("\n".join((body or "").splitlines())):   # a lone CR ends a line too
         remark = match.group(1)
         while True:   # cut parenthesised remarks, nested ones too, before splitting at the commas
             plain = re.sub(r"\([^()]*\)", " ", remark)
@@ -343,8 +366,10 @@ def _items(body: str) -> tuple[list[str], list[str]]:
             item = item.strip()
             if not item:
                 continue
-            token = _NAME.search(item)
+            token = next((t for t in _NAME.finditer(item) if re.search(r"\w", t.group(0))), None)   # `- test_a`
             name = token.group(0).rstrip(".:") if token else ""   # `test_b.` and `test_a:` end a sentence
+            if not re.search(r"\w", name) or name.casefold() in ("none", "n/a"):   # `Tests: none`, `Tests: -`
+                name = ""
             if not name:
                 dropped.append(item)
             elif name not in names:
@@ -370,8 +395,10 @@ def missing_required(names: Sequence[str], passed_ids: Iterable[str]) -> list[st
         candidates.update({test, test.split("[", 1)[0]})   # `t.py::test_x[1]`, `test_x[a-b]`, a cut `test_x[a`
         inner = _UNITTEST_ID.match(test)
         if inner:
-            dotted = inner.group(1)
-            candidates.update({dotted, f"{dotted}.{test.split()[0]}"})   # Python < 3.11: `test_x (pkg.mod.Case)`
+            dotted, method = inner.group(1), test.split()[0]
+            # 3.11+ prints `test_x (pkg.mod.Case.test_x)`; older Pythons `test_x (pkg.mod.Case)`: the class alone
+            # is not a test, so only the method under it is a candidate
+            candidates.add(dotted if dotted.endswith("." + method) else f"{dotted}.{method}")
     return [name for name in names
             if not any(c == name or c.endswith("." + name) or c.endswith("::" + name) for c in candidates)]
 

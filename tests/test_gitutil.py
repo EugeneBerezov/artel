@@ -149,3 +149,17 @@ class ProcessGroupTest(RepoTestCase):
             gitutil.Repo.discover(self.repo_path).rev("HEAD")
         for key, value in platform.popen_kwargs().items():
             self.assertEqual(seen.get(key), value, key)
+
+
+class GitBytesTest(RepoTestCase):
+    def test_git_bytes_keeps_every_byte_and_raises_git_error(self):
+        """Mutation caught: text mode (a lone CR translated to a newline, bytes replaced) or a failure that
+        returns empty output instead of raising."""
+        (self.repo_path / "odd.txt").write_bytes(b"a\rb\r\nc\xff\n")
+        git(self.repo_path, "add", "odd.txt")
+        git(self.repo_path, "commit", "-q", "-m", "odd")
+        repo = gitutil.Repo.discover(self.repo_path)
+        self.assertEqual(repo.git_bytes("show", "HEAD:odd.txt"), b"a\rb\r\nc\xff\n")
+        with self.assertRaises(GitError) as caught:
+            repo.git_bytes("show", "HEAD:no-such-file")
+        self.assertIn("no-such-file", caught.exception.stderr)
