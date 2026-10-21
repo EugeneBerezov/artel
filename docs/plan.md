@@ -3622,6 +3622,8 @@ def gates(repo, board, cfg, task, result: VerifyResult) -> list[Hit]
 
 **Context for the writer:** Global Constraints + PD-4 (amended prefix), PD-5, PD-16, PD-34, PD-46, PD-64 (`base_verify` only), PD-66 (runner side), PD-68, PD-69, PD-74 + this task.
 
+**Also (controller review of T37, reviews/T37-ctl.md; this task is next on `runner.py`):** (a) an orphan clear of a stage job whose agent had started adds `stage_runs+1` (through `extra_sets`), so a task whose finish keeps failing while `clear_running` succeeds ends `stuck` at `max_stage_runs` instead of re-running every tick (`test_repeated_orphan_clear_reaches_stage_runs_cap`); (b) `test_setup_internal_error_does_not_count_stage_run` at runner level (an internal error after setup started, before the agent → `stage_runs` unchanged — catches `agent_started` set for every job kind in `_on_start`); (c) the passing probe used by PD-61 is the latest *passing* probe of the kind, not meta `last_probe` (a later failing `limit` probe must not hide it) — `test_failing_probe_after_passing_keeps_escalation`.
+
 **Files:**
 - Modify: `artel/integrate.py` (`verify_commit`, `base_green`, `VerifyResult.kind == "red_base"`, `finish_verify` for it), `tests/test_integrate.py`
 - Modify: `artel/journal.py` (`Fate`, `finding_fates`, `original_severity`), `tests/test_journal.py`
