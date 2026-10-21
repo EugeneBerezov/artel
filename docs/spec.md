@@ -399,7 +399,8 @@ protected path) only on **hard signals**:
   neither side, so commenting an assertion out is a removal;
 - an added line in a matching file that matches one of `test_markers`
   (regexes): an unconditional skip (`@skip` with or without arguments,
-  `pytest.mark.skip` also as `pytestmark`, `skipIf(True` / `skipUnless(False`),
+  `pytest.mark.skip` also as `pytestmark`, `skipIf(True` / `skipif(True` /
+  `skipUnless(False`),
   `.only(`, an added `xfail` or expected failure, `os._exit` — conditional
   skips (`skipIf`, platform checks), skip calls in a test body
   (`skipTest`, `pytest.skip`, which are usually conditional) and `sys.exit`
@@ -410,7 +411,8 @@ protected path) only on **hard signals**:
   optional indentation and a `-` or `*` bullet) followed by comma-separated
   names (`Tests:` is case-sensitive; backticks and quotes around a name
   and any text after it are dropped, so `` Tests: `test_a` (happy path) ``
-  names `test_a`; an item with no name is ignored with a NOTE). A name is satisfied when a passed test id of the task's verify
+  names `test_a`; an item with no name, or `none` / `n/a`, is ignored with a
+  NOTE). A name is satisfied when a passed test id of the task's verify
   equals it or ends with `.<name>` or `::<name>`, optionally followed by a
   `[…]` parameter suffix (so `test_retry_limit` matches
   `tests.test_net.Retry.test_retry_limit` and `t.py::test_retry_limit[2]`). A
@@ -863,13 +865,13 @@ protected_paths = [".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "art
                                   # + templates dir + setup_inputs + files in list-form setup/verify (§4)
 test_paths = ["tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
               "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*"]
-test_markers = ['^\s*@(unittest\.)?skip\b', '\bmark\.skip\b', '\bskip(If\(\s*True|Unless\(\s*False)\b',
+test_markers = ['^\s*@(unittest\.)?skip\b', '\bmark\.skip\b', '\bskip([Ii]f\(\s*True|Unless\(\s*False)\b',
                 '\b(it|test|describe)\.skip\(', '\bx(it|describe|test)\(', '\.only\(', 'pytest\.mark\.xfail',
                 '\bxfail\(', '@(unittest\.)?expectedFailure', 'os\._exit\(']
                                   # regexes on added lines of test_paths files → ask (§4); not conditional skips
 test_assert_markers = ["assert", "expect("]   # a test file losing more of these lines than it gains → ask
 verify_test_id_regex = ['^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$', '^PASSED (\S+)']
-                                  # ids of passed tests (unittest -v, pytest -rA); verify must print them
+                                  # ids of passed tests (unittest -v -b, pytest -rA); verify must print them
 base_cache_ttl = "6h"             # a cached green base verify older than this is verified again
 shadow_verify = true              # verify the reviewed commit when a review finds a blocker/major (no tokens)
 risk_signals = ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"]
