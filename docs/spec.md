@@ -319,6 +319,19 @@ review would make its verdict describe code that does not exist). Without
 `project_tools` it can write probes but not run them. `vet` and `attack`
 keep the read-only `attacker` profile.
 
+**Mutation check (risky tasks, owner 2026-10-21).** In the round-1 review
+of a task that is `risky` (vet) or was added with `--attack`, the reviewer
+also tests the tests: it changes two or three lines the task is about (a
+condition, a boundary, a returned value) one at a time, runs the tests
+that cover them, and restores each file (`git checkout -- <file>`) before
+the next. A change the tests do not catch is a finding — `minor`, unless
+it shows a real defect — with the changed line and the test command as
+basis. It needs `project_tools`; without them the reviewer skips the check
+and says so. At the end of every review the runner compares tracked files
+in the slot with the branch tip: any difference left behind is restored
+and the review counts as a failed stage, because its verdict may describe
+code that does not exist.
+
 **Repository check (every agent stage).** A probe, a test or any command an
 agent runs acts on the shared `.git`, which the slot clean-up does not
 touch. Before and after every agent stage — writers too — the runner takes
@@ -386,6 +399,16 @@ protected path) only on **hard signals**:
   (regexes): an unconditional skip, `.only(`, an added `xfail` or expected
   failure, `os._exit` — conditional skips (`skipIf`, platform checks) and
   `sys.exit` are ordinary test code and are not markers.
+- **required tests** (owner, 2026-10-21): the task text may name tests
+  the change must have, one or more lines starting with `Tests:` followed
+  by comma-separated names. A name is satisfied when a passed test id of
+  the task's verify equals it or ends with `.<name>` or `::<name>` (so
+  `test_retry_limit` matches `tests.test_net.Retry.test_retry_limit`). A
+  name that no passed id satisfies — missing, failing or skipped — is a
+  hard signal; so is a task that names tests while its verify log yields
+  no test ids at all (nothing can be confirmed). The writer's prompt
+  repeats the list. Required tests are checked even when there are no
+  recorded ids for the integration tip.
 Any other changed or deleted line in a matching file, and any change to a
 matching file that is not itself a test file (`conftest.py`,
 `__init__.py`, test configuration), only sends the round-1 review to the
