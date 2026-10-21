@@ -594,3 +594,39 @@ class ArgvTest(unittest.TestCase):
             self.assertEqual(recorded[recorded.index("--json-schema") + 1], A.schema_json())   # byte for byte
             self.assertEqual(call["prompt"], prompt)   # the prompt arrived on stdin
             self.assertNotIn(prompt, recorded)
+
+
+class UnavailableTest(unittest.TestCase):
+    def parse(self, *lines):
+        parser = A.StreamParser()
+        for line in lines:
+            parser.feed(line)
+        return parser
+
+    def test_is_unavailable_shapes(self):
+        """PD-57. Mutation caught: 429 read as unavailable; 5xx/529 missed; a clean result with no assistant record
+        read as down; the limit check missing."""
+        assistant = A.sample_assistant_line("hi", {"input_tokens": 1, "output_tokens": 1})
+        ok = A.sample_result_line({"outcome": "done", "summary": "x"})
+        error = lambda status: A.sample_result_line(None, None, is_error=True, api_error_status=status)
+        self.assertTrue(A.is_unavailable(self.parse(), 1))                          # crash, nothing seen
+        self.assertTrue(A.is_unavailable(self.parse(error(529)), 1))
+        self.assertTrue(A.is_unavailable(self.parse(assistant, error(503)), 1))
+        self.assertTrue(A.is_unavailable(self.parse(error(500)), 1))
+        self.assertFalse(A.is_unavailable(self.parse(error(429)), 1))               # a limit, not an outage
+        self.assertFalse(A.is_unavailable(self.parse(assistant, ok), 0))            # a normal result
+        self.assertFalse(A.is_unavailable(self.parse(ok), 0))                       # ok result, no assistant record
+        self.assertFalse(A.is_unavailable(self.parse(assistant, error(400)), 1))    # a plain error
+        self.assertFalse(A.is_unavailable(self.parse(A.sample_rate_limit_line("rejected", 5, "five_hour", 1.0)), 1))
+
+    def test_assistant_seen(self):
+        self.assertFalse(A.StreamParser().assistant_seen)
+        self.assertTrue(self.parse(A.sample_assistant_line("hi", {"input_tokens": 1, "output_tokens": 1})).assistant_seen)
+
+
+class EmptyTokenTest(unittest.TestCase):
+    def test_build_argv_keeps_empty_token(self):
+        """Mutation caught: build_argv dropping `""` (`--tools` would swallow the next flag)."""
+        cfg = runtime_cfg(agent_command=[sys.executable, "x.py"], **{"profiles.writer": ["--permission-mode", "acceptEdits", "--tools", "", "--model", "{model}"]})
+        argv = A.build_argv(cfg, profile="writer", model="haiku", notice_path=Path("/n/notice.md"))
+        self.assertEqual(argv[argv.index("--tools") + 1], "")

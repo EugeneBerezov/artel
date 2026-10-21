@@ -2,6 +2,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from artel import platform
 from artel.errors import ArtelError, GitError
 
 INTEGRATION = "artel/integration"
@@ -20,8 +21,10 @@ class Worktree:
 
 def _run(args: list[str], cwd: Path, input: str | None = None, env: dict | None = None):
     try:
-        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, input=input,
-                              encoding="utf-8", errors="replace", env=env)
+        # own process group / session, like agents, setup and verify: a Ctrl+C or group SIGTERM aimed at the runner
+        # during a soft stop must not kill a running git
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, input=input, encoding="utf-8",
+                              errors="replace", env=env, **platform.popen_kwargs())
     except FileNotFoundError as exc:
         if Path(cwd).is_dir():   # the directory exists, so the executable is what is missing
             raise ArtelError("git not found on PATH") from exc

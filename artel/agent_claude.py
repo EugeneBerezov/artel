@@ -14,7 +14,7 @@ docs/spike-2026-10-19.md (Claude Code 2.1.304, model haiku, Linux):
       `--permission-mode` explicitly (the owner's settings may say `auto`); the prompt goes on stdin only
       (variadic `--allowedTools` swallows a positional prompt).
 - Q6  final `usage` is a SUM over all API calls of the run; per-call usage is `assistant.message.usage`.
-- Q7  the notice is best effort; `--setting-sources` is a user knob, absent from the defaults.
+- Q7  the notice is best effort; `--setting-sources` is in `profiles.common` since Task 44.
 - PD-40 `api_error_status == 429` on an error result as the limit-hit shape is an ASSUMPTION (unobserved).
 """
 import json
@@ -133,6 +133,7 @@ class StreamParser:
         self.is_error = False
         self.api_error_status: object = None
         self.max_rank = 0
+        self.assistant_seen = False         # any `assistant` record: the model was reached (PD-57)
         self.denials: list[dict] = []
         self.session_id: str | None = None
         self._calls: dict[str, dict] = {}   # message id → its last usage (one API call may emit several lines)
@@ -201,6 +202,7 @@ class StreamParser:
         return event
 
     def _assistant(self, obj: dict) -> None:
+        self.assistant_seen = True
         self._session(obj)
         message = obj.get("message")
         usage = message.get(USAGE_FIELD) if isinstance(message, dict) else None
@@ -238,6 +240,23 @@ class StreamParser:
             value = obj.get(field)
             if isinstance(value, int) and not isinstance(value, bool):
                 setattr(self.usage, attr, value)
+
+
+def is_unavailable(parser: StreamParser, exit_code: int | None) -> bool:
+    """PD-57: the agent could not do its job for a reason that is not the task's. The caller has already ruled out
+    a stop and a timeout; a rate-limited run (PD-40) is the limit's, never this. (a) no `assistant` record and no
+    `result` with `is_error: false`: the CLI did not start, crashed or died before its first model call; (b) an error
+    result with `api_error_status` 500-599 or 529."""
+    if parser.limit_hit():
+        return False
+    if parser.is_error:
+        try:
+            status = int(parser.api_error_status)
+        except (TypeError, ValueError):
+            status = None
+        if status is not None and (500 <= status <= 599 or status == 529):
+            return True
+    return not parser.assistant_seen and not (parser.result_seen and not parser.is_error)
 
 
 def _closed_id(item) -> int | None:

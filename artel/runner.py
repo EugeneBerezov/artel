@@ -3,7 +3,8 @@
 Single writer (§3.1): workers run stages, verify and the base job and store their results; only the main thread
 applies transitions, and human requests at the start of every tick (`requests.apply_pending`, Task 18). While
 any pause is active the runner keeps ticking (§3.1 Pauses); notifications go out on one sender thread, never on
-the tick thread. Limits, quota windows and probes belong to Task 35, vetting to Task 21.
+the tick thread. Usage events, quota windows, the night budget and the probes that end an open-ended pause are
+here too (Task 35); vetting belongs to Task 21.
 """
 import json
 import os
@@ -18,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from artel import agent_claude, cmd_agent, config as config_mod, integrate, journal, notify as notify_mod, pauses
-from artel import pick, platform, procs
+from artel import pick, platform, probe, procs
 from artel import requests, slots, stages, transitions
 from artel.board import Board, open_board
 from artel.errors import ArtelError
@@ -30,11 +31,17 @@ FINISHED_STATES = ("done", "rejected")   # their logs are pruned beyond log_keep
 HEAVY_CHECK_TIMEOUT = 30.0               # heavy_lock_check reports a stale lock; it never waits on the lock
 NOTIFY_FLUSH_MIN = 5.0                   # shutdown waits at least this long for queued events (runner_stopped)
 _TIP_KEY = "integration_tip"             # PD-65 d: the sha the runner itself left artel/integration at
+SAMPLE_GAP = 600.0                       # usage_samples: at most one per 10 minutes (PD-56)
+SAMPLE_KEEP = 48 * 3600.0
+BUDGET_WINDOW = 24 * 3600.0
+LIMIT_DETAIL = "usage limit"             # one cause per kind: a probe that learns the reset time replaces it
+LIMIT_KINDS = ("limit", "quota", "agent_unavailable")   # end at `until`, or by a probe when there is none
+_QUOTA_KEYS = (("five_hour", "quota_stop_five_hour"), ("seven_day", "quota_stop_seven_day"))
 
 
 @dataclass
 class Job:
-    kind: str                 # "stage" | "verify" | "base"
+    kind: str                 # "stage" | "verify" | "base" | "probe" (slot -1: it takes no slot)
     task_id: int | None
     slot: int
     thread: threading.Thread
@@ -45,6 +52,7 @@ class Job:
     version: int | None = None  # the task's version when the job was started: unchanged = nothing applied yet
     discarded: bool = False     # terminated for a request (PD-30): its result is never applied
     finished: bool = False      # the work returned: the thread is about to end, collect it now
+    probe_kind: str | None = None   # the pause kind a probe job was started for
 
 
 @dataclass(frozen=True)
@@ -68,7 +76,8 @@ class Runner:
         self.notify = notify
         self.board: Board | None = None
         self.jobs: list[Job] = []
-        self.rate_limits: list = []        # Task 22 turns these into pauses
+        self._rate_events: queue.SimpleQueue = queue.SimpleQueue()   # RateLimit events from worker threads
+        self._setup_outage: dict | None = None         # PD-31: the setup_failed outage a timed retry goes on with
         self.stopping = False
         self._lock = platform.FileLock(repo.lock_path)
         self._wake = threading.Event()
@@ -109,6 +118,7 @@ class Runner:
             self._adopt_integration_tip()
             slots.ensure_slots(self.repo, self.board, self.cfg, self.cfg["max_agents"])
             self.reconcile()
+            self._guarded("the stored usage windows", lambda: self._evaluate_usage(fresh=False))   # before the first pick
             if self.cfg["review_rounds"] == 0:   # PD-51
                 print("warning: review_rounds = 0 behaves like 1: one review, blocking findings go to you"
                       " (no fix round)", file=sys.stderr)
@@ -246,6 +256,8 @@ class Runner:
     def resumed(self, kinds: list[str]) -> None:
         if {"base_conflict", "integration_moved"} & set(kinds):
             self._adopt_integration_tip()   # PD-65 d: the human's repair of artel/integration is adopted
+        if "setup_failed" in kinds:
+            self._setup_outage = None
         for kind in kinds:
             self._emit(Event("resumed", text=kind))
 
@@ -274,13 +286,25 @@ class Runner:
         active = pauses.active(self.board)
         self._guarded("the disk check", lambda: self._update_disk("disk" in active))   # one failing check
         self._guarded("the setup pause", lambda: self._update_setup_failed(active.get("setup_failed")))
+        self._guarded("the limit pauses", self._update_limit_pauses)
 
     def _update_setup_failed(self, setup) -> None:
         if setup is None:
             self._setup_hashes.clear()
-        elif self._setup_inputs_changed() or (setup.until is not None and self.clock() >= setup.until):
-            self.unpause("setup_failed")   # PD-31: the next stage runs setup again; failing again pauses again
+        elif self._setup_inputs_changed():
+            self.unpause("setup_failed")   # PD-31: the next stage runs setup again
             self._setup_hashes.clear()
+            self._setup_outage = None
+        elif setup.until is not None and self.clock() >= setup.until:
+            # the timed retry: lifted without a `resumed`; if setup fails again with the same inputs it is the same
+            # outage (one notification per outage), if it works `_setup_worked` announces the end
+            pauses.remove(self.board, "setup_failed")
+            self._setup_hashes.clear()
+
+    def _setup_worked(self) -> None:
+        if self._setup_outage is not None and "setup_failed" not in pauses.active(self.board):
+            self._setup_outage = None
+            self._emit(Event("resumed", text="setup_failed"))
 
     def _update_disk(self, paused: bool) -> None:
         minimum = self.cfg["min_free_disk"]
@@ -307,7 +331,159 @@ class Runner:
             self._setup_hashes[slot] = slots.setup_hash(path, self.cfg["commands.setup"],
                                                         self.cfg["commands.setup_inputs"])
         text = journal.truncate_utf8(f"setup failed for task {task_id}: {detail}", journal.TEXT_LIMIT)
-        self.pause("setup_failed", text, until=self.clock() + self.cfg["setup_retry"], setting="commands.setup")
+        until = self.clock() + self.cfg["setup_retry"]
+        first_line = detail.strip().splitlines()[0] if detail.strip() else ""
+        digest = self._setup_hashes.get(slot) if slot is not None else None
+        outage = self._setup_outage
+        if outage is not None and digest is not None and outage["hash"] == digest:
+            # the retry failed again with the same inputs: the same outage, its original `since`
+            pauses.add(self.board, "setup_failed", text, now=self.clock(), until=until, setting="commands.setup",
+                       since=outage["since"])
+            journal.append(self.board, "FAIL", journal.truncate_utf8(f"setup retry failed again: {first_line}",
+                                                                      journal.TEXT_LIMIT), author="runner")
+            if first_line != outage["line"]:   # a different error is news
+                outage["line"] = first_line
+                self._notify_paused("setup_failed")
+            return
+        self.pause("setup_failed", text, until=until, setting="commands.setup")
+        self._setup_outage = {"hash": digest, "since": self.clock(), "line": first_line}
+
+    # usage events, quota and limit pauses (spec §5 step 5, PD-22, PD-40, PD-56) -----------------------------------
+
+    def on_rate_limit(self, ev) -> None:
+        """Called from a worker thread; the main thread applies it at the next tick."""
+        self._rate_events.put(ev)
+        self._wake.set()
+
+    def _apply_rate_events(self) -> None:
+        events = []
+        while True:
+            try:
+                events.append(self._rate_events.get_nowait())
+            except queue.Empty:
+                break
+        for ev in events:
+            self._usage_event(ev)
+        if events:
+            self._evaluate_usage(fresh=True)
+
+    def _json_meta(self, key: str, default):
+        raw = self.board.get_meta(key)
+        try:
+            return json.loads(raw) if raw else default
+        except ValueError:
+            return default   # unreadable: treated as never stored, rewritten by the next event
+
+    def _usage_event(self, ev) -> None:
+        now = self.clock()
+        if ev.limit_type:
+            self.board.set_meta(f"limit:{ev.limit_type}", json.dumps(
+                {"status": ev.status, "rank": ev.rank, "resets_at": ev.resets_at, "utilization": ev.utilization,
+                 "seen_at": now}))
+        self._store_windows(probe.event_windows(ev), now)
+        if ev.rank >= agent_claude.status_rank(self.cfg["limit_stop"]):
+            until = ev.resets_at if ev.resets_at is not None and ev.resets_at > now else self._latest_future_reset(now)
+            self.pause("limit", LIMIT_DETAIL, until=until, setting="limit_stop")
+
+    def _latest_future_reset(self, now: float) -> float | None:
+        resets = [w["resets_at"] for w in self._json_meta("usage_windows", {}).values()
+                  if isinstance(w, dict) and isinstance(w.get("resets_at"), (int, float)) and w["resets_at"] > now]
+        return max(resets) if resets else None
+
+    def _store_windows(self, windows: dict, now: float) -> None:
+        """PD-56: the latest event per window; the weekly utilization is also sampled for the night budget."""
+        if not windows:
+            return
+        stored = self._json_meta("usage_windows", {})
+        samples = [s for s in self._json_meta("usage_samples", []) if s[0] > now - SAMPLE_KEEP]
+        rolled = stored.get("seven_day", {}).get("resets_at")
+        if isinstance(rolled, (int, float)) and rolled <= now:   # the weekly window rolled: older samples are another week
+            samples = [s for s in samples if s[0] >= rolled]
+        for name, window in windows.items():
+            stored[name] = {"utilization": window["utilization"], "resets_at": window["resets_at"], "seen": now}
+        week = windows.get("seven_day")
+        if week is not None and (not samples or now - samples[-1][0] >= SAMPLE_GAP):
+            samples.append([now, week["utilization"]])
+        self.board.set_meta("usage_windows", json.dumps(stored))
+        self.board.set_meta("usage_samples", json.dumps(samples))
+
+    def _evaluate_usage(self, *, fresh: bool) -> None:
+        """Quota thresholds per window and the night budget over the stored samples. `fresh` = just reported by
+        an event: a window with no reset time then pauses (and is probed); from the store at start only a window
+        with a future reset does, so a stale record cannot pause a new runner for ever."""
+        now = self.clock()
+        for name, key in _QUOTA_KEYS:
+            window = self._json_meta("usage_windows", {}).get(name)
+            if not isinstance(window, dict) or window.get("utilization", 0) < self.cfg[key]:
+                continue
+            reset = window.get("resets_at")
+            if reset is None and not fresh or reset is not None and reset <= now:
+                continue
+            self.pause("quota", f"{name} window at or above {key}", until=reset, setting=key)
+        recent = [s for s in self._json_meta("usage_samples", []) if s[0] > now - BUDGET_WINDOW]
+        budget = self.cfg["night_budget_seven_day"]
+        if len(recent) >= 2 and recent[-1][1] - recent[0][1] >= budget:
+            self.pause("quota", f"weekly window grew by {budget:g} within 24 hours", setting="night_budget_seven_day",
+                       until=recent[0][0] + BUDGET_WINDOW)
+
+    def _update_limit_pauses(self) -> None:
+        """limit, quota and agent_unavailable end at their `until`; with none they are probed (PD-55), at most one
+        probe at a time and `limit_probes` in 24 h across all kinds, then they wait for `resume`."""
+        now = self.clock()
+        active = pauses.active(self.board)
+        for kind in LIMIT_KINDS:
+            pause = active.get(kind)
+            if pause is None:
+                continue
+            if pause.until is not None:
+                if now >= pause.until:
+                    self.unpause(kind)
+                continue
+            if pause.exhausted:
+                continue
+            limit = active.get("limit")
+            if kind != "limit" and limit is not None and limit.until is not None and limit.until > now:
+                continue   # a known limit end is coming: probing now would only use up the probes (SPEC-GAP T35)
+            times = pauses.probe_times(self.board, now=now)
+            if len(times) >= self.cfg["limit_probes"]:
+                pauses.set_exhausted(self.board, kind)
+                self._emit(Event("paused", text=f"{kind}: {len(times)} probes in 24 h did not lift it; "
+                                                f"`artel resume` is needed"))
+            elif not self.stopping and not any(j.kind == "probe" for j in self.jobs) and probe.due(pause, self.cfg, now=now, times=times):
+                self._spawn("probe", None, -1, self._probe_work).probe_kind = kind
+
+    def _probe_work(self, board: Board, job: Job):
+        return probe.run_probe(self.repo, self.cfg, self.child_env(), now=self.clock(), stop_event=job.stop)
+
+    def _finish_probe(self, job: Job) -> None:
+        """Applies a probe's result to the pause it was started for (PD-55). Never touches a task."""
+        board, now, kind = self.board, self.clock(), job.probe_kind
+        result = job.result
+        if job.error is not None or result is None:
+            journal.append(board, "FAIL", stages._clip_tail("internal error in the probe: ", job.error or "no result"),
+                           author="runner")
+            pauses.record_probe(board, now=now, kind=kind, outcome="unavailable")
+            return
+        if job.stop.is_set():
+            return                                         # stopped by a stop request: no real attempt, not counted
+        pauses.record_probe(board, now=now, kind=kind, outcome=result.outcome)
+        self._store_windows(result.windows, now)
+        self._evaluate_usage(fresh=True)
+        pause = pauses.active(board).get(kind)
+        if pause is None:
+            return                                         # a `resume` already ended it
+        if probe.ended(pause, result, self.cfg, now=now):
+            self.unpause(kind)
+        elif kind == "quota" and result.outcome == "ok":   # still above a threshold: its window's reset is the end
+            for name, key in _QUOTA_KEYS:
+                window = result.windows.get(name)
+                if window and window["utilization"] >= self.cfg[key] and (window["resets_at"] or 0) > now:
+                    pauses.add(board, "quota", f"{name} window at or above {key}", now=now,
+                               until=window["resets_at"], setting=key)
+        elif result.outcome == "limit" and result.resets_at is not None and result.resets_at > now:
+            # a probed `limit` gets its end (same cause, replaced, no second notification); for another probed
+            # kind the pause stays and the limit is its own kind
+            self.pause("limit", LIMIT_DETAIL, until=result.resets_at, setting="limit_stop")
 
     # the integration tip (PD-65 d) ----------------------------------------------------------------------------
 
@@ -476,7 +652,7 @@ class Runner:
         task = board.get_task(job.task_id)
         plan = stages.plan_stage(self.repo, board, self.cfg, task, job.slot, base_env=self.child_env())
         run = stages.run_stage(self.repo, board, self.cfg, plan, job.slot, on_start=self._on_start(board, job),
-                               on_rate_limit=self.rate_limits.append, stop_event=job.stop)
+                               on_rate_limit=self.on_rate_limit, stop_event=job.stop)
         return plan, run
 
     def _verify_work(self, board: Board, job: Job):
@@ -573,6 +749,7 @@ class Runner:
             print(f"artel: internal error in {what}: {last} (not journaled: {exc})", file=sys.stderr)
 
     def _collect(self) -> None:
+        self._apply_rate_events()   # events a finishing job queued come before its result is applied
         for job in self.jobs:
             if job.finished:
                 job.thread.join(1.0)   # its work is over: collect it now, not one poll_interval later
@@ -615,6 +792,12 @@ class Runner:
 
     def _finish(self, job: Job) -> None:
         board = self.board
+        if job.kind == "probe":
+            try:
+                self._finish_probe(job)
+            except Exception:   # noqa: BLE001 - a probe belongs to no task: nothing else may be charged for it
+                self._record_tick_error("the probe", traceback.format_exc())
+            return
         if job.discarded:                             # PD-30: terminated for a request, nothing to apply
             if job.task_id is not None:
                 board.clear_running(job.task_id)
@@ -656,6 +839,8 @@ class Runner:
             plan, run = job.result
             tr = stages.finish_stage(self.repo, board, self.cfg, job.task_id, plan, run)
             detail = f"setup {run.setup}"
+            if run.setup == "ok":
+                self._setup_worked()
         else:
             try:
                 tr = integrate.finish_verify(self.repo, board, self.cfg, job.task_id, job.result)

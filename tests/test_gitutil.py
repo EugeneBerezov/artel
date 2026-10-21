@@ -1,4 +1,5 @@
 import os
+import subprocess
 from pathlib import Path
 
 from artel import gitutil
@@ -130,3 +131,21 @@ class GitutilMoreTest(RepoTestCase):
             with self.assertRaises(ArtelError) as cm:
                 repo.git("status")
             self.assertIn("git not found on PATH", str(cm.exception))
+
+
+class ProcessGroupTest(RepoTestCase):
+    def test_git_runs_in_own_process_group(self):
+        """T22 SPEC-GAP. Mutation caught: git started in the runner's own group (Ctrl+C or a group SIGTERM during a
+        soft stop would kill it)."""
+        from artel import platform
+        seen = {}
+        real = subprocess.run
+
+        def spy(*args, **kwargs):
+            seen.update(kwargs)
+            return real(*args, **kwargs)
+
+        with mock.patch.object(gitutil.subprocess, "run", spy):
+            gitutil.Repo.discover(self.repo_path).rev("HEAD")
+        for key, value in platform.popen_kwargs().items():
+            self.assertEqual(seen.get(key), value, key)

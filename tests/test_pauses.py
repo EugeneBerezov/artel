@@ -168,3 +168,27 @@ class PausesTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+    def test_probe_times_pruned_to_24_hours_and_kept_across_pause_removal(self):
+        """Mutation caught: the history kept in the pause record; no 24 h window."""
+        pauses.add(self.board, "limit", "x", now=0.0)
+        pauses.record_probe(self.board, now=100.0, kind="limit", outcome="limit")
+        pauses.record_probe(self.board, now=200.0, kind="agent_unavailable", outcome="unavailable")
+        pauses.remove(self.board, "limit")
+        self.assertEqual(pauses.probe_times(self.board, now=300.0), [(100.0, "limit"), (200.0, "agent_unavailable")])
+        later = 100.0 + 24 * 3600.0
+        self.assertEqual(pauses.probe_times(self.board, now=later), [(200.0, "agent_unavailable")])
+        pauses.record_probe(self.board, now=later, kind="limit", outcome="ok")
+        self.assertEqual([ts for ts, _ in pauses.probe_times(self.board, now=later)], [200.0, later])
+        self.assertEqual(json.loads(self.board.get_meta("last_probe")), {"at": later, "kind": "limit", "outcome": "ok"})
+
+    def test_probe_times_unreadable_record_counts_nothing(self):
+        self.board.set_meta("probe_times", "{not json")
+        self.assertEqual(pauses.probe_times(self.board, now=1.0), [])
+        pauses.record_probe(self.board, now=1.0, kind="limit", outcome="ok")
+        self.assertEqual(pauses.probe_times(self.board, now=2.0), [(1.0, "limit")])
+
+    def test_add_with_earlier_since_keeps_it(self):
+        """Task 35: a pause re-added by a timed retry keeps the outage's first `since`."""
+        pauses.add(self.board, "setup_failed", "x", now=50.0, since=10.0)
+        self.assertEqual(pauses.active(self.board)["setup_failed"].since, 10.0)
