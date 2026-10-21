@@ -384,12 +384,14 @@ protected path) only on **hard signals**:
   pass there (skipped included). Tests are compared as **sets of test
   ids**, read from the verify log with `verify_test_id_regex` (one group:
   the id of a passed test; defaults for `unittest -v` and `pytest -rA`).
-  The verify command must print ids (`-v`); totals are not enough, because
+  The verify command must print ids (`unittest -v -b`: `-b` keeps a test's
+  own output from splitting its `ok` line; `pytest -rA`); totals are not enough, because
   `Ran N tests` counts skipped tests and new tests hide removed ones. No
   recorded ids for the tip (a fresh board, a tip a human repaired) → no id
   check, and the task's VERDICT says `test-id check off: no ids recorded
   for <sha>` (`artel status` too, once it exists). The ids are kept per
-  sha and only for green verifies: a later red result for the same sha, or
+  sha and only for green verifies; the first green record of a sha stands
+  and is never replaced; a later red result for the same sha, or
   `resume` forgetting the base-check cache, never removes them;
 - a matching file whose diff removes more lines containing an assertion
   marker (`test_assert_markers`: `assert`, `expect(` by default) than it
@@ -406,7 +408,9 @@ protected path) only on **hard signals**:
 - **required tests** (owner, 2026-10-21): the task text may name tests
   the change must have, one or more lines starting with `Tests:` (after
   optional indentation and a `-` or `*` bullet) followed by comma-separated
-  names. A name is satisfied when a passed test id of the task's verify
+  names (`Tests:` is case-sensitive; backticks and quotes around a name
+  and any text after it are dropped, so `` Tests: `test_a` (happy path) ``
+  names `test_a`; an item with no name is ignored with a NOTE). A name is satisfied when a passed test id of the task's verify
   equals it or ends with `.<name>` or `::<name>`, optionally followed by a
   `[…]` parameter suffix (so `test_retry_limit` matches
   `tests.test_net.Retry.test_retry_limit` and `t.py::test_retry_limit[2]`). A
