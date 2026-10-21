@@ -65,7 +65,7 @@ class Task:
     accepted: bool                  # human accepted the verified commit (PD-36)
     risky: bool                     # vet found the task risky (PD-37)
     answered: bool
-    last_verify: str | None         # "green" | "red" | "conflict" | "timeout" | None
+    last_verify: str | None         # "green" | "green_flaky" | "red" | "conflict" | "timeout" | None
     running: bool
     running_kind: str | None        # "agent" | "setup" | "verify" (the base job is not a task, PD-34)
     running_started_at: float | None

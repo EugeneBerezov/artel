@@ -9,6 +9,7 @@ import posixpath
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+from artel.errors import GitError
 from artel.gitutil import INTEGRATION, Repo
 
 SHOWN = 3   # paths named in a summary before "+N more"
@@ -55,8 +56,11 @@ def _repo_relative(repo: Repo, arg: str) -> str | None:
 
 
 def _is_blob(repo: Repo, tip: str, path: str) -> bool:
-    result = repo.git("cat-file", "-t", f"{tip}:{path}", check=False)
-    return result.returncode == 0 and result.stdout.strip() == "blob"   # not `-e`: it accepts directories
+    """True for a regular file at `tip`. `ls-tree` prints nothing for a missing path, `tree` for a directory and
+    `commit` for a submodule (its object is not in this repository); any git failure raises GitError."""
+    listed = repo.git("ls-tree", tip, "--", path)
+    fields = listed.stdout.split(None, 2)
+    return len(fields) >= 2 and fields[1] == "blob"
 
 
 def entries(repo: Repo, cfg) -> tuple[Entry, ...]:
@@ -69,7 +73,9 @@ def entries(repo: Repo, cfg) -> tuple[Entry, ...]:
     for item in cfg["protected_paths"]:
         add(item, False, "protected_paths")
     if cfg["protected_paths"]:
-        add(cfg["templates_dir"], False, "templates_dir")
+        templates = _repo_relative(repo, cfg["templates_dir"])   # an absolute templates_dir inside the repository
+        if templates is not None:
+            add(templates, False, "templates_dir")
     tip = repo.rev(INTEGRATION)
     for key in ("commands.verify", "commands.setup"):
         command = cfg[key]
@@ -98,23 +104,29 @@ def matches(path: str, entry: Entry) -> bool:
 
 
 def changed_paths(repo: Repo, tip: str) -> list[str]:
-    result = repo.git("diff", "--name-only", "--no-renames", "-z", f"{INTEGRATION}...{tip}", check=False)
-    if result.returncode != 0:
-        return []
+    """Raises GitError when git fails (a missing `tip` included)."""
+    result = repo.git("diff", "--name-only", "--no-renames", "-z", f"{INTEGRATION}...{tip}")
     return sorted(p for p in result.stdout.split("\x00") if p)
 
 
+GIT_ERROR = "<git error>"
+
+
 def hits(repo: Repo, cfg, tip: str) -> list[Hit]:
-    found = entries(repo, cfg)
-    if not found:
-        return []
-    out = []
-    for path in changed_paths(repo, tip):
-        for entry in found:
-            if matches(path, entry):
-                out.append(Hit(path, entry.source))
-                break
-    return out
+    """Fails closed: a git failure while deciding is one hit, so the task goes to a human and a strong review."""
+    try:
+        found = entries(repo, cfg)
+        if not found:
+            return []
+        out = []
+        for path in changed_paths(repo, tip):
+            for entry in found:
+                if matches(path, entry):
+                    out.append(Hit(path, entry.source))
+                    break
+        return out
+    except GitError:
+        return [Hit(GIT_ERROR, "protected_paths", "git failed while looking for protected paths")]
 
 
 def summary(hits: Sequence[Hit]) -> str:
