@@ -1,7 +1,9 @@
+import os
 import subprocess
 import sys
 import textwrap
 import unittest
+from unittest import mock
 
 from artel import config as C, testguard
 from artel.gitutil import INTEGRATION, Repo, task_branch
@@ -104,7 +106,10 @@ class DiffHitsTest(GuardCase):
         """Mutation caught: a marker missing from the check (each disables a test or ends the process)."""
         self.integration_with({"tests/test_old.py": TESTS})
         cases = ["@unittest.skip('x')\n", "@pytest.mark.skip\n", "it.only('x', f)\n", "@pytest.mark.xfail\n",
-                 "os._exit(0)\n"]
+                 "os._exit(0)\n", "@unittest.skip\n", "@unittest.skip ('x')\n", "@skip ('x')\n",
+                 "pytestmark = pytest.mark.skip\n", 'pytestmark = [pytest.mark.skip(reason="x")]\n',
+                 '@unittest.skipIf(True, "x")\n', '@unittest.skipUnless(False, "x")\n', "xfail(reason)\n",
+                 "xit('x', f)\n", "@unittest.expectedFailure\n", "@mark.skip\n"]
         for line in cases:
             with self.subTest(line=line):
                 tip = self.task({"tests/test_old.py": TESTS + line})
@@ -131,7 +136,10 @@ class DiffHitsTest(GuardCase):
         """Mutation caught: the round-2 marker list (skipIf, sys.exit and `fit(` are ordinary test code)."""
         self.integration_with({"tests/test_old.py": TESTS})
         extra = ('@unittest.skipIf(sys.platform == "win32", "posix")\n'
-                 'cmd = py_cmd("import sys; sys.exit(3)")\nmodel.fit(x)\n')
+                 'cmd = py_cmd("import sys; sys.exit(3)")\nmodel.fit(x)\n'
+                 "pytestmark = pytest.mark.skipif(sys.platform == 'win32', reason='x')\n"
+                 '    self.skipTest("no x")\n    pytest.skip("no x")\n@unittest.skipUnless(HAS_X, "x")\n'
+                 "@unittest.skipIf(HAS_X, 'x')\n@skip_if_slow\n")
         self.assertEqual(self.hard(self.task({"tests/test_old.py": TESTS + extra})), [])
 
     def test_test_setup_change_is_soft(self):
@@ -157,6 +165,129 @@ class DiffHitsTest(GuardCase):
         self.assertEqual([h.note for h in self.soft(changed)], ["binary change"])
         added = self.task(binary={"tests/test_new_blob.py": b"\x00\x05"})
         self.assertEqual(self.soft(added), [])
+
+    def test_removed_marker_is_not_a_hit(self):
+        """Mutation caught: markers looked for on removed lines too (deleting a skip decorator is a fix)."""
+        self.integration_with({"tests/test_old.py": TESTS + "@unittest.skip('x')\nos._exit(0)\n"})
+        tip = self.task({"tests/test_old.py": TESTS})
+        self.assertEqual(self.hard(tip), [])
+
+    def test_load_tests_in_test_file_is_soft(self):
+        """Mutation caught: a `load_tests` hook (it can drop whole suites) merging after a cheap review."""
+        self.integration_with({"tests/test_old.py": TESTS})
+        tip = self.task({"tests/test_old.py": TESTS + "\ndef load_tests(loader, tests, pattern):\n    return tests\n"})
+        self.assertEqual(self.hard(tip), [])
+        self.assertEqual(self.soft(tip), [Hit("tests/test_old.py", "test_paths", "adds load_tests")])
+
+    def test_many_files_cost_two_git_diffs(self):
+        """Mutation caught: one `git diff` per path (a 1000-file test codemod is thousands of processes)."""
+        files = {f"tests/test_{i}.py": TESTS for i in range(7)}
+        self.integration_with(files)
+        tip = self.task({rel: TESTS + "x = 1\n" for rel in files})
+        calls = []
+        real = Repo.git
+
+        def counting(repo, *args, **kw):
+            calls.append(args)
+            return real(repo, *args, **kw)
+        with mock.patch.object(Repo, "git", counting):
+            scanned = testguard.scan(self.repo, self.cfg(), tip)
+            testguard.hard_hits(self.repo, self.cfg(), tip, scanned)
+            testguard.soft_hits(self.repo, self.cfg(), tip, scanned)
+        self.assertEqual(len([a for a in calls if "diff" in a]), 2)   # --raw once, -U0 once; hits share the scan
+        self.assertEqual(len(scanned.changes), 7)
+
+    def test_chunked_diff_keeps_each_path_with_its_lines(self):
+        """Mutation caught: sections matched to the wrong path at a chunk boundary."""
+        files = {f"tests/test_{i}.py": TESTS for i in range(5)}
+        self.integration_with(files)
+        tip = self.task({rel: TESTS.replace("1, 1", f"{i}, 9") if i in (1, 4) else TESTS + "x = 1\n"
+                         for i, rel in enumerate(files)})
+        with mock.patch.object(testguard, "_CHUNK", 2):
+            self.assertEqual([h.path for h in self.soft(tip)], ["tests/test_1.py", "tests/test_4.py"])
+
+    def test_section_count_mismatch_falls_back_to_per_path_diffs(self):
+        """Mutation caught: trusting the order of sections when git printed a different number than there are
+        paths (a type change prints two): lines would be credited to the wrong files."""
+        files = {f"tests/test_{i}.py": TESTS for i in range(3)}
+        self.integration_with(files)
+        tip = self.task({"tests/test_0.py": TESTS + "x = 1\n", "tests/test_1.py": TESTS.replace("1, 1", "1, 9"),
+                         "tests/test_2.py": TESTS + "x = 1\n"})
+        real, calls = testguard._sections, []
+
+        def lying(text):
+            calls.append(1)
+            found = real(text)
+            return found[:-1] if len(calls) == 1 else found   # the first, whole-chunk parse comes back short
+        with mock.patch.object(testguard, "_sections", lying):
+            self.assertEqual([h.path for h in self.soft(tip)], ["tests/test_1.py"])
+        self.assertEqual(len(calls), 4)   # the chunk, then one diff per path
+
+    def blob(self, text):
+        return subprocess.run(["git", "hash-object", "-w", "--stdin"], cwd=self.repo_path, input=text, check=True,
+                              capture_output=True, encoding="utf-8").stdout.strip()
+
+    def test_type_change_keeps_every_line_of_the_path(self):
+        """Mutation caught: only the first of a type change's two sections kept (the markers added by the new
+        file vanish). The index is written directly: no symlink is created on disk."""
+        self.integration_with({"tests/test_link.py": TESTS})
+        git(self.repo_path, "update-index", "--cacheinfo", f"120000,{self.blob('target')},tests/test_link.py")
+        git(self.repo_path, "commit", "-q", "-m", "make it a link")
+        git(self.repo_path, "branch", "-f", INTEGRATION, "main")
+        git(self.repo_path, "update-index", "--cacheinfo", f"100644,{self.blob(TESTS + 'os._exit(0)')},tests/test_link.py")
+        git(self.repo_path, "commit", "-q", "-m", "back to a file with a marker")
+        git(self.repo_path, "branch", "-f", task_branch(1), "main")
+        git(self.repo_path, "reset", "-q", "--hard", INTEGRATION)
+        self.assertEqual([h.source for h in self.hard(task_branch(1))], ["test_markers"])
+
+    def test_submodule_log_setting_does_not_break_the_scan(self):
+        """Mutation caught: `diff.submodule=log` printing a section without a `diff --git` header (a gitlink
+        bumped under tests/), which made the section count wrong and the fallback raise."""
+        self.integration_with({"tests/test_old.py": TESTS})
+        git(self.repo_path, "config", "diff.submodule", "log")
+        git(self.repo_path, "checkout", "-q", "-b", "side", INTEGRATION)
+        git(self.repo_path, "update-index", "--add", "--cacheinfo", f"160000,{'3' * 40},tests/fixture")
+        self.commit_file("tests/test_old.py", TESTS + "os._exit(0)\n", "marker")
+        git(self.repo_path, "branch", "-f", task_branch(1), "side")
+        git(self.repo_path, "checkout", "-q", "main")
+        self.assertEqual([h.source for h in self.hard(task_branch(1))], ["test_markers"])
+
+    def test_surrogates_never_reach_a_hit(self):
+        """Mutation caught: a latin-1 line or a non-UTF-8 name read with surrogate escapes into a Hit, where the
+        journal's utf-8 encode raised (every verify of the task then crashed)."""
+        self.integration_with({"tests/test_old.py": TESTS})
+        path = self.tmp / "latin"
+        git(self.repo_path, "worktree", "add", "-q", "-b", task_branch(1), str(path), INTEGRATION)
+        (path / "tests" / "test_old.py").write_bytes(TESTS.encode("utf-8") + b"@unittest.skip('caf\xe9')\n")
+        git(path, "commit", "-q", "-am", "latin-1 skip")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        (hit,) = self.hard(task_branch(1))
+        self.assertEqual(hit.source, "test_markers")
+        hit.note.encode("utf-8")   # raises on a lone surrogate
+        hit.path.encode("utf-8")
+
+    def test_non_utf8_path_round_trips(self):
+        """Mutation caught: a path git prints that is not UTF-8 decoded lossily, so its own diff comes back
+        empty and the assertion and marker checks silently pass (Linux file systems only)."""
+        name = os.fsdecode(b"tests/test_\xff.py")
+        self.integration_with({})
+        try:
+            (self.repo_path / "tests").mkdir()
+            (self.repo_path / name).write_text(TESTS, encoding="utf-8", newline="\n")
+        except (OSError, UnicodeError):
+            self.skipTest("this file system cannot hold a non-UTF-8 name")
+        git(self.repo_path, "add", "-A")
+        git(self.repo_path, "commit", "-q", "-m", "odd name")
+        git(self.repo_path, "branch", "-f", INTEGRATION, "main")
+        path = self.tmp / "odd-task"
+        git(self.repo_path, "worktree", "add", "-q", "-b", task_branch(9), str(path), INTEGRATION)
+        (path / name).write_text("def test_a(self):\n    pass\nos._exit(0)\n", encoding="utf-8", newline="\n")
+        git(path, "commit", "-q", "-am", "gut it")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        hits = self.hard(task_branch(9))
+        self.assertEqual({h.source for h in hits}, {"test_assert_markers", "test_markers"})
+        for hit in hits:
+            hit.path.encode("utf-8")   # shown with U+FFFD, never a lone surrogate
 
     def test_marker_outside_test_paths_ignored(self):
         """Mutation caught: scanning every changed file (a `@skip` in product code is not a disabled test)."""
@@ -293,6 +424,27 @@ class BaseRecordTest(GuardCase):
         self.assertEqual(len(files), testguard.KEEP_IDS)
         self.assertEqual(testguard.base_ids(self.repo, f"{24:040x}"), frozenset({"t24"}))
 
+    def test_pruning_keeps_the_integration_tip(self):
+        """Mutation caught: the tip's file pruned once enough task verifies were written after it (the files are
+        aged explicitly: equal mtimes and sort order must not hide the bug)."""
+        tip = git(self.repo_path, "rev-parse", "HEAD")
+        git(self.repo_path, "branch", "-f", INTEGRATION, tip)
+        testguard.write_ids(self.repo, tip, frozenset({"keep"}))
+        old = self.repo.artel_dir / "verify-ids" / f"{tip}.txt"
+        os.utime(old, ns=(1_000_000_000, 1_000_000_000))   # the oldest file of all
+        for i in range(30):
+            testguard.write_ids(self.repo, f"{i + 1:040x}", frozenset({"x"}))
+        self.assertEqual(testguard.base_ids(self.repo, tip), frozenset({"keep"}))
+        self.assertEqual(len(list(old.parent.glob("*.txt"))), testguard.KEEP_IDS)
+
+    def test_existing_ids_file_never_replaced(self):
+        """Mutation caught: a second green record shrinking a sha's baseline (a verify that merged nothing)."""
+        sha = "2" * 40
+        testguard.write_ids(self.repo, sha, frozenset({"a", "b"}))
+        testguard.write_ids(self.repo, sha, frozenset({"a"}))
+        testguard.write_base(self.board, self.repo, sha=sha, green=True, at=1.0, log="", ids=frozenset({"z"}))
+        self.assertEqual(testguard.base_ids(self.repo, sha), frozenset({"a", "b"}))
+
     def test_read_base_ignores_garbage(self):
         """Mutation caught: a corrupt meta value crashing the runner instead of reading as `no record`."""
         self.assertIsNone(testguard.read_base(self.board))
@@ -310,8 +462,38 @@ class BaseRecordTest(GuardCase):
 class RequiredTest(unittest.TestCase):
     def test_required_tests_parsed(self):
         """Mutation caught: case-sensitive prefix, no stripping, duplicates kept, order lost."""
-        body = "Do it.\nTests: test_b, test_a\n  \ntests:  test_c ,test_a,\nTESTS:x\nnot Tests: here\n"
-        self.assertEqual(testguard.required_tests(body), ["test_b", "test_a", "test_c", "x"])
+        body = ("Do it.\nTests: test_b, test_a\n  \nTests:  test_c ,test_a,\r\nTests:\ttest_d,\ttest_e\t\r\n"
+                "tests: not_a_requirement\nTESTS: neither\nnot Tests: here\n")
+        self.assertEqual(testguard.required_tests(body), ["test_b", "test_a", "test_c", "test_d", "test_e"])
+
+    def test_required_tests_plan_style(self):
+        """Mutation caught: the plan's own style (`Tests:` with backticks and a remark) taken literally, so every
+        such task asks; `tests: none` becoming a requirement."""
+        body = 'Tests: `test_a` (the happy path), "test_b"\nTests: `test_c` (catches x, y), \u2014, `t.py::test_d[1]`\n'
+        self.assertEqual(testguard.required_tests(body), ["test_a", "test_b", "test_c", "t.py::test_d[1]"])
+        self.assertEqual(testguard.required_ignored(body), ["\u2014"])
+        self.assertEqual(testguard.required_tests("tests: none\n"), [])
+
+    def test_required_tests_bulleted_and_indented(self):
+        """Mutation caught: a `Tests:` line in a markdown list or an indented block ignored (the check fails open)."""
+        body = "Steps:\n- Tests: test_a\n  * Tests: test_b, test_c\n    Tests: test_d\n"
+        self.assertEqual(testguard.required_tests(body), ["test_a", "test_b", "test_c", "test_d"])
+        self.assertEqual(testguard.required_tests("see Tests: test_x\n"), [])
+
+    def test_required_name_matches_parametrized_id(self):
+        """Mutation caught: a pytest parameter suffix making a passed test look missing (fails closed)."""
+        self.assertEqual(testguard.missing_required(["test_x", "test_y"], {"t.py::test_x[1]", "a.B.test_y[a-b]"}), [])
+        self.assertEqual(testguard.missing_required(["test"], {"t.py::test_x[1]"}), ["test"])
+        self.assertEqual(testguard.missing_required(names=["test_z"], passed_ids={"t.py::test_x"}), ["test_z"])
+        self.assertEqual(testguard.missing_required(["test_x"], {"t.py::test_x[[1, 2]]", "t.py::test_y[a"}), [])
+        self.assertEqual(testguard.missing_required(["test_y"], {"t.py::test_y[a"}), [])   # `PASSED (\S+)` cut it
+
+    def test_required_item_punctuation_and_nested_remarks(self):
+        """Mutation caught: sentence punctuation or a nested remark leaving an unmeetable name (a false ask)."""
+        self.assertEqual(testguard.required_tests("Tests: test_a, test_b.\n"), ["test_a", "test_b"])
+        self.assertEqual(testguard.required_tests("Tests: test_a: the happy path\n"), ["test_a"])
+        self.assertEqual(testguard.required_tests("Tests: test_a (catches f(x), not g), test_c\n"),
+                         ["test_a", "test_c"])
 
     def test_no_tests_line_no_check(self):
         """Mutation caught: a task without a `Tests:` line getting a check."""

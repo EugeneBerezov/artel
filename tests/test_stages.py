@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from artel import agent_claude, board as B, config as C, journal, procs, protect, slots, stages, transitions
+from artel import agent_claude, board as B, config as C, journal, procs, protect, slots, stages, testguard, transitions
 from artel.agent_claude import RateLimit
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION, Repo
@@ -785,6 +785,18 @@ class ReviewTest(StagesCase):
         self.assertEqual(planned({"tests/test_b.py": "y = 1\n"}), (cheap, "models.review"))   # an addition is free
         self.assertEqual(planned({"tests/test_a.py": "x = 2\n"}, round=2),
                          (cheap, "closure check (models.review)"))
+
+    def test_plan_stage_scans_the_diff_once(self):
+        """Mutation caught: hard and soft hits each running their own `git diff` (T38 review F)."""
+        self.commit_file("tests/test_a.py", "x = 1\n", "base test")
+        git(self.repo_path, "branch", "-f", INTEGRATION, "main")
+        tid = self.task_in("reviewing", round=1)
+        self.make_branch(tid, "tests/test_a.py", "x = 2\n")
+        real = testguard.scan
+        with mock.patch.object(testguard, "scan", side_effect=real) as scan:
+            stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(scan.call_count, 1)
 
     def test_review_pass_goes_to_verifying(self):
         tid = self.review_task()

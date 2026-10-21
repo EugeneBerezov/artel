@@ -19,12 +19,12 @@ class Worktree:
     branch: str | None  # without refs/heads/
 
 
-def _run(args: list[str], cwd: Path, input: str | None = None, env: dict | None = None):
+def _run(args: list[str], cwd: Path, input: str | None = None, env: dict | None = None, errors: str = "replace"):
     try:
         # own process group / session, like agents, setup and verify: a Ctrl+C or group SIGTERM aimed at the runner
         # during a soft stop must not kill a running git
         return subprocess.run(["git", *args], cwd=cwd, capture_output=True, input=input, encoding="utf-8",
-                              errors="replace", env=env, **platform.popen_kwargs())
+                              errors=errors, env=env, **platform.popen_kwargs())
     except FileNotFoundError as exc:
         if Path(cwd).is_dir():   # the directory exists, so the executable is what is missing
             raise ArtelError("git not found on PATH") from exc
@@ -66,8 +66,11 @@ class Repo:
         return cls(root, common_dir)
 
     def git(self, *args: str, cwd: Path | None = None, check: bool = True,
-            input: str | None = None, env: dict | None = None) -> subprocess.CompletedProcess:
-        result = _run(list(args), cwd or self.root, input=input, env=env)
+            input: str | None = None, env: dict | None = None,
+            errors: str = "replace") -> subprocess.CompletedProcess:
+        """`errors`: how undecodable bytes in git's output are read; "surrogateescape" round-trips a path that is
+        not UTF-8 back into an argument."""
+        result = _run(list(args), cwd or self.root, input=input, env=env, errors=errors)
         if check and result.returncode != 0:
             raise GitError(list(args), result.stderr)
         return result

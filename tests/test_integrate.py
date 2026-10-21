@@ -1349,6 +1349,89 @@ class GuardGatesTest(IntegrateCase):
         self.assertNotEqual(late.base_sha, old)
         self.assertEqual(self.finish(other, late).to_state, "verified")    # no baseline for the new tip: check off
 
+    def test_existing_ids_file_never_replaced(self):
+        """Mutation caught: a verify that merged nothing (the branch is the tip) shrinking the tip's baseline
+        after its own gate fired; the next task would then compare with the smaller set and merge."""
+        self.commit_on_integration("ids.txt", ok_lines("a"))
+        tip = self.baseline("a", "b")
+        tid = self.board.insert_task(title="t", state="open", created_by="human")
+        git(self.repo_path, "branch", task_branch(tid), INTEGRATION)
+        task = self.board.get_task(tid)
+        self.assertTrue(self.board.update_task(tid, expect_state="open", expect_version=task.version,
+                                               state="verifying"))
+        result = self.verify(tid)
+        self.assertEqual(result.commit, tip)                                     # nothing of its own: commit == tip
+        self.assertEqual(self.finish(tid, result).to_state, "awaiting_accept")   # b is missing
+        self.assertEqual(testguard.base_ids(self.repo, tip), frozenset({"a (tests.t.A.a)", "b (tests.t.A.b)"}))
+        other = self.task_with_commit("verifying", "other.txt")
+        self.assertEqual(self.finish(other, self.verify(other)).to_state, "awaiting_accept")   # still asks
+
+    def test_empty_verify_does_not_journal_id_check_off(self):
+        """Mutation caught: `test-id check off` journaled for a verify that ran nothing (nothing to read ids from)."""
+        self.configure(**{"commands.verify": ""})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.finish(tid, self.verify(tid))
+        self.assertFalse(any(t.startswith("test-id check off") for t in self.verdicts()))
+
+    def test_flaky_verify_writes_its_ids(self):
+        """Mutation caught: ids written for `green` only (an accepted flaky task would integrate with no baseline)."""
+        flag = self.tmp / "flag"
+        self.configure(**{"commands.verify": py_cmd(
+            "import os, sys\n"
+            f"first = not os.path.exists({json.dumps(str(flag))})\n"
+            f"open({json.dumps(str(flag))}, 'w', encoding='utf-8').close()\n"
+            "print('a (tests.t.A.a) ... ok')\n"
+            "sys.exit(1 if first else 0)\n")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "green_flaky")
+        self.finish(tid, result)
+        self.assertEqual(testguard.base_ids(self.repo, result.commit), frozenset({"a (tests.t.A.a)"}))
+
+    def test_deciding_run_ids_are_the_last_green_runs(self):
+        """Mutation caught: the first run's ids checked (a strict task re-runs; the last green run decides)."""
+        counter = self.tmp / "runs"
+        self.configure(**{"commands.verify": py_cmd(
+            "import os\n"
+            f"p = {json.dumps(str(counter))}\n"
+            "n = (open(p, encoding='utf-8').read() if os.path.exists(p) else '') + 'x'\n"
+            "open(p, 'w', encoding='utf-8').write(n)\n"
+            "print('a (tests.t.A.a) ... ok')\n"
+            "if len(n) > 1: print('b (tests.t.A.b) ... ok')\n")})
+        self.baseline("a", "b")
+        tid = self.task_with_commit("verifying", "a.txt")
+        task = self.board.get_task(tid)
+        self.assertTrue(self.board.update_task(tid, expect_state="verifying", expect_version=task.version,
+                                               red_seen=True))
+        result = self.verify(tid)
+        self.assertEqual((result.kind, len(result.runs)), ("green", 2))
+        self.assertEqual(result.ids, frozenset({"a (tests.t.A.a)", "b (tests.t.A.b)"}))
+        self.assertEqual(self.finish(tid, result).to_state, "verified")
+
+    def test_gate_reasons_are_capped_at_three(self):
+        """Mutation caught: every reason listed (the VERDICT would pass the 400-byte limit) or a wrong count."""
+        for name in ("a", "b", "c", "d", "e"):
+            self.commit_on_integration(f"tests/test_{name}.py", "x = 1\n")
+        tid = self.task_with_commit("verifying", "a.txt")
+        path = self.temp_worktree(task_branch(tid))
+        for name in ("a", "b", "c", "d", "e"):
+            git(path, "rm", "-q", f"tests/test_{name}.py")
+        git(path, "commit", "-q", "-m", "drop all")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        tr = self.finish(tid, self.verify(tid))
+        self.assertIn("tests/test_a.py deleted; tests/test_b.py deleted; tests/test_c.py deleted; +2 more (test_paths)",
+                      tr.cause)
+        self.assertNotIn("test_d.py", tr.cause)
+
+    def test_tests_item_naming_no_test_is_noted(self):
+        """Mutation caught: an item with no name silently dropped (or kept as an unmeetable requirement)."""
+        tid = self.task_with_commit("verifying", "ids.txt", ok_lines("test_a"), body="Tests: `test_a`, \u2014\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "verified")                       # test_a passed; the dash is no requirement
+        facts = [e["text"] for e in self.entries("FACT")]
+        self.assertEqual(len(facts), 1)
+        self.assertIn("naming no test ignored", facts[0])
+
     def test_empty_verify_names_only_itself(self):
         """Mutation caught: an empty verify also reporting every baseline test as missing."""
         self.baseline("a", "b")

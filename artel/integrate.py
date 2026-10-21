@@ -287,6 +287,11 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
         if off:   # phase 1: the controller must see that the id rule did not run
             journal.append(board, "VERDICT", journal.truncate_utf8(off, journal.TEXT_LIMIT), author=_RUNNER,
                            task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
+        ignored = testguard.required_ignored(task.body) if result.kind in ("green", "green_flaky") else []
+        if ignored:   # a `Tests:` item that names no test is no requirement (spec §4); say so once per verify
+            note = "Tests: item(s) naming no test ignored: " + ", ".join(i[:40] for i in ignored[:3])
+            journal.append(board, "FACT", journal.truncate_utf8(note, journal.TEXT_LIMIT), author=_RUNNER,
+                           task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
         if result.kind in ("red", "timeout"):
             journal.append(board, "FAIL", journal.truncate_utf8(
                 f"verify {result.kind} ({result.detail}); log: {log}", journal.TEXT_LIMIT),
