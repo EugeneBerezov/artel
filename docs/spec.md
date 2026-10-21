@@ -533,8 +533,12 @@ Loop:
      so restarts do not reset the baseline) → pause `quota` until 24 h after
      the baseline sample; the notification states the date;
    - a limit hit without a reset time (e.g. an error result only, PD-40) →
-     pause `limit` until the latest future `resetsAt` already recorded for a
-     window; if none is known, **probe**: a minimal agent call on
+     take the recorded window with the highest last utilization (owner,
+     2026-10-21: the latest reset is in practice always the weekly one, which
+     paused a five-hour limit for days); if that utilization is at least 0.9
+     and its `resetsAt` is in the future, pause `limit` until that
+     `resetsAt`; a limit end already known for the pause is never replaced
+     by this guess; otherwise **probe**: a minimal agent call on
      `models.probe` (profile `probe`, §6: one turn, "reply OK", no tools, no
      schema, no slot, no task); the k-th probe of a pause runs k ×
      `limit_retry` after the previous one (the first after the pause began:
