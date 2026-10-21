@@ -3204,6 +3204,8 @@ Content requirements per section (§11): (1) three sentences + "when not to use 
 
 **Revision round 2 (owner D6/D7, PD-67; attack round 2 N5, N14, leaks M7):** `Entry` carries its `source` from the start and hits are `Hit` values, so the review reason and the VERDICT name the setting each hit came from; every `commands.setup_inputs` entry is a derived exact entry (source `commands.setup_inputs`); closure-kind reviews never escalate. The interface block below is already the round-2 form. `integrate.py` arrives here after Task 18 moved the base-conflict pause into `pauses`.
 
+**Also (controller review of T31, reviews/T31-ctl.md — three surviving mutations in `artel/stages.py`, tests in `tests/test_stages.py`):** `test_conflict_closure_review_uses_round1_range` (`review_closure=1` with a stale `fix_base` from an earlier verify fix → `diff_range` is the round-1 range, not `fix_base..artel/<id>` — catches `review_closure == 2` widened to truthy); `test_write_ready_no_commits_adds_no_ask` (a writer `ready` without commits → no ASK entry, task `open` via R17r — catches dropping `plan.stage == "fix"` from the ASK condition); `test_write_ready_no_commits_verdict_names_max_attempts` (below the cap the VERDICT text names `max_attempts` — catches dropping `ready_no_commits` from `_cause_verdict`).
+
 **Files:**
 - Create: `artel/protect.py`, `tests/test_protect.py`
 - Modify: `artel/stages.py` (`choose_model` escalation, `plan_stage` passes the hits), `tests/test_stages.py`

@@ -269,7 +269,7 @@ notifies; the human resolves the merge on `artel/integration` and runs
 | `FINDING` | reviewer, attacker | Defect with severity `blocker` / `major` / `minor`, basis, and status `open` / `closed` (closure set by a later review). |
 | `ASK` | runner | Question for the human, from a stage's `ask` outcome or after the last round. |
 | `ANSWER` | human | Answer to an `ASK`. |
-| `VERDICT` | runner | Stage result: `PASS`, `FINDINGS`, `READY`, `FAIL`. |
+| `VERDICT` | runner | Stage result: `PASS`, `FINDINGS`, `READY`, `FAIL`, `NOCHANGE` (a verify fix returned ready without a new commit; the task waits for a human). |
 | `DONE` | runner | Merged: integration commit, usage per stage. |
 
 Limits: `text` ≤ 400 bytes UTF-8, `basis` ≤ 200 bytes. Longer material goes
