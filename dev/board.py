@@ -777,9 +777,9 @@ def _missing_pinned_tests(main, source, plan_lines, branch):
     names = pinned_tests("\n".join(lines[lo - 1:hi]))
     if not names:
         return []
-    _, out = git(main, "grep", "-h", "-o", "-E", r"def test_\w+", branch,
+    _, out = git(main, "grep", "-h", "-E", r"^\s*(def test_\w+|test_\w+\s*=)", branch,
                  "--", "*.py")
-    defined = {line.split()[-1] for line in out.splitlines()}
+    defined = set(re.findall(r"^\s*(?:def )?(test_\w+)", out, re.M))   # defs and aliases
     _, out = git(main, "ls-tree", "-r", "--name-only", branch)
     defined |= {Path(p).stem for p in out.split()}
     _, out = git(main, "show", branch + ":artel/config_schema.py")

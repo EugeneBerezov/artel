@@ -620,6 +620,17 @@ class Integrate(TmpCase):
         cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A",
             expect=0)
 
+    def test_class_alias_counts_as_test(self):
+        # catches: `test_x = test_y` aliases (test_board.py, test_transitions.py) refused
+        self.pin_tests("test_alias")
+        self.start()
+        self.tests_branch("test_real", extra={"tests/test_two.py":
+                                              "import unittest\nclass U(unittest.TestCase):\n"
+                                              "    def test_y(self):\n        pass\n"
+                                              "    test_alias = test_y\n"})
+        cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A",
+            expect=0)
+
     def test_allow_missing_with_reason_is_journaled(self):
         self.pin_tests("test_alpha")
         self.start()
