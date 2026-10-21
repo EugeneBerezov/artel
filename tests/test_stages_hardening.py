@@ -49,7 +49,7 @@ class HardeningTest(StagesCase):
         plan, run, tr = self.go(tid)
         self.assertTrue(run.new_commits)
         self.assertFalse(run.merge_committed)   # a commit, but not the merge of integration
-        self.assertEqual(self.task(tid).state, "open")
+        self.assertEqual(self.task(tid).state, "fixing")   # R17f: retried in place (PD-63)
 
     def test_conflict_fix_committed_before_a_requeue_keeps_the_work(self):
         # catches: judging the merge against where THIS run started (a retry would delete the whole branch)
@@ -301,15 +301,17 @@ class Round2Test(StagesCase):
         return tid
 
     def test_reset_branch_closes_open_review_findings_as_superseded(self):
-        # PD-46: write -> review major -> fix ready without a commit -> R17 -> write -> review pass -> verifying
+        # PD-46: write -> review major -> fix ready without a commit -> R17g -> write -> review pass -> verifying
         tid = self.task_in("reviewing", round=1, with_commit=True)
         self.scenario({f"{tid}:review": [{"result": {"outcome": "findings", "summary": "s", "findings": [
             {"severity": "major", "text": "bug in deleted code", "basis": ""}]}}]})
         self.go(tid)
         self.assertEqual(self.task(tid).state, "fixing")
+        fixing = self.task(tid)   # one failed fix already: the next one spends the attempts and resets (R17g, PD-63)
+        self.board.update_task(tid, expect_state="fixing", expect_version=fixing.version, attempts=1)
         attack = journal.add_finding(self.board, task_id=tid, stage="attack", round=0, severity="major",
                                      text="about the task", basis="", author="agent:attack")
-        self.scenario({f"{tid}:fix": [{"result": READY}]})   # ready without a commit -> R17: branch reset
+        self.scenario({f"{tid}:fix": [{"result": READY}]})   # ready without a commit -> R17g: branch reset
         self.go(tid)
         task = self.task(tid)
         self.assertEqual(task.state, "open")
@@ -341,7 +343,7 @@ class Round2Test(StagesCase):
                                      {"result": READY}]})
         plan, run, tr = self.go(tid)
         self.assertFalse(run.merge_committed)   # the merged commit is in the branch but the work was dropped
-        self.assertEqual(self.task(tid).state, "open")
+        self.assertEqual(self.task(tid).state, "fixing")   # R17f: retried in place (PD-63)
 
     def test_denials_of_a_requeued_run_are_recorded(self):
         tid = self.task_in("writing", with_commit=True)

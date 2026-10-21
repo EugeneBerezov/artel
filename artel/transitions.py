@@ -27,23 +27,36 @@ class Limits:
     max_verify_fixes: int
     merge: str
     autoapprove: str
+    verify_reruns: int = 1
+    max_stage_runs: int = 12
+    max_branch_resets: int = 1
 
     @staticmethod
     def for_task(task: Task, *, max_attempts: int, review_rounds: int, max_verify_fixes: int,
-                 merge: str, autoapprove: str) -> "Limits":
+                 merge: str, autoapprove: str, verify_reruns: int = 1, max_stage_runs: int = 12,
+                 max_branch_resets: int = 1) -> "Limits":
+        """A task a human created keeps its own `merge` and `review_rounds`; one an agent created may only make
+        them stricter than the configuration (PD-65 c): it cannot loosen the gate that guards its own merge."""
+        own_rounds = review_rounds if task.review_rounds is None else task.review_rounds
+        if task.created_by == "human":
+            effective_merge = task.merge or merge
+        else:
+            effective_merge = "ask" if "ask" in (task.merge, merge) else merge
+            own_rounds = max(own_rounds, review_rounds)
         return Limits(
             max_attempts=max_attempts,
-            review_rounds=(review_rounds if task.review_rounds is None else task.review_rounds)
-            + task.extra_review_rounds,
+            review_rounds=own_rounds + task.extra_review_rounds,
             max_verify_fixes=max_verify_fixes + task.extra_verify_fixes,
-            merge=task.merge or merge,
-            autoapprove=autoapprove)
+            merge=effective_merge,
+            autoapprove=autoapprove,
+            verify_reruns=verify_reruns, max_stage_runs=max_stage_runs, max_branch_resets=max_branch_resets)
 
     @staticmethod
     def from_cfg(task: Task, cfg: Mapping[str, object]) -> "Limits":
         return Limits.for_task(task, max_attempts=cfg["max_attempts"], review_rounds=cfg["review_rounds"],
                                max_verify_fixes=cfg["max_verify_fixes"], merge=cfg["merge"],
-                               autoapprove=cfg["autoapprove"])
+                               autoapprove=cfg["autoapprove"], verify_reruns=cfg["verify_reruns"],
+                               max_stage_runs=cfg["max_stage_runs"], max_branch_resets=cfg["max_branch_resets"])
 
 
 @dataclass(frozen=True)
@@ -74,9 +87,9 @@ EVENTS = ("add_human", "add_agent", "pick", "vet_ok", "vet_risky", "vet_inadequa
           "reject", "attack_clear", "attack_blocker", "stage_failed", "ready", "ask",
           "setup_failed", "internal_error", "review_clear", "review_blocking", "answer", "rework",
           "verify_green", "verify_red", "verify_conflict", "accept", "ff_ok", "ff_impossible",
-          "ready_no_commits")
+          "ready_no_commits", "verify_green_flaky", "agent_unavailable", "due_at_cap")
 EFFECTS = ("delete_branch", "reset_branch", "terminate_running", "append_findings", "append_answer",
-           "ask_open_findings", "pause_setup_failed", "notify_internal_error")
+           "ask_open_findings", "pause_setup_failed", "notify_internal_error", "requeue")
 
 STAGE_STATES = ("vetting", "attacking", "writing", "reviewing", "fixing")
 JOB_STATES = STAGE_STATES + ("verifying",)
@@ -103,7 +116,7 @@ TABLE = (
     Row("R07b", ("attacking",), "attack_clear", "open", when=("then=open",), sets=("attempts=0", "then=none",),
         effects=("append_findings",)),
     Row("R08", ("proposed", "awaiting_approval", "rejected"), "approve", "open",
-        when=("approvable",), sets=("rejected_by=none",)),
+        when=("approvable",), sets=("rejected_by=none", "stage_runs=0")),
     Row("R09", LIVE, "reject", "rejected", sets=("rejected_by=human",),
         effects=("terminate_running", "delete_branch")),
     Row("R10a", ("open",), "pick", "attacking", when=("attack",)),
@@ -115,15 +128,22 @@ TABLE = (
         stuck_on_cap=True, cause="max_attempts"),
     Row("R14a", ("writing",), "ready", "reviewing", sets=("attempts=0", "round+1",)),
     Row("R14b", ("fixing",), "ready", "reviewing", when=("fix_kind=review",),
-        sets=("attempts=0", "round+1", "fix_kind=none")),
+        sets=("attempts=0", "round+1", "fix_kind=none", "review_closure=0")),    # not R29's closure kind
     Row("R15", ("fixing",), "ready", "reviewing", when=("fix_kind=verify",),
         sets=("fix_kind=none", "review_closure=2", "attempts=0")),   # PD-48: fix_base is kept
     Row("R16", ("fixing",), "ready", "reviewing", when=("fix_kind=conflict",),
         sets=("attempts=0", "fix_kind=none", "review_closure=1")),
-    Row("R17", ("writing", "fixing"), "stage_failed", "open",
+    Row("R17", ("writing",), "stage_failed", "open",
         sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0",
               "review_closure=0"),   # the reset branch gets a fresh first review, never a closure
         effects=("reset_branch",), stuck_on_cap=True, cause="max_attempts"),
+    Row("R17f", ("fixing",), "stage_failed", "=", when=("attempts_left",), sets=("attempts+1",),
+        cause="max_attempts"),                                                               # PD-63: retry in place
+    Row("R17g", ("fixing",), "stage_failed", "open", when=("attempts_spent", "resets_left"),
+        sets=("attempts=0", "resets+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0",
+              "review_closure=0"), effects=("reset_branch",), cause="max_branch_resets"),
+    Row("R17h", ("fixing",), "stage_failed", "stuck", when=("attempts_spent", "resets_spent"),
+        sets=("attempts+1", "stuck_from=fixing"), cause="max_branch_resets"),
     Row("R17r", ("writing",), "ready_no_commits", "open",
         sets=("attempts+1", "round=0", "verify_fixes=0", "fix_kind=none", "fix_base=none", "accepted=0",
               "review_closure=0"),
@@ -140,55 +160,62 @@ TABLE = (
     Row("R22b", ("reviewing",), "review_blocking", "blocked", when=("round>=rounds",),
         sets=("attempts=0", "asked_by=review", "cause=cap", "review_closure=0"), effects=("ask_open_findings",),
         cause="review_rounds"),
-    Row("R23", ("blocked",), "answer", "attacking", when=("asked_by=attack",), sets=("clear_ask",),
+    Row("R23", ("blocked",), "answer", "attacking", when=("asked_by=attack",), sets=("clear_ask", "stage_runs=0"),
         effects=("append_answer",)),
-    Row("R24", ("blocked",), "answer", "@asked", when=("asked_by=write|fix",), sets=("clear_ask",),
+    Row("R24", ("blocked",), "answer", "@asked", when=("asked_by=write|fix",), sets=("clear_ask", "stage_runs=0"),
         effects=("append_answer",)),
     Row("R25", ("blocked",), "answer", "reviewing", when=("asked_by=review", "cause=ask"),
-        sets=("clear_ask",), effects=("append_answer",)),
+        sets=("clear_ask", "stage_runs=0"), effects=("append_answer",)),
     Row("R26", ("blocked",), "answer", "fixing", when=("asked_by=review", "cause=cap"),
-        sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip"),
+        sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip", "stage_runs=0"),
         effects=("append_answer",)),
-    Row("R27", ("blocked",), "answer", "vetting", when=("asked_by=vet",), sets=("clear_ask",),
+    Row("R27", ("blocked",), "answer", "vetting", when=("asked_by=vet",), sets=("clear_ask", "stage_runs=0"),
         effects=("append_answer",)),
     Row("R28", ("blocked",), "answer", "fixing", when=("asked_by=verify", "cause=cap"),
-        sets=("fix_kind=verify", "extra_verify_fixes+1", "clear_ask", "fix_base=tip"),
+        sets=("fix_kind=verify", "extra_verify_fixes+1", "clear_ask", "fix_base=tip", "stage_runs=0"),
         effects=("append_answer",)),
     Row("R28a", ("blocked",), "answer", "fixing", when=("asked_by=verify", "cause=ask"),
-        sets=("fix_kind=verify", "clear_ask", "fix_base=tip"), effects=("append_answer",)),
+        sets=("fix_kind=verify", "clear_ask", "fix_base=tip", "stage_runs=0"), effects=("append_answer",)),
     Row("R29a", ("blocked",), "rework", "fixing", when=("has_branch",),
-        sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip"),
+        sets=("fix_kind=review", "extra_review_rounds+1", "clear_ask", "fix_base=tip", "stage_runs=0"),
         effects=("append_answer",)),
     Row("R29b", ("stuck",), "rework", "fixing", when=("has_branch",),
         sets=("fix_kind=review", "extra_review_rounds+1", "attempts=0", "stuck_from=none", "answered=1",
-              "fix_base=tip", "accepted=0"),
+              "fix_base=tip", "accepted=0", "resets=0", "stage_runs=0"),
         effects=("append_answer",)),
     Row("R30", ("stuck",), "rework", "@stuck_from", when=("no_branch", "stuck_from=vetting|attacking|writing"),
-        sets=("attempts=0", "stuck_from=none", "answered=1"), effects=("append_answer",)),
+        sets=("attempts=0", "resets=0", "stuck_from=none", "answered=1", "stage_runs=0"),   # spec §3.1: resets too
+        effects=("append_answer",)),
     Row("R31a", ("verifying",), "verify_green", "verified", when=("merge=auto|accepted",),
         sets=("attempts=0",), cause="merge"),
     Row("R31b", ("verifying",), "verify_green", "awaiting_accept", when=("merge=ask", "not_accepted"),
         cause="merge", sets=("attempts=0",)),
+    Row("R31c", ("verifying",), "verify_green_flaky", "awaiting_accept", sets=("flaky=1", "attempts=0")),
     Row("R32", ("verifying",), "verify_conflict", "fixing", when=("vfix<cap",),
-        sets=("attempts=0", "fix_kind=conflict", "verify_fixes+1", "accepted=0"), cause="max_verify_fixes"),
+        sets=("attempts=0", "fix_kind=conflict", "verify_fixes+1", "accepted=0", "fix_base=tip"),
+        cause="max_verify_fixes"),                                                          # PD-67: review the resolution
     Row("R33", ("verifying",), "verify_red", "fixing", when=("vfix<cap",),
-        sets=("attempts=0", "fix_kind=verify", "verify_fixes+1", "accepted=0", "fix_base=tip"), cause="max_verify_fixes"),
+        sets=("attempts=0", "fix_kind=verify", "verify_fixes+1", "accepted=0", "fix_base=tip", "red_seen=1"),
+        cause="max_verify_fixes"),
     Row("R34a", ("verifying",), "verify_red", "blocked", when=("vfix>=cap",),
-        sets=("attempts=0", "asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
+        sets=("attempts=0", "asked_by=verify", "cause=cap", "accepted=0", "red_seen=1"), cause="max_verify_fixes"),
     Row("R34b", ("verifying",), "verify_conflict", "blocked", when=("vfix>=cap",),
         sets=("attempts=0", "asked_by=verify", "cause=cap", "accepted=0"), cause="max_verify_fixes"),
-    Row("R35", ("awaiting_accept",), "accept", "verified", sets=("accepted=1",)),
+    Row("R35", ("awaiting_accept",), "accept", "verified", sets=("accepted=1", "flaky=0", "stage_runs=0")),
     Row("R35b", ("blocked",), "accept", "verifying", when=("asked_by=verify", "cause=ask"),
-        sets=("clear_ask", "fix_kind=none")),                                                # PD-62: no `accepted`
+        sets=("clear_ask", "fix_kind=none", "stage_runs=0")),                                # PD-62: no `accepted`
     Row("R36", ("verified",), "ff_ok", "done", effects=("delete_branch",)),
     Row("R37", ("verified",), "ff_impossible", "verifying"),
+    Row("R38", STAGE_STATES, "agent_unavailable", "=", effects=("requeue",)),                # no counter (PD-61)
+    Row("R39", STAGE_STATES, "due_at_cap", "stuck", when=("stage_runs_spent",), sets=("stuck_from=state",),
+        cause="max_stage_runs"),
 )
 
 _STAGE_OF_STATE = {"vetting": "vet", "attacking": "attack", "writing": "write", "reviewing": "review",
                    "fixing": "fix"}
 _STATE_OF_STAGE = {"write": "writing", "fix": "fixing"}
-_BOOL_COLUMNS = {"accepted", "risky", "answered"}
-_INT_COLUMNS = {"attempts", "round", "verify_fixes", "review_closure"}
+_BOOL_COLUMNS = {"accepted", "risky", "answered", "flaky", "red_seen"}
+_INT_COLUMNS = {"attempts", "round", "verify_fixes", "review_closure", "stage_runs", "resets"}
 
 
 class _Ctx:
@@ -233,6 +260,16 @@ def _guard(name: str, c: _Ctx) -> bool:
         return t.verify_fixes < c.limits.max_verify_fixes
     if name == "vfix>=cap":
         return t.verify_fixes >= c.limits.max_verify_fixes
+    if name == "attempts_left":
+        return t.attempts + 1 < c.limits.max_attempts
+    if name == "attempts_spent":
+        return t.attempts + 1 >= c.limits.max_attempts
+    if name == "resets_left":
+        return t.resets < c.limits.max_branch_resets
+    if name == "resets_spent":
+        return t.resets >= c.limits.max_branch_resets
+    if name == "stage_runs_spent":
+        return t.stage_runs >= c.limits.max_stage_runs
     key, sep, value = name.partition("=")
     if not sep:
         raise AssertionError(f"unknown guard {name!r}")   # table bug
@@ -261,6 +298,8 @@ def _update(spec: str, c: _Ctx) -> dict[str, object]:
         return {column: int(value)}
     if value == "none":
         return {column: None}
+    if value == "state":
+        return {column: t.state}
     if value == "tip":
         if c.tip is None:
             raise TransitionError(f"tip is required for {spec}")
@@ -300,6 +339,15 @@ def _cause(row: Row, c: _Ctx, stuck: bool, attempts: int | None) -> str:
     if row.cause == "review_rounds":
         op = "<" if t.round < c.limits.review_rounds else ">="
         return f"round {t.round} {op} review_rounds {c.limits.review_rounds}"
+    if row.cause == "max_branch_resets":
+        if row.rid == "R17g":
+            return (f"attempts {t.attempts + 1} >= max_attempts {c.limits.max_attempts}: branch reset "
+                    f"{t.resets + 1} of max_branch_resets {c.limits.max_branch_resets}")
+        return (f"fix failed {c.limits.max_attempts} times after {t.resets} branch reset(s) "
+                f"(max_branch_resets={c.limits.max_branch_resets})")
+    if row.cause == "max_stage_runs":
+        return (f"{t.stage_runs} agent runs since a human last moved the task "
+                f"(max_stage_runs={c.limits.max_stage_runs})")
     if row.cause == "max_verify_fixes":
         op = "<" if t.verify_fixes < c.limits.max_verify_fixes else ">="
         return f"verify_fixes {t.verify_fixes} {op} max_verify_fixes {c.limits.max_verify_fixes}"
@@ -324,7 +372,8 @@ def matching_rows(task: Task | None, event: str, limits: Limits | None, *, stage
 
 
 def decide(task: Task | None, event: str, limits: Limits | None, *, stage: str | None = None,
-           has_branch: bool | None = None, tip: str | None = None) -> Transition:
+           has_branch: bool | None = None, tip: str | None = None,
+           extra_sets: tuple[str, ...] = ()) -> Transition:
     if event not in EVENTS:
         raise TransitionError(f"unknown event: {event}")
     found = matching_rows(task, event, limits, stage=stage, has_branch=has_branch, tip=tip)
@@ -339,7 +388,7 @@ def decide(task: Task | None, event: str, limits: Limits | None, *, stage: str |
         return Transition(row.rid, event, None, row.to, {}, row.effects, "")
     c = _Ctx(task, limits, stage, has_branch, tip)
     updates: dict[str, object] = {}
-    for spec in row.sets:
+    for spec in (*row.sets, *extra_sets):   # the caller's sets come after the row's own (Task 37: "stage_runs+1")
         updates.update(_update(spec, c))
     to = _target(row, c)
     stuck = False
@@ -352,9 +401,10 @@ def decide(task: Task | None, event: str, limits: Limits | None, *, stage: str |
 
 
 def apply(board: Board, task_id: int, event: str, limits: Limits, *, stage: str | None = None,
-          has_branch: bool | None = None, tip: str | None = None) -> Transition:
+          has_branch: bool | None = None, tip: str | None = None,
+          extra_sets: tuple[str, ...] = ()) -> Transition:
     task = board.get_task(task_id)
-    tr = decide(task, event, limits, stage=stage, has_branch=has_branch, tip=tip)
+    tr = decide(task, event, limits, stage=stage, has_branch=has_branch, tip=tip, extra_sets=extra_sets)
     if not board.update_task(task_id, expect_state=task.state, expect_version=task.version,
                              state=tr.to_state, **tr.updates):
         raise StaleTask(f"task {task_id} changed under us ({event} from {task.state})")
