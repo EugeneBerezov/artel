@@ -396,14 +396,20 @@ protected path) only on **hard signals**:
   adds; comment lines (starting with `#`, `//`, `/*` or `*`) count on
   neither side, so commenting an assertion out is a removal;
 - an added line in a matching file that matches one of `test_markers`
-  (regexes): an unconditional skip, `.only(`, an added `xfail` or expected
-  failure, `os._exit` — conditional skips (`skipIf`, platform checks) and
-  `sys.exit` are ordinary test code and are not markers.
+  (regexes): an unconditional skip (`@skip` with or without arguments,
+  `pytest.mark.skip` also as `pytestmark`, `skipIf(True` / `skipUnless(False`),
+  `.only(`, an added `xfail` or expected failure, `os._exit` — conditional
+  skips (`skipIf`, platform checks), skip calls in a test body
+  (`skipTest`, `pytest.skip`, which are usually conditional) and `sys.exit`
+  are ordinary test code and are not markers; the id check catches a test
+  they turn off.
 - **required tests** (owner, 2026-10-21): the task text may name tests
-  the change must have, one or more lines starting with `Tests:` followed
-  by comma-separated names. A name is satisfied when a passed test id of
-  the task's verify equals it or ends with `.<name>` or `::<name>` (so
-  `test_retry_limit` matches `tests.test_net.Retry.test_retry_limit`). A
+  the change must have, one or more lines starting with `Tests:` (after
+  optional indentation and a `-` or `*` bullet) followed by comma-separated
+  names. A name is satisfied when a passed test id of the task's verify
+  equals it or ends with `.<name>` or `::<name>`, optionally followed by a
+  `[…]` parameter suffix (so `test_retry_limit` matches
+  `tests.test_net.Retry.test_retry_limit` and `t.py::test_retry_limit[2]`). A
   name that no passed id satisfies — missing, failing or skipped — is a
   hard signal; so is a task that names tests while its verify log yields
   no test ids at all (nothing can be confirmed). The writer's prompt
@@ -853,9 +859,9 @@ protected_paths = [".claude/", "CLAUDE.md", "CLAUDE.local.md", ".mcp.json", "art
                                   # + templates dir + setup_inputs + files in list-form setup/verify (§4)
 test_paths = ["tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
               "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*"]
-test_markers = ['^\s*@(unittest\.)?skip\(', '^\s*@pytest\.mark\.skip\b(?!if)', '\b(it|test|describe)\.skip\(',
-                '\bx(it|describe|test)\(', '\.only\(', 'pytest\.mark\.xfail', '\bxfail\(', '@(unittest\.)?expectedFailure',
-                'os\._exit\(']
+test_markers = ['^\s*@(unittest\.)?skip\b', '\bmark\.skip\b', '\bskip(If\(\s*True|Unless\(\s*False)\b',
+                '\b(it|test|describe)\.skip\(', '\bx(it|describe|test)\(', '\.only\(', 'pytest\.mark\.xfail',
+                '\bxfail\(', '@(unittest\.)?expectedFailure', 'os\._exit\(']
                                   # regexes on added lines of test_paths files → ask (§4); not conditional skips
 test_assert_markers = ["assert", "expect("]   # a test file losing more of these lines than it gains → ask
 verify_test_id_regex = ['^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$', '^PASSED (\S+)']
@@ -953,8 +959,11 @@ minutes. Sections:
    what it does not see (test configuration inside `package.json` or
    `pyproject.toml` unless listed in `test_paths`; weakening done purely by
    additions — an import-time monkeypatch in a new test file, a `load_tests`
-   or `conftest.py` hook that filters tests — is left to the reviewer, and
-   the verify command must print test ids for the id check), the night circuit
+   or `conftest.py` hook that filters tests, an early `return` in a test,
+   assertions wrapped in a string, a skip call in a test body — is left to
+   the id check and the reviewer; the verify command must print test ids
+   for the id check, and ids are read from the whole log, so a test that
+   prints a fake id line is outside the trust model), the night circuit
    breakers (§3.1 Pauses), `CLAUDE.md` rules that require human approval and how the
    unattended notice handles them, what the Telegram notifier sends. The
    **trust model**, stated plainly: agents, `setup` and `verify` run as the
