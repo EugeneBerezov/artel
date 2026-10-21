@@ -45,10 +45,14 @@ def merge_identity_args(repo: Repo) -> list[str]:
     return ["-c", "user.name=artel", "-c", "user.email=artel@localhost"]
 
 
+def clean_env() -> dict[str, str]:
+    """The environment without the variables that would redirect git to another repository."""
+    return {k: v for k, v in os.environ.items() if k not in _GIT_ENV}
+
+
 def _git(repo: Repo, *args: str, cwd: Path, check: bool = True):
     """Run git inside a slot with the repository-redirecting environment variables removed."""
-    env = {k: v for k, v in os.environ.items() if k not in _GIT_ENV}
-    return repo.git(*args, cwd=cwd, check=check, env=env)
+    return repo.git(*args, cwd=cwd, check=check, env=clean_env())
 
 
 def _slots_root(repo: Repo, cfg) -> Path:
@@ -221,6 +225,12 @@ def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
         _git(repo, "revert", "--quit", cwd=path, check=False)
     if state["MERGE_HEAD"]:
         _git(repo, "merge", "--abort", cwd=path, check=False)
+    clear = _git(repo, "ls-files", "-v", "-z", cwd=path).stdout   # skip-worktree / assume-unchanged hide edits
+    hidden = [e[2:] for e in clear.split("\0") if e and e[0] != "H"]
+    if hidden:
+        for flag in ("--no-skip-worktree", "--no-assume-unchanged"):   # one flag per call: two lose the first
+            repo.git("update-index", flag, "-z", "--stdin", cwd=path, input="\0".join(hidden) + "\0",
+                     env=clean_env())
     _git(repo, "reset", "--hard", cwd=path)
     excludes = [arg for pattern in keep for arg in ("-e", pattern)]
     _git(repo, "clean", "-ffdx", *excludes, cwd=path)
@@ -266,19 +276,24 @@ def _setup_outputs_key(n: int) -> str:
     return f"setup_outputs:{n}"
 
 
+def forget_setup(board, n: int) -> None:
+    """The slot's setup output is gone (or was never proven): setup runs again at its next stage."""
+    board.set_slot_setup_hash(n, None)
+    board.del_meta(_setup_outputs_key(n))
+
+
 def leave_slot(repo: Repo, board, cfg, n: int) -> None:
     path = guard(repo, board, cfg, n)
-    scrub(repo, path, cfg["slot_keep"])
-    _git(repo, "switch", "--detach", cwd=path)
     recorded = board.get_meta(_setup_outputs_key(n))
     if recorded is not None:
         try:
             outputs = json.loads(recorded)
         except ValueError:
             outputs = []
-        if any(not _kept(name, cfg["slot_keep"]) for name in outputs):   # PD-73: scrub just deleted setup output
-            board.set_slot_setup_hash(n, None)
-            board.del_meta(_setup_outputs_key(n))
+        if any(not _kept(name, cfg["slot_keep"]) for name in outputs):   # PD-73: the scrub deletes setup output;
+            forget_setup(board, n)                                       # forget first: a crash must not keep the hash
+    scrub(repo, path, cfg["slot_keep"])
+    _git(repo, "switch", "--detach", cwd=path)
 
 
 def setup_hash(path: Path, setup_cmd, inputs: Sequence[str]) -> str:
@@ -301,7 +316,8 @@ def setup_changed(path: Path, cfg, stored_hash: str | None) -> bool:
 
 def _untracked_tops(repo: Repo, path: Path) -> set[str]:
     """Top-level paths git shows as untracked or ignored: what a setup command can leave behind for a scrub."""
-    out = _git(repo, "status", "--porcelain=v1", "--ignored", "-z", cwd=path, check=False).stdout
+    out = _git(repo, "status", "--porcelain=v1", "--ignored", "--untracked-files=all", "-z", cwd=path,
+               check=False).stdout
     tops, skip = set(), False
     for entry in out.split("\0"):
         if skip:                  # the source path of a rename or copy

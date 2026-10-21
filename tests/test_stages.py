@@ -1247,9 +1247,6 @@ class NightGuardTest(StagesCase):
         workers = {r.id: r.workers for r in self.board.list_runs(tid)}
         self.assertEqual((workers[plan.run_id], workers[plan2.run_id]), (3, None))
 
-if __name__ == "__main__":
-    unittest.main()
-
 
 class RepoCheckStageTest(StagesCase):
     """PD-66, PD-67, PD-73, PD-74 around `run_stage`."""
@@ -1363,6 +1360,73 @@ class RepoCheckStageTest(StagesCase):
         plan, run, tr = self.go(tid)
         self.assertEqual((run.left_tracked, tr.event), (False, "review_clear"))
 
+    def attributes_scenario(self, tid):
+        target = str(self.repo.common_dir / "info" / "attributes")
+        self.scenario({f"{tid}:review": [{"write": [target, "* text\n"]}, self.PASS]})
+
+    def test_void_review_closes_no_finding(self):
+        """Mutation caught: a review that left tracked changes still closing ids and recording findings."""
+        tid = self.review_task(round=2)
+        found = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
+                                    text="open one", basis="", author="agent:review")
+        self.scenario({f"{tid}:review": [{"write": ["work.txt", "edited\n"]},
+                                         {"result": {"outcome": "pass", "summary": "fine", "closed": [found],
+                                                     "findings": [self.finding_dict()]}}]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.left_tracked)
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid)], [found])
+
+    def finding_dict(self):
+        return {"severity": "minor", "text": "a nit", "basis": "x"}
+
+    def test_lone_stage_with_shared_change_fails(self):
+        """Mutation caught: a shared-repository change tolerated when no other stage ran (it is the stage's)."""
+        tid = self.review_task()
+        self.attributes_scenario(tid)
+        plan, run, tr = self.go(tid)
+        self.assertEqual((tr.event, run.overlapped), ("stage_failed", ()))
+        self.assertFalse((self.repo.common_dir / "info" / "attributes").exists())
+        (fail,) = self.fail_entries(tid)
+        self.assertIn("file info/attributes created", fail)
+        self.assertIn("saved in artel/repo-changes/", fail)
+        saved = list((self.repo.artel_dir / "repo-changes").glob(f"*-T{tid}-review/info/attributes"))
+        self.assertEqual(len(saved), 1)
+        self.assertEqual(saved[0].read_bytes(), b"* text\n")
+
+    def test_overlapping_stages_report_without_failing(self):
+        """Mutation caught: charging a stage for a change another stage or setup may have made (owner decision):
+        it is reported and restored, the stage keeps its own outcome."""
+        tid = self.review_task()
+        self.attributes_scenario(tid)
+        plan, run, tr = self.go(tid, overlapping=lambda: [tid, 99])
+        self.assertEqual((tr.event, run.overlapped), ("review_clear", (99,)))
+        self.assertEqual(self.task(tid).state, "verifying")
+        self.assertFalse((self.repo.common_dir / "info" / "attributes").exists())
+        (fail,) = self.fail_entries(tid)
+        self.assertIn("stage not failed, overlapping: #99", fail)
+
+    def test_idle_slot_cleaned_by_the_check_loses_its_setup_hash(self):
+        """Mutation caught: an idle slot scrubbed of setup output keeping a hash that says setup is done."""
+        slots.ensure_slots(self.repo, self.board, self.cfg, 2)
+        other = slots.slot_path(self.repo, self.cfg, 2)
+        self.board.set_slot_setup_hash(2, "h")
+        tid = self.review_task()
+        self.scenario({f"{tid}:review": [{"write": [str(other / "stray.txt"), "x\n"]}, self.PASS]})
+        plan, run, tr = self.go(tid, idle_slots=lambda: [(2, other)], overlapping=lambda: [99])
+        self.assertEqual(run.repo_changes, ("idle slot 2 changed",))
+        self.assertIsNone([s for s in self.board.list_slots() if s.n == 2][0].setup_hash)
+        self.assertFalse((other / "stray.txt").exists())
+
+    def test_mutation_check_not_in_a_closure_round_even_with_the_placeholder(self):
+        """Mutation caught: the check asked in a closure round when a project template carries `$mutation_check`."""
+        self.configure(**{"commands.project_tools": ["Bash(python3 -m unittest *)"]})
+        from artel import templates
+        path = templates.project_path(self.repo, self.cfg, "review-closure.md")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("closure $diff_range\n$mutation_check\nend\n", encoding="utf-8", newline="\n")
+        tid = self.review_task(risky=True, round=2)
+        self.assertNotIn("Mutation check", self.plan(tid).prompt)
+
     def test_closure_list_filled_for_every_closure_template(self):
         """Mutation caught: the open findings listed for review-closure.md only (the conflict and verify-fix
         reviews then close nothing)."""
@@ -1428,3 +1492,7 @@ class RepoCheckStageTest(StagesCase):
         plan, run, tr = self.go(tid, extra_time=lambda: 2.0)
         self.assertFalse(run.timed_out)
         self.assertEqual(tr.event, "review_clear")
+
+
+if __name__ == "__main__":
+    unittest.main()

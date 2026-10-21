@@ -90,7 +90,8 @@ class Runner:
         self.notify_kill = notify_kill
         self.board: Board | None = None
         self.jobs: list[Job] = []
-        self.activity: dict[int, float] = {}           # PD-66: when the runner last started or ended a job of a task
+        self.activity: dict[int, float] = {}           # PD-66: when the runner last started, ended or moved a task
+        self.stage_activity: dict[int, float] = {}     # ... an agent stage, setup or verify job (0: the base job)
         self._rate_events: queue.SimpleQueue = queue.SimpleQueue()   # RateLimit events from worker threads
         self._setup_lifted_at: float = 0.0             # the last timed lift: only a stage started after it proves setup
         self._setup_outage: dict | None = None         # PD-31: the setup_failed outage a timed retry goes on with
@@ -790,10 +791,31 @@ class Runner:
             job.version = self.board.get_task(task_id).version
         job.thread = threading.Thread(target=body, name=f"artel-{kind}-{task_id}", daemon=True)
         self.jobs.append(job)
-        if task_id is not None:
-            self.activity[task_id] = self.clock()
+        self._touch(job)
         job.thread.start()
         return job
+
+    def _touch(self, job: Job) -> None:
+        now = self.clock()
+        if job.task_id is not None:
+            self.activity[job.task_id] = now
+        if job.kind in ("stage", "verify", "base"):
+            self.stage_activity[job.task_id or 0] = now
+
+    def _skip_refs(self, job: Job, started: float) -> set[str]:
+        """Branches of other tasks the runner touched since `started` or that have a job: not the stage's doing.
+        The stage's own task is never in it (its branch is the stage's to move, and only for a writer)."""
+        tasks = {t for t, at in list(self.activity.items()) if at >= started}
+        tasks |= {j.task_id for j in list(self.jobs) if j.task_id is not None}
+        tasks.discard(job.task_id)
+        return {f"refs/heads/{task_branch(t)}" for t in tasks}
+
+    def _touch_requested(self) -> None:
+        """A request may move or delete the branch of its task: stamp it before the git effect (PD-66 N1)."""
+        now = self.clock()
+        for request in self.board.pending_requests():
+            if request.task_id is not None:
+                self.activity[request.task_id] = now
 
     def _leave_quietly(self, board: Board | None, slot: int) -> None:
         if board is None:
@@ -826,12 +848,16 @@ class Runner:
         started = self.clock()
 
         def skip_refs() -> set[str]:   # the branches the runner itself touched during the stage (PD-66)
-            tasks = {t for t, at in list(self.activity.items()) if at >= started}
-            tasks |= {j.task_id for j in list(self.jobs) if j.task_id is not None}
-            tasks.discard(job.task_id)
-            return {f"refs/heads/{task_branch(t)}" for t in tasks}
+            return self._skip_refs(job, started)
+
+        def overlapping() -> set[int]:   # other agent stages, setups and verify jobs during this stage
+            others = {t for t, at in list(self.stage_activity.items()) if at >= started}
+            others |= {j.task_id or 0 for j in list(self.jobs) if j is not job and j.kind in ("stage", "verify", "base")}
+            others.discard(job.task_id)
+            return others
         run = stages.run_stage(self.repo, board, self.cfg, plan, job.slot, on_start=self._on_start(board, job),
-                               on_rate_limit=self.on_rate_limit, stop_event=job.stop, skip_refs=skip_refs)
+                               on_rate_limit=self.on_rate_limit, stop_event=job.stop, skip_refs=skip_refs,
+                               overlapping=overlapping)
         return plan, run
 
     def _verify_work(self, board: Board, job: Job, queued_at: float | None = None):
@@ -888,7 +914,9 @@ class Runner:
     def _apply_requests(self) -> None:
         self._announced = set(pauses.active(self.board))   # kinds whose `paused` the human has already been sent
         try:
+            self._touch_requested()
             requests.apply_pending(self.repo, self.board, self.cfg, self, now=self.clock())
+            self._touch_requested()
             for kind in pauses.active(self.board):   # `artel pause`: every pause notifies (§3.1)
                 if kind not in self._announced:
                     self._notify_paused(kind)
@@ -940,16 +968,14 @@ class Runner:
             if job.finished:
                 job.thread.join(1.0)   # its work is over: collect it now, not one poll_interval later
         for job in [j for j in self.jobs if not j.thread.is_alive()]:
+            self._touch(job)   # before it leaves `jobs`: no moment where its branch is neither live nor stamped
             self.jobs.remove(job)
-            if job.task_id is not None:
-                self.activity[job.task_id] = self.clock()
             try:
                 self._finish(job)
             except Exception:   # noqa: BLE001 - one task's bookkeeping must not stop the runner
                 tail = traceback.format_exc()
                 self._guarded("finishing a job", lambda: self._finish_failed(job, tail))
-            if job.task_id is not None:   # its git effects (integrate, branch delete) ran in `_finish`
-                self.activity[job.task_id] = self.clock()
+            self._touch(job)   # its git effects (integrate, branch delete) ran in `_finish`
 
     def _clear_orphans(self) -> None:
         """T22 controller review a: a task marked running with no job of this runner (its result could not be applied

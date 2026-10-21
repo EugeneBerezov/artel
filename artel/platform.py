@@ -130,6 +130,16 @@ if IS_WINDOWS:
                     ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
 
 
+def file_mode(path: Path) -> int | None:
+    """The permission bits of a file, or None where they mean nothing (Windows)."""
+    return None if IS_WINDOWS else stat.S_IMODE(Path(path).stat().st_mode)
+
+
+def set_file_mode(path: Path, mode: int | None) -> None:
+    if mode is not None and not IS_WINDOWS:
+        os.chmod(path, mode)
+
+
 def popen_kwargs() -> dict:
     if IS_WINDOWS:
         return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}

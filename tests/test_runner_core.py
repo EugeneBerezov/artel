@@ -149,6 +149,126 @@ class RunnerCoreTest(E2ECase):
         self.assertLess(max(w[2] for w in writes), min(w[3] for w in writes))   # the two writers overlapped
         self.assertSlotsCleanAndDetached()
 
+    def shared_repo_fails(self, tid):
+        return [e.text for e in journal.task_entries(self.board, tid)
+                if e.kind == "FAIL" and "changed the shared repository" in e.text]
+
+    def test_another_tasks_integration_during_a_stage_is_not_a_change(self):
+        """Mutation caught (M27b): no activity stamp when a job is collected / before it leaves `jobs` — task A is
+        integrated and its branch deleted while B's stage runs, and B is failed and A's branch recreated."""
+        a = self.add_task("A", area=["a"])
+        b = self.add_task("B", area=["b"])
+        slow = [{"sleep": 4.0}, {"write": ["b.txt", "x\n"]}, {"commit": "b"},
+                {"result": {"outcome": "ready", "summary": "done"}}]
+        self.scenario({f"{a}:write": [{"write": ["a.txt", "x\n"]}, {"commit": "a"},
+                                      {"result": {"outcome": "ready", "summary": "done"}}],
+                       f"{b}:write": slow, "review": PASS})
+        r = self.runner(max_agents=2)
+        r.start()
+        try:
+            self.drive(r, lambda: all(self.board.get_task(t).state == "done" for t in (a, b)), timeout=90)
+        finally:
+            r.shutdown()
+        self.assertEqual(self.shared_repo_fails(b), [])
+        self.assertFalse(self.repo.branch_exists(f"artel/{a}"))   # and it was not recreated
+
+    def test_reject_during_other_stage_is_not_a_change(self):
+        """Mutation caught: a request-driven branch delete missing from the runner's record (`artel reject` of one
+        task fails another task's stage and recreates the rejected branch). Also M32: the own branch must not
+        be in its own skip_refs (the second half: a reviewer that commits is caught)."""
+        a = self.add_task("A", area=["a"])
+        b = self.add_task("B", area=["b"])
+        ask = [{"write": ["a.txt", "x\n"]}, {"commit": "a"},
+               {"result": {"outcome": "ask", "summary": "s", "question": "q?"}}]
+        slow = [{"sleep": 4.0}, {"write": ["b.txt", "x\n"]}, {"commit": "b"},
+                {"result": {"outcome": "ready", "summary": "done"}}]
+        self.scenario({f"{a}:write": ask, f"{b}:write": slow, "review": PASS})
+        r = self.runner(max_agents=2)
+        r.start()
+        try:
+            self.drive(r, lambda: self.board.get_task(a).state == "blocked")
+            requests.enqueue(self.repo, self.board, "reject", a, {})
+            self.drive(r, lambda: self.board.get_task(a).state == "rejected" and
+                       self.board.get_task(b).state == "done", timeout=90)
+        finally:
+            r.shutdown()
+        self.assertEqual(self.shared_repo_fails(b), [])
+        self.assertFalse(self.repo.branch_exists(f"artel/{a}"))
+
+    def test_reviewer_commit_on_its_own_branch_is_caught_through_the_runner(self):
+        """Mutation caught (M32): `tasks.discard(job.task_id)` removed — the own branch is in its own skip_refs and a
+        reviewer's commit passes unnoticed."""
+        tid = self.add_task("A")
+        self.scenario({"write": WRITE, "review": [{"write": ["extra.txt", "x\n"]}, {"commit": "sneaky"},
+                                                  *PASS]})
+        r = self.runner(max_agents=1)
+        r.start()
+        try:
+            self.drive(r, lambda: bool(self.shared_repo_fails(tid)), timeout=40)
+        finally:
+            r.shutdown()
+        self.assertIn("review changed the shared repository", self.shared_repo_fails(tid)[0])
+
+    def test_skip_refs_never_holds_the_stages_own_branch(self):
+        """Mutation caught (M32): `tasks.discard(job.task_id)` removed — the own branch would be in its own
+        skip_refs; and other live jobs' and recently touched tasks' branches must be in it."""
+        r = self.runner(max_agents=1)
+        gone = threading.Thread(target=lambda: None)
+        gone.start()
+        gone.join()
+        own = Job("stage", 7, 1, gone, threading.Event())
+        r.jobs = [own, Job("stage", 8, 2, gone, threading.Event())]
+        r.activity = {7: 5.0, 9: 5.0, 10: 1.0}
+        self.assertEqual(r._skip_refs(own, 4.0), {"refs/heads/artel/8", "refs/heads/artel/9"})
+
+    def test_requests_are_stamped_before_they_are_applied(self):
+        """Mutation caught: `_touch_requested` missing (a request that deletes a branch is a foreign change to the
+        stage that is running)."""
+        tid = self.add_task("A")
+        requests.enqueue(self.repo, self.board, "reject", tid, {})
+        r = self.runner(max_agents=1)
+        r.board = runner_module.open_board(self.repo.board_path)
+        self.addCleanup(r.board.close)
+        seen = []
+        with mock.patch.object(requests, "apply_pending", side_effect=lambda *a, **k: seen.append(dict(r.activity))):
+            r._apply_requests()
+        self.assertIn(tid, seen[0])
+
+    def test_activity_is_stamped_again_after_the_jobs_effects(self):
+        """Mutation caught: the stamp written before `_finish` only (a stage that starts meanwhile sees the
+        integrated task's branch deleted as foreign)."""
+        r = self.runner(max_agents=1)
+        ticks = iter(range(1, 100))
+        r.clock = lambda: float(next(ticks))
+        gone = threading.Thread(target=lambda: None)
+        gone.start()
+        gone.join()
+        r.jobs = [Job("stage", 7, 1, gone, threading.Event(), finished=True)]
+        last = []
+        with mock.patch.object(r, "_finish", side_effect=lambda job: last.append(r.clock())):
+            r._collect()
+        self.assertGreater(r.activity[7], last[0])
+
+    def test_collect_stamps_activity_before_the_job_leaves_jobs(self):
+        """Mutation caught (M27b): the stamp written after `jobs.remove` (a concurrent stage's skip_refs sees the
+        task neither live nor stamped)."""
+        r = self.runner(max_agents=1)
+        seen = []
+
+        class Jobs(list):
+            def remove(inner, job):
+                seen.append(r.activity.get(job.task_id))
+                super().remove(job)
+
+        done = threading.Thread(target=lambda: None)
+        done.start()
+        done.join()
+        r.jobs = Jobs([Job("stage", 7, 1, done, threading.Event(), finished=True)])
+        with mock.patch.object(r, "_finish"):
+            r._collect()
+        self.assertEqual(len(seen), 1)
+        self.assertIsNotNone(seen[0])
+
     def test_overlapping_areas_never_run_together(self):
         def work(name):
             return [{"sleep": 0.5}, {"write": [name, "x\n"]}, {"commit": f"work {name}"},
