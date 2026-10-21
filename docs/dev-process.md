@@ -50,8 +50,13 @@ given in the first message (`You are s1`). Loop:
    them for child processes). Then
    `python3 dev/board.py integrate <id> --branch dev/T<id> --session <S>` — merges into
    `main`, runs the suite, pushes (standing permission: `main` only, never
-   force). The task is now `review(...)`: dependents stay blocked until the
-   other session passes the cross-review.
+   force). It refuses a branch that lacks a test the task's plan section
+   names (`` `test_*` `` in backticks; test modules and setting names such
+   as `test_paths` do not count): write it, or — when the plan names a test
+   that is not yours to write (replaced, renamed, another task's) — add
+   `--allow-missing NAME[,NAME] --reason "<why>"`, which is journaled for
+   the reviewer. The task is now `review(...)`: dependents stay blocked
+   until the other session passes the cross-review.
 7. `python3 dev/board.py ci --sha <merge sha>` — the CI matrix (Linux, macOS,
    Windows). Wait for the result. Red → `python3 dev/board.py reopen <id>
    --reason "<job, test, cause>" --session <S>` and fix it as the same task.

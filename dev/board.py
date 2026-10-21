@@ -758,6 +758,33 @@ def _terminate(signum, frame):
 
 # Only the controller changes these, by pushing to main directly (docs/dev-process.md).
 CONTROLLER_DOCS = ("docs/spec.md", "docs/plan.md")
+PINNED_TEST = re.compile(r"`(test_\w+)`")
+
+
+def pinned_tests(text):
+    """Test names a plan section pins: `test_*` in backticks."""
+    return sorted(set(PINNED_TEST.findall(text)))
+
+
+def _missing_pinned_tests(main, source, plan_lines, branch):
+    """Pinned names with no `def <name>` on the branch. Names that are
+    test modules or settings (`test_paths`, `test_markers`) are not tests."""
+    lo, hi = plan_lines
+    try:
+        lines = (Path(main) / source).read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    names = pinned_tests("\n".join(lines[lo - 1:hi]))
+    if not names:
+        return []
+    _, out = git(main, "grep", "-h", "-o", "-E", r"def test_\w+", branch,
+                 "--", "*.py")
+    defined = {line.split()[-1] for line in out.splitlines()}
+    _, out = git(main, "ls-tree", "-r", "--name-only", branch)
+    defined |= {Path(p).stem for p in out.split()}
+    _, out = git(main, "show", branch + ":artel/config_schema.py")
+    defined |= set(re.findall(r'_s\("(\w+)"', out))
+    return [n for n in names if n not in defined]
 
 
 def cmd_integrate(args):
@@ -767,7 +794,8 @@ def cmd_integrate(args):
     # TEST_TIMEOUT: the board lock is only taken for the bookkeeping.
     with store.lock("integrate.lock"):
         with store.lock():
-            task = find_task(store.load(), args.id)
+            board = store.load()
+            task = find_task(board, args.id)
             if task["state"] == "done":
                 raise BoardError("T%d is already done" % args.id)
             if task["state"] != "claimed" or task["session"] != session:
@@ -775,6 +803,7 @@ def cmd_integrate(args):
                                  "%s)" % (args.id, session, task["state"],
                                           task["session"] or "-"))
             title = task["title"]
+            source, plan_lines = board["source"], task["plan_lines"]
         main = main_worktree(args.repo)
         rc, out = git(main, "symbolic-ref", "--short", "-q", "HEAD")
         if rc != 0 or out.strip() != MAIN_BRANCH:
@@ -800,6 +829,18 @@ def cmd_integrate(args):
                 "edits). Drop the change: git checkout $(git merge-base main HEAD) "
                 "-- %s, commit, integrate again; a real gap is a SPEC-GAP note"
                 % (args.branch, ", ".join(touched), " ".join(touched)))
+        missing = _missing_pinned_tests(main, source, plan_lines, args.branch)
+        allowed = set(filter(None, (args.allow_missing or "").split(",")))
+        unexplained = [n for n in missing if n not in allowed]
+        if unexplained:
+            raise BoardError(
+                "%s lacks tests the plan pins for T%d: %s. Write them, or, when the "
+                "plan names a test that is not yours to write (renamed, replaced, "
+                "another task's), integrate with --allow-missing NAME[,NAME] "
+                "--reason TEXT (journaled)"
+                % (args.branch, args.id, ", ".join(unexplained)))
+        if allowed and not args.reason:
+            raise BoardError("--allow-missing needs --reason")
         rc, head = git(main, "rev-parse", "HEAD")
         head = head.strip()
 
@@ -824,6 +865,10 @@ def cmd_integrate(args):
             store.save(board)
             store.journal(session, "DONE", args.id,
                           "merged %s into main" % args.branch, basis=sha)
+            if allowed:
+                store.journal(session, "FACT", args.id,
+                              "pinned tests not written: %s (%s)"
+                              % (", ".join(sorted(allowed)), args.reason))
     print(sha)
     return 0
 
@@ -1009,6 +1054,9 @@ def build_parser():
     s.add_argument("id", type=int)
     s.add_argument("--branch", required=True)
     s.add_argument("--session", required=True)
+    s.add_argument("--allow-missing", metavar="NAMES",
+                   help="pinned test names knowingly not written (comma list)")
+    s.add_argument("--reason", help="why, for --allow-missing (journaled)")
     s.set_defaults(fn=cmd_integrate)
 
     s = sub.add_parser("ci", help="GitHub Actions result for main")

@@ -579,6 +579,77 @@ class Integrate(TmpCase):
         self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
         self.assertEqual(self.tasks()[1]["state"], "claimed")
 
+    def pin_tests(self, *names):
+        plan = self.repo / "docs" / "plan.md"
+        plan.write_text(plan.read_text().replace(
+            "- Create: `a.py`", "- Create: `a.py`\n- Tests: "
+            + ", ".join("`%s`" % n for n in names)))
+        git(self.repo, "commit", "-qam", "pin tests")
+        git(self.repo, "push", "-q", "origin", "main")
+
+    def tests_branch(self, *defs, extra=None):
+        git(self.repo, "checkout", "-b", "dev/T1")
+        files = {"tests/test_one.py": "import unittest\nclass T(unittest.TestCase):\n"
+                 + "".join("    def %s(self):\n        pass\n" % d
+                           for d in defs or ["test_other"])}
+        files.update(extra or {})
+        for name, text in files.items():
+            (self.repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (self.repo / name).write_text(text)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "tests")
+        git(self.repo, "checkout", "main")
+
+    def test_missing_pinned_test_is_refused(self):
+        # catches: a plan-pinned test silently not written (T36 dropped one)
+        self.pin_tests("test_alpha", "test_beta")
+        self.start()
+        self.tests_branch("test_alpha")
+        head = git(self.repo, "rev-parse", "HEAD")
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("test_beta", r.stdout + r.stderr)
+        self.assertNotIn("test_alpha,", r.stdout + r.stderr)
+        self.assertEqual(git(self.repo, "rev-parse", "HEAD"), head)
+        self.assertEqual(self.tasks()[1]["state"], "claimed")
+
+    def test_pinned_tests_present_integrate(self):
+        self.pin_tests("test_alpha")
+        self.start()
+        self.tests_branch("test_alpha")
+        cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A",
+            expect=0)
+
+    def test_allow_missing_with_reason_is_journaled(self):
+        self.pin_tests("test_alpha")
+        self.start()
+        self.tests_branch()
+        cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A",
+            "--allow-missing", "test_alpha", "--reason", "renamed to test_a",
+            expect=0)
+        journal = (self.store() / "journal.md").read_text()
+        self.assertIn("pinned tests not written: test_alpha (renamed to test_a)",
+                      journal)
+
+    def test_allow_missing_needs_reason(self):
+        self.pin_tests("test_alpha")
+        self.start()
+        self.tests_branch()
+        r = cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A",
+                "--allow-missing", "test_alpha")
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("--reason", r.stdout + r.stderr)
+        self.assertEqual(self.tasks()[1]["state"], "claimed")
+
+    def test_module_and_setting_names_are_not_tests(self):
+        # catches: `test_paths` (a setting) or `test_one` (a module) demanded as tests
+        self.pin_tests("test_one", "test_paths")
+        self.start()
+        self.tests_branch(extra={"artel/config_schema.py":
+                                 '_s("test_paths", "str_list", [], "x")\n'})
+        cli(self.repo, "integrate", "1", "--branch", "dev/T1", "--session", "A",
+            expect=0)
+
     def test_conflict_rolls_back(self):
         self.start()
         self.branch_with("dev/T1", "base.txt", "branch side\n")
