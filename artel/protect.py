@@ -58,7 +58,7 @@ def _repo_relative(repo: Repo, arg: str) -> str | None:
 def _is_blob(repo: Repo, tip: str, path: str) -> bool:
     """True for a regular file at `tip`. `ls-tree` prints nothing for a missing path, `tree` for a directory and
     `commit` for a submodule (its object is not in this repository); any git failure raises GitError."""
-    listed = repo.git("ls-tree", tip, "--", path)
+    listed = repo.git("--literal-pathspecs", "ls-tree", tip, "--", path)   # `:!x` in an argument is no magic
     fields = listed.stdout.split(None, 2)
     return len(fields) >= 2 and fields[1] == "blob"
 
@@ -125,8 +125,9 @@ def hits(repo: Repo, cfg, tip: str) -> list[Hit]:
                     out.append(Hit(path, entry.source))
                     break
         return out
-    except GitError:
-        return [Hit(GIT_ERROR, "protected_paths", "git failed while looking for protected paths")]
+    except GitError as e:
+        why = next((line.strip() for line in e.stderr.splitlines() if line.strip()), "no message")
+        return [Hit(GIT_ERROR, "protected_paths", f"git failed while looking for protected paths: {why}")]
 
 
 def summary(hits: Sequence[Hit]) -> str:

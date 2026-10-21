@@ -100,15 +100,28 @@ def _verify_command(cfg, repo: Repo, path: Path, *, log_path: Path, env, on_star
     return "red", f"exit {result.returncode}", result.returncode
 
 
+def _mark_red_seen(board, task_id: int) -> None:
+    """red_seen=1 as soon as a verify run came back red (PD-72), whatever the job's end. A task that moved on
+    (rejected, terminated) needs no flag."""
+    for _ in range(3):
+        cur = board.get_task(task_id)
+        if cur.red_seen or board.update_task(task_id, expect_state=cur.state, expect_version=cur.version,
+                                             red_seen=True):
+            return
+
+
 def _verify_job(repo: Repo, board, cfg, task: Task, slot_n: int, path: Path, commit: str, *, env, on_start,
                 stop_event, queued_at) -> VerifyResult:
     """Run commands.verify, and again after a red run (spec §5 step 7): the same merged tree, no setup, each run
     under its own heavy_lock, one `runs` row each. Green on a rerun is flaky. A task that has been red before
     (`red_seen`, PD-72) needs every one of its 1 + verify_reruns runs green."""
     total = 1 + cfg["verify_reruns"]
+    strict = task.red_seen
     runs: list[VerifyRun] = []
     detail = ""
-    for _ in range(total):
+    for i in range(total):
+        if i and stop_event is not None and stop_event.is_set():   # no process, no lock for a stopped rerun
+            return VerifyResult("stopped", None, runs[-1].log_path, "stopped before a rerun", tuple(runs))
         n = 1 + sum(1 for r in board.list_runs(task.id) if r.stage == "verify")
         log_path = repo.logs_dir / str(task.id) / f"verify-{n}.log"
         run = board.start_run(task_id=task.id, stage="verify", round=task.round, model=None, model_reason=None,
@@ -120,15 +133,17 @@ def _verify_job(repo: Repo, board, cfg, task: Task, slot_n: int, path: Path, com
                                                  stop_event=stop_event)
         finally:
             outcome = "red" if kind == "not_started" else kind
+            duration_ms = int((time.monotonic() - started) * 1000)
             board.finish_run(run.id, outcome=outcome, usage={}, exit_code=code, timed_out=kind == "timeout",
-                             killed=kind in ("timeout", "stopped"),
-                             duration_ms=int((time.monotonic() - started) * 1000))
-        runs.append(VerifyRun(outcome, int((time.monotonic() - started) * 1000), log_path))
+                             killed=kind in ("timeout", "stopped"), duration_ms=duration_ms)
+            if outcome == "red":   # persist the evidence now: a stop, an error or a crash in the rerun must not forget it
+                _mark_red_seen(board, task.id)
+        runs.append(VerifyRun(outcome, duration_ms, log_path))
         if kind == "not_started":   # like a failing setup: pause the board, burn no fix and no agent
             return VerifyResult("setup_failed", None, log_path, detail, tuple(runs))
         if kind in ("timeout", "stopped"):   # never rerun
             return VerifyResult(kind, None, log_path, detail, tuple(runs))
-        if kind == "green" and not task.red_seen:
+        if kind == "green" and not strict:
             break
     outcomes = [r.outcome for r in runs]
     last = runs[-1].log_path
@@ -176,8 +191,8 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
         slots.leave_slot(repo, board, cfg, slot_n)
 
 
-_EVENT = {"green": "verify_green", "green_flaky": "verify_green_flaky", "red": "verify_red", "timeout": "verify_red", "conflict": "verify_conflict",
-          "setup_failed": "setup_failed"}
+_EVENT = {"green": "verify_green", "green_flaky": "verify_green_flaky", "red": "verify_red",
+          "timeout": "verify_red", "conflict": "verify_conflict", "setup_failed": "setup_failed"}
 
 
 def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
@@ -188,44 +203,51 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
     limits = transitions.Limits.from_cfg(task, cfg)
     tip = repo.rev(task_branch(task_id))   # after the verify merge: the base of a verify fix (PD-35)
     guarded: list[protect.Hit] = []
-    if result.kind == "green" and limits.merge == "auto":
+    if (result.kind == "green" and limits.merge == "auto") or result.kind == "green_flaky":
         guarded = protect.hits(repo, cfg, result.commit or tip)   # the verified commit, not a later one (PD-45)
-        if guarded:
+        if guarded and result.kind == "green":
             limits = dataclasses.replace(limits, merge="ask")   # R31b unless accepted (R31a, PD-36)
-    transitions.decide(task, _EVENT[result.kind], limits, tip=tip)   # refuse before writing anything
-    if result.kind != "setup_failed":
-        if not board.update_task(task_id, expect_state=task.state, expect_version=task.version,
-                                 last_verify=result.kind):
-            raise transitions.StaleTask(f"task {task_id} changed under us (verify result)")
-    tr = transitions.apply(board, task_id, _EVENT[result.kind], limits, tip=tip)
-    if guarded and tr.rid == "R31b":
-        sources = ", ".join(sorted({h.source for h in guarded}))
-        tr = dataclasses.replace(
-            tr, cause=f"merge=ask: touches protected path(s) {protect.summary(guarded)} ({sources})")
-    if result.kind == "green_flaky":
-        tr = dataclasses.replace(tr, cause="merge=ask: flaky verify (verify_reruns)")
-    if result.kind in ("green", "green_flaky") and result.commit:
-        board.set_meta(_verified_key(task_id), result.commit)   # PD-45: exactly this commit may be integrated
-    elif result.kind != "setup_failed":
-        board.del_meta(_verified_key(task_id))
-    log = _rel(repo, result.log_path)
-    verdict = f"verify {result.kind}: {result.detail}; {tr.from_state} -> {tr.to_state} [{tr.rid}]"
-    if tr.cause:
-        verdict += f" ({tr.cause})"
-    journal.append(board, "VERDICT", journal.truncate_utf8(verdict, journal.TEXT_LIMIT), author=_RUNNER,
-                   task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
-    if result.kind in ("red", "timeout"):
-        journal.append(board, "FAIL", journal.truncate_utf8(f"verify {result.kind} ({result.detail}); log: {log}",
-                                                            journal.TEXT_LIMIT),
-                       author=_RUNNER, task_id=task_id, stage="verify", round=task.round,
-                       basis=journal.truncate_utf8(log, 200))
-    elif result.kind == "green_flaky":   # a FAIL, never a FACT: the first run was red
+    flaky_text = ""
+    if result.kind == "green_flaky":   # a FAIL, never a FACT: the first run was red
         failed = failed_tests(result.log_path)
-        text = f"flaky verify: {_command_text(cfg['commands.verify'])}, red log {log}"
+        flaky_text = f"flaky verify: {_command_text(cfg['commands.verify'])}, red log {_rel(repo, result.log_path)}"
         if failed:
-            text += "; failed: " + ", ".join(failed)
-        journal.append(board, "FAIL", journal.truncate_utf8(text, journal.TEXT_LIMIT), author=_RUNNER,
+            flaky_text += "; failed: " + ", ".join(failed)
+    transitions.decide(task, _EVENT[result.kind], limits, tip=tip)   # refuse before writing anything
+    with board.tx():   # the transition, the verified commit and the journal lines land together
+        if result.kind != "setup_failed":
+            if not board.update_task(task_id, expect_state=task.state, expect_version=task.version,
+                                     last_verify=result.kind):
+                raise transitions.StaleTask(f"task {task_id} changed under us (verify result)")
+        tr = transitions.apply(board, task_id, _EVENT[result.kind], limits, tip=tip)
+        if guarded and tr.rid in ("R31b", "R31c"):
+            sources = ", ".join(sorted({h.source for h in guarded}))
+            reason = f"touches protected path(s) {protect.summary(guarded)} ({sources})"
+            why = "; ".join(sorted({h.note for h in guarded if h.path == protect.GIT_ERROR}))
+            if why:
+                reason += f"; {why}"
+            lead = "merge=ask: flaky verify (verify_reruns); " if tr.rid == "R31c" else "merge=ask: "
+            tr = dataclasses.replace(tr, cause=lead + reason)
+        elif tr.rid == "R31c":
+            tr = dataclasses.replace(tr, cause="merge=ask: flaky verify (verify_reruns)")
+        if result.kind in ("green", "green_flaky") and result.commit:
+            board.set_meta(_verified_key(task_id), result.commit)   # PD-45: exactly this commit may be integrated
+        elif result.kind != "setup_failed":
+            board.del_meta(_verified_key(task_id))
+        log = _rel(repo, result.log_path)
+        verdict = f"verify {result.kind}: {result.detail}; {tr.from_state} -> {tr.to_state} [{tr.rid}]"
+        if tr.cause:
+            verdict += f" ({tr.cause})"
+        journal.append(board, "VERDICT", journal.truncate_utf8(verdict, journal.TEXT_LIMIT), author=_RUNNER,
                        task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
+        if result.kind in ("red", "timeout"):
+            journal.append(board, "FAIL", journal.truncate_utf8(
+                f"verify {result.kind} ({result.detail}); log: {log}", journal.TEXT_LIMIT),
+                           author=_RUNNER, task_id=task_id, stage="verify", round=task.round,
+                           basis=journal.truncate_utf8(log, 200))
+        elif flaky_text:
+            journal.append(board, "FAIL", journal.truncate_utf8(flaky_text, journal.TEXT_LIMIT), author=_RUNNER,
+                           task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
     return tr
 
 
@@ -239,30 +261,40 @@ def _command_text(command, limit: int = 100) -> str:
 _ANSI = re.compile(r"\x1b\[[0-9;]*m")
 
 
+_PERCENT = re.compile(r"\s*\[\s*\d+%\]\s*$")
+
+
+def _failed_id(line: str) -> str | None:
+    line = _ANSI.sub("", line).rstrip("\r\n")
+    if line.startswith("FAILED ("):   # unittest's summary line
+        return None
+    if line.startswith(("FAIL: ", "ERROR: ")):
+        return line.split(": ", 1)[1].strip() or None
+    if line.startswith("FAILED "):
+        return line[len("FAILED "):].split(" - ", 1)[0].strip() or None
+    if " FAILED " in line:
+        before, after = line.split(" FAILED ", 1)
+        node = after.split(" - ", 1)[0].strip()
+        if "::" in node:   # pytest-xdist: `[gw0] [ 50%] FAILED tests/t.py::test_a`
+            return node
+        return _PERCENT.sub("", before).strip() or None   # `tests/t.py::test_a FAILED [ 50%]`
+    return None
+
+
 def failed_tests(log_path: Path, limit: int = 3) -> list[str]:
-    """Up to `limit` failed test ids from a verify log: unittest `FAIL: id` / `ERROR: id`, pytest `FAILED id - why`
-    or `id FAILED [ 50%]`."""
+    """Up to `limit` failed test ids from a verify log: unittest `FAIL: id` / `ERROR: id`, pytest `FAILED id - why`,
+    `id FAILED [ 50%]` or xdist `[gw0] [ 50%] FAILED id`. Reads the log line by line."""
+    found: list[str] = []
     try:
         with open(log_path, encoding="utf-8", errors="replace", newline="") as fh:
-            lines = [line.rstrip("\r\n") for line in fh]
+            for line in fh:
+                test = _failed_id(line)
+                if test and test not in found:
+                    found.append(test)
+                    if len(found) == limit:
+                        break
     except OSError:
         return []
-    found: list[str] = []
-    for line in lines:
-        test = None
-        line = _ANSI.sub("", line)
-        if line.startswith("FAILED ("):   # unittest's summary line
-            continue
-        if line.startswith(("FAIL: ", "ERROR: ")):
-            test = line.split(": ", 1)[1].strip()
-        elif line.startswith("FAILED "):
-            test = line[len("FAILED "):].split(" - ", 1)[0].strip()
-        elif " FAILED " in line:
-            test = line.split(" FAILED ", 1)[0].strip().split()[-1] if line.split(" FAILED ", 1)[0].strip() else None
-        if test and test not in found:
-            found.append(test)
-            if len(found) == limit:
-                break
     return found
 
 

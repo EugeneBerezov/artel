@@ -816,6 +816,7 @@ class RerunTest(IntegrateCase):
         result = self.verify(tid)
         self.assertEqual(result.kind, "red")
         self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red", "red"])
+        self.assertEqual(result.log_path.name, "verify-2.log")   # the last run's log; mutation: runs[0]
         tr = self.finish(tid, result)
         self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R33", "fixing"))
 
@@ -826,7 +827,8 @@ class RerunTest(IntegrateCase):
                               "kill_grace": "1s"})
             tid = self.task_with_commit("verifying", "a.txt")
             self.assertEqual(self.verify(tid).kind, "timeout")
-            self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["timeout"])
+            (row,) = self.verify_rows(tid)
+            self.assertEqual((row.outcome, row.timed_out, row.killed), ("timeout", True, True))
         with self.subTest("stopped"):
             self.configure(**{"commands.verify": py_cmd("import time; time.sleep(30)"), "kill_grace": "1s"})
             tid = self.task_with_commit("verifying", "b.txt")
@@ -950,13 +952,16 @@ class RerunTest(IntegrateCase):
         result = self.verify(tid)
         self.assertEqual(result.kind, "green_flaky")
         self.assertEqual([r.outcome for r in result.runs], ["green", "red"])
+        self.finish(tid, result)
+        (fail,) = self.entries("FAIL")
+        self.assertIn("verify-2.log", fail["text"])   # the red run's log, not the green one (first_red)
 
     def test_verify_that_cannot_start_is_not_rerun(self):
         """Mutation caught: rerunning a verify command that does not start (one setup_failed row, no second try)."""
         self.configure(**{"commands.verify": ["artel-no-such-program-xyz"]})
         tid = self.task_with_commit("verifying", "a.txt")
         self.assertEqual(self.verify(tid).kind, "setup_failed")
-        self.assertEqual(len(self.verify_rows(tid)), 1)
+        self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red"])   # vocabulary: no not_started
 
     def test_verify_rows_record_duration(self):
         """Mutation caught: duration_ms left empty on a verify row (spec §5 step 7)."""
@@ -979,6 +984,86 @@ class RerunTest(IntegrateCase):
         log.write_text("FAIL: test_a (m.A.test_a)\nFAILED (failures=1)\n\x1b[31mFAILED\x1b[0m t.py::test_b - x\n",
                        encoding="utf-8", newline="")
         self.assertEqual(integrate.failed_tests(log), ["test_a (m.A.test_a)", "t.py::test_b"])
+
+    def test_flaky_fail_entry_names_failed_tests(self):
+        """Mutation caught: the FAIL entry without the red log or the failed test ids, or longer than 400 bytes."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.finish(tid, self.verify(tid))
+        (fail,) = self.entries("FAIL")
+        self.assertRegex(fail["text"], r"^flaky verify: .+, red log .*verify-1\.log; failed: test_a \(tests\.test_x\.A\.test_a\)$")
+        self.assertLessEqual(len(fail["text"].encode("utf-8")), 400)
+
+    def test_red_seen_survives_a_stop_in_the_rerun(self):
+        """Mutation caught: red_seen set only when the job ends (red, then a stop in the rerun forgot the red)."""
+        flag = self.tmp / "flag"
+        self.configure(**{"commands.verify": py_cmd(
+            "import os, sys, time\n"
+            f"first = not os.path.exists({json.dumps(str(flag))})\n"
+            f"open({json.dumps(str(flag))}, 'w', encoding='utf-8').close()\n"
+            "if first: sys.exit(1)\n"
+            "time.sleep(30)\n"), "kill_grace": "1s"})
+        tid = self.task_with_commit("verifying", "a.txt")
+        stop = threading.Event()
+        threading.Timer(2.0, stop.set).start()
+        result = self.verify(tid, stop_event=stop)
+        self.assertEqual(result.kind, "stopped")
+        self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red", "stopped"])
+        self.assertTrue(self.board.get_task(tid).red_seen)
+
+    def test_red_seen_survives_an_error_in_the_rerun(self):
+        """Mutation caught: red_seen kept in memory (an exception or a crash in the rerun forgot the red)."""
+        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        real, calls = self.board.start_run, []
+
+        def start_run(**kw):
+            calls.append(1)
+            if len(calls) == 2:
+                raise RuntimeError("database is locked")
+            return real(**kw)
+        with mock.patch.object(self.board, "start_run", start_run):
+            with self.assertRaises(RuntimeError):
+                self.verify(tid)
+        self.assertTrue(self.board.get_task(tid).red_seen)
+
+    def test_flaky_touching_protected_paths_names_them(self):
+        """Mutation caught: protect.hits skipped for a flaky task (the human accepts it as 'flaky' only)."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h")})
+        tid = self.task_with_commit("verifying", "CLAUDE.md")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.rid, "R31c")
+        self.assertIn("flaky verify", tr.cause)
+        self.assertIn("CLAUDE.md", tr.cause)
+        self.assertIn("protected_paths", tr.cause)
+        verdict = " ".join(e["text"] for e in self.entries("VERDICT"))
+        self.assertIn("CLAUDE.md", verdict)
+
+    def test_flaky_result_lands_in_one_transaction(self):
+        """Mutation caught: R31c committed before the journal lines (a crash between leaves no evidence)."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        real = integrate.journal.append
+
+        def append(board, kind, *a, **kw):
+            if kind == "FAIL":
+                raise RuntimeError("crash")
+            return real(board, kind, *a, **kw)
+        with mock.patch.object(integrate.journal, "append", append):
+            with self.assertRaises(RuntimeError):
+                self.finish(tid, result)
+        self.assertEqual(self.board.get_task(tid).state, "verifying")
+        self.assertEqual(self.entries("VERDICT"), [])
+        self.assertIsNone(self.board.get_meta(f"verified:{tid}"))
+
+    def test_failed_tests_xdist_and_parametrized_ids(self):
+        """Mutation caught: '50%]' read as a test id; a parametrized id with a space cut to its tail."""
+        log = self.tmp / "x.log"
+        log.write_text("[gw0] [ 50%] FAILED tests/t.py::test_a\n[gw1] [ 75%] FAILED tests/t.py::test_b - boom\n"
+                       "tests/t.py::test_x[a b] FAILED [ 90%]\n", encoding="utf-8", newline="")
+        self.assertEqual(integrate.failed_tests(log),
+                         ["tests/t.py::test_a", "tests/t.py::test_b", "tests/t.py::test_x[a b]"])
 
 
 if __name__ == "__main__":

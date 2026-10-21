@@ -220,8 +220,10 @@ class HitsTest(RepoCase):
 
     def test_git_error_counts_as_protected_hit(self):
         """Mutation caught: fail-open (a git failure leaving the task unprotected)."""
-        self.assertEqual(protect.hits(self.repo, self.cfg(), "artel/999"),
-                         [Hit("<git error>", "protected_paths", "git failed while looking for protected paths")])
+        (hit,) = protect.hits(self.repo, self.cfg(), "artel/999")
+        self.assertEqual((hit.path, hit.source), ("<git error>", "protected_paths"))
+        self.assertTrue(hit.note.startswith("git failed while looking for protected paths: "))
+        self.assertGreater(len(hit.note), len("git failed while looking for protected paths: "))   # git's own line
         with self.assertRaises(GitError):
             protect.changed_paths(self.repo, "artel/999")
 
@@ -240,6 +242,23 @@ class HitsTest(RepoCase):
         self.assertFalse(protect._is_blob(self.repo, "gitlink", "missing.txt"))
         with self.assertRaises(GitError):
             protect._is_blob(self.repo, "no-such-branch", "dir/f.txt")
+
+    def test_pathspec_magic_in_a_verify_argument_is_no_error(self):
+        """Mutation caught: an argument like ':!vendor' read as a pathspec (git 128, every task flagged)."""
+        self.assertFalse(protect._is_blob(self.repo, INTEGRATION, ":!vendor"))
+        self.assertFalse(protect._is_blob(self.repo, INTEGRATION, ":(glob)scripts/*"))
+        self.branch_with(1, {"src/app.py": "x\n"})
+        cfg = self.cfg(**{"commands.verify": [sys.executable, "-c", "pass", ":!vendor"]})
+        self.assertEqual(protect.hits(self.repo, cfg, task_branch(1)), [])
+
+    def test_git_error_inside_entries_fails_closed(self):
+        """Mutation caught: entries() evaluated outside the try (a failing _is_blob raises out of hits)."""
+        from unittest import mock
+        with mock.patch.object(protect, "_is_blob", side_effect=GitError(["ls-tree"], "fatal: boom\n")):
+            (hit,) = protect.hits(self.repo, self.cfg(**{"commands.verify": [sys.executable, "tools/c.py"]}),
+                                  INTEGRATION)
+        self.assertEqual(hit.path, "<git error>")
+        self.assertIn("fatal: boom", hit.note)
 
     def test_changed_paths_sorted(self):
         """Mutation caught: an unsorted list (a summary whose order changes between runs)."""
