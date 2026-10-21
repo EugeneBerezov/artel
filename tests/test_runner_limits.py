@@ -2,7 +2,9 @@
 §3.1 Pauses; PD-22, PD-40, PD-54..PD-60)."""
 import json
 
-from artel import pauses
+from unittest import mock
+
+from artel import pauses, probe
 from artel.agent_claude import RateLimit, status_rank
 from artel.events import Event
 from tests.e2e import E2ECase
@@ -124,7 +126,7 @@ class RateLimitEventTest(LimitCase):
     def test_limit_without_reset_uses_recorded_window(self):
         """Mutation caught: ignoring the recorded usage windows (the pause would wait for a probe)."""
         r = self.started()
-        self.feed(r, limit_event("allowed", T0 + 3 * HOUR, "five_hour", 0.5))
+        self.feed(r, limit_event("allowed", T0 + 3 * HOUR, "five_hour", 0.95))
         self.feed(r, limit_event("rejected", None, None))
         self.assertEqual(self.active()["limit"].until, T0 + 3 * HOUR)
 
@@ -337,8 +339,9 @@ class ProbeScheduleTest(LimitCase):
         self.clock.now = T0 + 6 * HOUR + 30 * MIN
         self.finish_probe(r, 2)                        # the limit ended: probing goes on
 
-    def test_stop_request_starts_no_probe_and_a_stopped_probe_is_not_counted(self):
-        """Review finding. Mutations caught: probing while stopping; counting a stopped probe."""
+    def test_stop_request_starts_no_probe_and_a_stopped_probe_is_counted(self):
+        """Review finding + controller decision: a stopped probe counts. Mutations caught: probing while stopping; not
+        counting a stopped probe (it would be due again at once after a restart)."""
         self.scenario({":probe": [{"sleep": 30}, *PROBE_OK]})
         r = self.started()
         r.pause("limit", "usage limit")
@@ -347,7 +350,7 @@ class ProbeScheduleTest(LimitCase):
         self.wait_until(lambda: self.probe_calls())
         r.request_stop(now=True)
         self.drive(r, lambda: not r.jobs, timeout=20)
-        self.assertEqual(pauses.probe_times(self.board, now=self.clock()), [])
+        self.assertEqual(len(pauses.probe_times(self.board, now=self.clock())), 1)
         r.shutdown()
         r2 = self.started()
         r2.request_stop(now=False)
@@ -549,3 +552,197 @@ class OtherKindsTest(LimitCase):
         r.tick()
         r.tick()
         self.assertEqual(self.probe_calls(), [])
+
+
+class ReviewFixesTest(LimitCase):
+    """T35 cross-review (reviews/T35-1.md)."""
+
+    def test_stale_quota_cause_dropped_when_its_window_falls_below(self):
+        """M1. Mutation caught: a five_hour cause with until=None surviving the probe that found it low (the pause
+        stayed open-ended, was probed until exhausted)."""
+        self.scenario({":probe": [{"assistant": {"input_tokens": 1, "output_tokens": 1}},
+                                  {"rate_limit": ["allowed", T0 + DAY, "five_hour", 0.5]},
+                                  {"rate_limit": ["allowed", T0 + 3 * DAY, "seven_day", 0.85]},
+                                  {"result": {"summary": "OK"}}]})
+        r = self.started()
+        self.feed(r, limit_event("allowed", None, "five_hour", 0.97))
+        self.assertIsNone(self.active()["quota"].until)
+        self.clock.now = T0 + 30 * MIN
+        self.finish_probe(r, 1)
+        quota = self.active()["quota"]
+        self.assertEqual(quota.until, T0 + 3 * DAY)
+        self.assertEqual([c.detail for c in quota.causes], ["seven_day window at or above quota_stop_seven_day"])
+
+    def test_quota_ends_when_the_last_window_falls_below_on_an_event(self):
+        r = self.started()
+        self.feed(r, limit_event("allowed", T0 + 2 * HOUR, "five_hour", 0.97))
+        self.feed(r, limit_event("allowed", T0 + 2 * HOUR, "five_hour", 0.3))
+        self.assertEqual(self.kinds(), [])
+        self.assertIn(("resumed", "quota"), [(e.kind, e.text) for e in self.sent(r)])
+
+    def test_later_429_without_reset_keeps_a_known_limit_end(self):
+        """M3a. Mutation caught: the reset-less event replacing the known end with the weekly reset."""
+        r = self.started()
+        self.feed(r, week(0.4, T0 + 5 * DAY))
+        self.feed(r, limit_event("rejected", T0 + 2 * HOUR))
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertEqual(self.active()["limit"].until, T0 + 2 * HOUR)
+
+    def test_fresh_window_over_threshold_with_a_past_reset_is_probed(self):
+        """m2. Mutation caught: ignoring it (the board keeps running at 99 %)."""
+        r = self.started()
+        self.feed(r, limit_event("allowed", T0 - 5, "five_hour", 0.99))
+        self.assertIn("quota", self.active())
+        self.assertIsNone(self.active()["quota"].until)
+
+    def test_pause_notification_names_the_window(self):
+        """m3 (spec §5 step 5). Mutation caught: no window type in the text."""
+        r = self.started()
+        self.feed(r, limit_event("rejected", T0 + HOUR, "five_hour"))
+        self.feed(r, week(0.9, T0 + DAY))
+        texts = [e.text for e in self.sent(r, "paused")]
+        self.assertTrue(any(t.startswith("limit:") and "[five_hour]" in t for t in texts), texts)
+        self.assertTrue(any(t.startswith("quota:") and "[seven_day]" in t for t in texts), texts)
+
+    def test_wrong_shaped_stored_records_do_not_drop_events(self):
+        """m4. Mutation caught: an IndexError/AttributeError in one event losing the whole tick's events."""
+        self.board.set_meta("usage_samples", json.dumps([[], [1], "x", [T0 - 1, 0.1]]))
+        self.board.set_meta("usage_windows", json.dumps([1, 2]))
+        r = self.started()
+        self.feed(r, limit_event("rejected", T0 + HOUR), week(0.9, T0 + DAY))
+        self.assertEqual(self.kinds(), ["limit", "quota"])
+
+    def test_samples_are_spaced_and_pruned(self):
+        """Mutations caught: no sample gap (a sample per event); no 48 h pruning."""
+        r = self.started()
+        self.feed(r, week(0.10, T0 + 6 * DAY))
+        self.clock.now = T0 + 5 * MIN
+        self.feed(r, week(0.11, T0 + 6 * DAY))
+        self.clock.now = T0 + 10 * MIN
+        self.feed(r, week(0.12, T0 + 6 * DAY))
+        samples = json.loads(self.board.get_meta("usage_samples"))
+        self.assertEqual([s[0] for s in samples], [T0, T0 + 10 * MIN])
+        self.clock.now = T0 + 49 * HOUR
+        self.feed(r, week(0.2, T0 + 6 * DAY))
+        self.assertEqual([s[0] for s in json.loads(self.board.get_meta("usage_samples"))], [T0 + 49 * HOUR])
+
+    def test_limit_without_reset_uses_window_at_its_limit(self):
+        """Owner A. Mutation caught: the latest reset (the weekly one) instead of the full window's."""
+        r = self.started()
+        self.feed(r, limit_event("allowed", T0 + 2 * HOUR, "five_hour", 0.97), week(0.4, T0 + 5 * DAY))
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertEqual(self.active()["limit"].until, T0 + 2 * HOUR)
+
+    def test_limit_without_reset_low_utilization_probes(self):
+        """Mutation caught: taking any recorded reset; no 0.9 floor."""
+        self.scenario({":probe": PROBE_429})
+        r = self.started()
+        self.feed(r, limit_event("allowed", T0 + 2 * HOUR, "five_hour", 0.89), week(0.4, T0 + 5 * DAY))
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertIsNone(self.active()["limit"].until)
+        self.clock.now = T0 + 30 * MIN
+        self.finish_probe(r, 1)
+
+    def test_limit_without_reset_keeps_known_end(self):
+        """Owner A / M3a. Mutation caught: a reset-less hit replacing a known end."""
+        r = self.started()
+        self.feed(r, limit_event("rejected", T0 + 2 * HOUR), week(0.95, T0 + 5 * DAY))
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertEqual(self.active()["limit"].until, T0 + 2 * HOUR)
+
+    def test_limit_without_reset_past_reset_of_full_window_probes(self):
+        r = self.started()
+        self.feed(r, limit_event("allowed", T0 - 5, "five_hour", 0.99))
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertIsNone(self.active()["limit"].until)
+
+    def test_night_budget_exactly_at_the_budget_pauses(self):
+        """Mutations caught: `>` instead of `>=`; float noise (0.35 - 0.20 is 0.1499...)."""
+        r = self.started()
+        self.feed(r, week(0.20, T0 + 6 * DAY))
+        self.clock.now = T0 + 20 * MIN
+        self.feed(r, week(0.35, T0 + 6 * DAY))
+        self.assertIn("quota", self.active())
+
+    def test_errored_probe_counts_against_the_cap(self):
+        """Mutation caught: a probe job that raises not recorded (a missing CLI would probe for ever)."""
+        r = self.started()
+        r.pause("limit", "usage limit")
+        self.clock.now = T0 + 30 * MIN
+        with mock.patch.object(probe, "run_probe", side_effect=RuntimeError("boom")):
+            self.finish_probe(r, 1)
+        self.assertEqual(pauses.probe_times(self.board, now=self.clock()), [(T0 + 30 * MIN, "limit")])
+        self.assertEqual(json.loads(self.board.get_meta("last_probe"))["outcome"], "unavailable")
+
+    # controller review 2 (reviews/T35-ctl.md)
+
+    def test_probe_warning_is_a_limit_not_ok(self):
+        """Mutation caught: a probe reporting allowed_warning read as ok (both pauses lift into the warning zone)."""
+        self.scenario({":probe": [{"assistant": {"input_tokens": 1, "output_tokens": 1}},
+                                  {"rate_limit": ["allowed_warning", T0 + 5 * HOUR, "five_hour", 0.5]},
+                                  {"result": {"summary": "OK"}}]})
+        r = self.started()
+        r.pause("agent_unavailable", "agent down")
+        r.pause("limit", "usage limit", setting="limit_stop")
+        self.clock.now = T0 + 30 * MIN
+        self.finish_probe(r, 1)
+        self.assertEqual(self.active()["limit"].until, T0 + 5 * HOUR)
+        self.assertIn("agent_unavailable", self.active())
+        self.assertEqual(json.loads(self.board.get_meta("last_probe"))["outcome"], "limit")
+
+    def test_probe_warning_ignored_when_limit_stop_is_rejected(self):
+        self.scenario({":probe": [{"assistant": {"input_tokens": 1, "output_tokens": 1}},
+                                  {"rate_limit": ["allowed_warning", T0 + 5 * HOUR, "five_hour", 0.5]},
+                                  {"result": {"summary": "OK"}}]})
+        r = self.started(limit_stop="rejected")
+        r.pause("agent_unavailable", "agent down")
+        self.clock.now = T0 + 30 * MIN
+        self.finish_probe(r, 1)
+        self.assertEqual(self.kinds(), [])
+
+    def test_limit_end_never_shrinks(self):
+        """Mutation caught: a later report with an earlier reset shortening the known end."""
+        r = self.started()
+        self.feed(r, limit_event("rejected", T0 + 3 * DAY, "seven_day"))
+        self.feed(r, limit_event("rejected", T0 + 4 * HOUR, "five_hour"))
+        self.assertEqual(self.active()["limit"].until, T0 + 3 * DAY)
+        self.feed(r, limit_event("rejected", T0 + 4 * DAY, "seven_day"))
+        self.assertEqual(self.active()["limit"].until, T0 + 4 * DAY)
+
+    def test_quota_probe_must_see_every_window_with_a_cause(self):
+        """Mutation caught: a probe event without seven_day lifting a seven_day quota cause."""
+        self.scenario({":probe": [{"assistant": {"input_tokens": 1, "output_tokens": 1}},
+                                  {"rate_limit": ["allowed", T0 + DAY, "five_hour", 0.1]},
+                                  {"result": {"summary": "OK"}}]})
+        r = self.started()
+        self.feed(r, week(0.9, None))
+        self.clock.now = T0 + 30 * MIN
+        self.finish_probe(r, 1)
+        self.assertIn("quota", self.active())
+
+    def test_weekly_fall_without_reset_time_is_a_roll(self):
+        """Mutation caught: a negative difference silencing the night budget for 24 h."""
+        r = self.started()
+        self.feed(r, week(0.60, None))
+        self.clock.now = T0 + 20 * MIN
+        self.feed(r, week(0.05, None))                    # rolled
+        self.clock.now = T0 + 40 * MIN
+        self.feed(r, week(0.21, None))                    # +0.16 over the new baseline
+        self.assertEqual(self.active()["quota"].causes[-1].setting, "night_budget_seven_day")
+
+    def test_events_of_one_batch_are_all_applied(self):
+        """Mutation caught: only the last queued event applied (rejected, then allowed)."""
+        r = self.started()
+        r.on_rate_limit(limit_event("rejected", T0 + HOUR))
+        r.on_rate_limit(limit_event("allowed", T0 + HOUR, "five_hour", 0.1))
+        r.tick()
+        self.assertIn("limit", self.active())
+
+    def test_probe_limit_with_a_past_reset_changes_nothing(self):
+        """Mutation caught: a past reset accepted as the end."""
+        self.scenario({":probe": [{"rate_limit": ["rejected", T0 - 60, "five_hour", 0.5]}, {"result_error": 429}]})
+        r = self.started()
+        r.pause("limit", "usage limit", setting="limit_stop")
+        self.clock.now = T0 + 30 * MIN
+        self.finish_probe(r, 1)
+        self.assertIsNone(self.active()["limit"].until)

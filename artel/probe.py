@@ -82,17 +82,20 @@ def run_probe(repo: Repo, cfg, env, *, now: float, stop_event: threading.Event |
     parser = StreamParser()
     windows: dict = {}
     limit_reset: list[float | None] = []
+    warned: list[bool] = []
+    limit_rank = agent_claude.status_rank(cfg["limit_stop"])
 
     def on_line(line: str) -> None:
         event = parser.feed(line)
         if event is not None:
             windows.update(event_windows(event))
-            if event.rank == 2:
+            if event.rank >= limit_rank:   # a warning counts when limit_stop says so: the pause must not lift into it
                 limit_reset.append(event.resets_at)
+                warned.append(True)
 
     res = procs.run_tree(probe_argv(cfg), cwd=cwd, env=env, stdin_text=PROMPT, timeout=PROBE_TIMEOUT,
                          kill_grace=cfg["kill_grace"], log_path=log, on_line=on_line, stop_event=stop_event)
-    if parser.limit_hit():
+    if parser.limit_hit() or warned:
         resets = next((r for r in reversed(limit_reset) if r is not None), None)
         return ProbeResult("limit", resets, log, windows)
     if res.timed_out or res.stopped or agent_claude.is_unavailable(parser, res.returncode):   # PD-55, PD-57
@@ -119,4 +122,7 @@ def ended(pause: Pause, result: ProbeResult, cfg, *, now: float) -> bool:
     if pause.kind != "quota":
         return True
     seen = {name: w for name, w in result.windows.items() if name in _THRESHOLDS}
-    return bool(seen) and all(w["utilization"] < cfg[_THRESHOLDS[name]] for name, w in seen.items())
+    # every window with an active quota cause must have been seen below its threshold; a probe that did not report
+    # one of them proves nothing about it
+    wanted = {name for name, key in _THRESHOLDS.items() if any(c.setting == key for c in pause.causes)} or set(seen)
+    return bool(wanted) and all(name in seen and seen[name]["utilization"] < cfg[_THRESHOLDS[name]] for name in wanted)

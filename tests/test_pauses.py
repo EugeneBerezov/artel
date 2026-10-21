@@ -165,10 +165,6 @@ class PausesTest(unittest.TestCase):
         self.assertEqual(pauses.active(self.board), {})
         self.assertIsNone(self.board.get_meta("pauses"))
 
-
-if __name__ == "__main__":
-    unittest.main()
-
     def test_probe_times_pruned_to_24_hours_and_kept_across_pause_removal(self):
         """Mutation caught: the history kept in the pause record; no 24 h window."""
         pauses.add(self.board, "limit", "x", now=0.0)
@@ -192,3 +188,19 @@ if __name__ == "__main__":
         """Task 35: a pause re-added by a timed retry keeps the outage's first `since`."""
         pauses.add(self.board, "setup_failed", "x", now=50.0, since=10.0)
         self.assertEqual(pauses.active(self.board)["setup_failed"].since, 10.0)
+
+    def test_drop_cause_reports_what_happened(self):
+        """Mutation caught: dropping every cause of the kind; not reporting the last one (no `resumed`)."""
+        pauses.add(self.board, "quota", "five_hour at limit", now=1.0)
+        pauses.add(self.board, "quota", "seven_day at limit", now=2.0, until=9.0)
+        self.assertEqual(pauses.drop_cause(self.board, "quota", "nothing"), "none")
+        self.assertEqual(pauses.drop_cause(self.board, "limit", "x"), "none")
+        self.assertEqual(pauses.drop_cause(self.board, "quota", "five_hour at limit"), "dropped")
+        pause = pauses.active(self.board)["quota"]
+        self.assertEqual((pause.until, pause.since), (9.0, 1.0))
+        self.assertEqual(pauses.drop_cause(self.board, "quota", "seven_day at limit"), "emptied")
+        self.assertNotIn("quota", pauses.active(self.board))
+
+
+if __name__ == "__main__":
+    unittest.main()
