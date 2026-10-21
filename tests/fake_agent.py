@@ -3,7 +3,7 @@
 Used as agent_command = [sys.executable, "<repo>/tests/fake_agent.py"]. Reads the prompt on stdin,
 ARTEL_TASK / ARTEL_STAGE / ARTEL_ROUND from the environment and $ARTEL_FAKE_DIR/scenario.json.
 Scenario keys, first match wins: "<task>:<stage>#<n>", "<task>:<stage>", "<stage>", "*".
-Actions: write, read, git, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit,
+Actions: write, write_file, read, git, commit, note, assistant, rate_limit, sleep, result, result_error, denied, result_raw, exit,
 crash. `{"crash": <exit code>, "stderr": <line>}` writes the line to stderr and exits with the code; as the first
 action it comes before any stream record (an agent CLI that dies before its first model call, PD-57).
 `{"result_error": <status>}` is an error result with that `api_error_status` (429, 5xx, 529; `true`: none).
@@ -136,8 +136,9 @@ def main() -> int:
             (fake_dir / out_name).write_text(Path(rel).read_text(encoding="utf-8"), encoding="utf-8", newline="\n")
         elif name == "git":   # an arbitrary git command in the cwd (e.g. ["merge", "--abort"])
             run_git(*arg)
-        elif name == "git":   # raw git in the slot (e.g. a fixer that resets away its work)
-            run_git(*arg)
+        elif name == "write_file":   # a new file in the cwd (a probe)
+            Path(arg).parent.mkdir(parents=True, exist_ok=True)
+            Path(arg).write_text("probe\n", encoding="utf-8", newline="\n")
         elif name == "commit":
             run_git("add", "-A")
             run_git("commit", "-q", "-m", arg)

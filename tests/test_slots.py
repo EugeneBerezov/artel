@@ -93,6 +93,19 @@ class EnsureTest(SlotsCase):
         self.assertIsNone(slots._exclude_slots_dir(self.repo, {"slots_dir": "../outside-pool"}))
         self.assertNotIn("outside-pool", (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8"))
 
+    def test_slots_dir_with_dotdot_is_normalized(self):
+        """Mutation caught: the unnormalized `relative_to` (`x/../.artel/slots` writes a '/x/../.artel/slots/' line
+        that hides nothing; `../outside` must still write none)."""
+        (self.repo_path / "x").mkdir()
+        self.assertEqual(git(self.repo_path, "status", "--porcelain"), "")
+        slots._exclude_slots_dir(self.repo, {"slots_dir": "x/../.artel/slots"})
+        exclude = (self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8").splitlines()
+        self.assertEqual(exclude.count("/.artel/slots/"), 1)
+        self.assertFalse([l for l in exclude if ".." in l])
+        before = list(exclude)
+        slots._exclude_slots_dir(self.repo, {"slots_dir": "a/../../outside"})
+        self.assertEqual((self.repo.common_dir / "info" / "exclude").read_text(encoding="utf-8").splitlines(), before)
+
     def test_ensure_is_idempotent(self):
         self.slot(2)
         marker = slots.slot_path(self.repo, self.cfg, 1) / "keep.txt"
@@ -689,6 +702,42 @@ class SetupTest(SlotsCase):
     def run_setup(self, n=1, task_id=None, **kw):
         path = slots.slot_path(self.repo, self.cfg, n)
         return slots.run_setup_if_needed(self.repo, self.board, self.cfg, n, path, task_id=task_id, **kw)
+
+    def leave(self, n=1):
+        slots.leave_slot(self.repo, self.board, self.cfg, n)
+
+    def test_leave_slot_clears_setup_hash_when_setup_output_is_removed(self):
+        """Mutation caught: a slot that runs without its environment (the setup output is not in slot_keep, the
+        scrub deletes it, the stored hash says setup is done — PD-73)."""
+        [n] = self.slot(1, **{"commands.setup": self.counter_cmd(
+            "import os; os.makedirs('.cache-env', exist_ok=True); open('.cache-env/x', 'w', encoding='utf-8').write('1')")})
+        self.assertEqual(self.run_setup(), "ok")
+        self.assertEqual(json.loads(self.board.get_meta(f"setup_outputs:{n}")), [".cache-env"])
+        self.leave()
+        self.assertIsNone(self.board.list_slots()[0].setup_hash)
+        self.assertIsNone(self.board.get_meta(f"setup_outputs:{n}"))
+        self.assertFalse((slots.slot_path(self.repo, self.cfg, n) / ".cache-env").exists())
+        self.assertEqual(self.run_setup(), "ok")
+        self.assertEqual(self.runs(), "xx")   # setup ran again for the next stage
+
+    def test_kept_setup_output_keeps_hash(self):
+        """Mutation caught: the hash cleared after every stage (a setup run per stage for the `.venv` layout)."""
+        [n] = self.slot(1, **{"commands.setup": self.counter_cmd(
+            "import os; os.makedirs('.venv', exist_ok=True); open('.venv/x', 'w', encoding='utf-8').write('1')")})
+        self.assertEqual(self.run_setup(), "ok")
+        self.leave()
+        self.assertIsNotNone(self.board.list_slots()[0].setup_hash)
+        self.assertTrue((slots.slot_path(self.repo, self.cfg, n) / ".venv" / "x").exists())
+        self.assertEqual(self.run_setup(), "skipped")
+        self.assertEqual(self.runs(), "x")
+
+    def test_setup_that_leaves_nothing_untracked_keeps_hash(self):
+        """Mutation caught: a tracked file rewritten by setup counted as output (reset restores it anyway)."""
+        [n] = self.slot(1, **{"commands.setup": self.counter_cmd("open('README', 'w', encoding='utf-8').write('changed')")})
+        self.assertEqual(self.run_setup(), "ok")
+        self.assertEqual(json.loads(self.board.get_meta(f"setup_outputs:{n}")), [])
+        self.leave()
+        self.assertIsNotNone(self.board.list_slots()[0].setup_hash)
 
     def test_setup_hash_changes_with_inputs_and_command(self):
         d = self.tmp / "h"

@@ -90,6 +90,7 @@ class Runner:
         self.notify_kill = notify_kill
         self.board: Board | None = None
         self.jobs: list[Job] = []
+        self.activity: dict[int, float] = {}           # PD-66: when the runner last started or ended a job of a task
         self._rate_events: queue.SimpleQueue = queue.SimpleQueue()   # RateLimit events from worker threads
         self._setup_lifted_at: float = 0.0             # the last timed lift: only a stage started after it proves setup
         self._setup_outage: dict | None = None         # PD-31: the setup_failed outage a timed retry goes on with
@@ -789,6 +790,8 @@ class Runner:
             job.version = self.board.get_task(task_id).version
         job.thread = threading.Thread(target=body, name=f"artel-{kind}-{task_id}", daemon=True)
         self.jobs.append(job)
+        if task_id is not None:
+            self.activity[task_id] = self.clock()
         job.thread.start()
         return job
 
@@ -820,8 +823,15 @@ class Runner:
                                      workers=self.workers)                                     # PD-71 a
         except agent_claude.CannotStartAgent as exc:   # owner 2026-10-21: agent_unavailable, not an internal error
             return stages.unstarted_stage(task, str(exc))
+        started = self.clock()
+
+        def skip_refs() -> set[str]:   # the branches the runner itself touched during the stage (PD-66)
+            tasks = {t for t, at in list(self.activity.items()) if at >= started}
+            tasks |= {j.task_id for j in list(self.jobs) if j.task_id is not None}
+            tasks.discard(job.task_id)
+            return {f"refs/heads/{task_branch(t)}" for t in tasks}
         run = stages.run_stage(self.repo, board, self.cfg, plan, job.slot, on_start=self._on_start(board, job),
-                               on_rate_limit=self.on_rate_limit, stop_event=job.stop)
+                               on_rate_limit=self.on_rate_limit, stop_event=job.stop, skip_refs=skip_refs)
         return plan, run
 
     def _verify_work(self, board: Board, job: Job, queued_at: float | None = None):
@@ -931,11 +941,15 @@ class Runner:
                 job.thread.join(1.0)   # its work is over: collect it now, not one poll_interval later
         for job in [j for j in self.jobs if not j.thread.is_alive()]:
             self.jobs.remove(job)
+            if job.task_id is not None:
+                self.activity[job.task_id] = self.clock()
             try:
                 self._finish(job)
             except Exception:   # noqa: BLE001 - one task's bookkeeping must not stop the runner
                 tail = traceback.format_exc()
                 self._guarded("finishing a job", lambda: self._finish_failed(job, tail))
+            if job.task_id is not None:   # its git effects (integrate, branch delete) ran in `_finish`
+                self.activity[job.task_id] = self.clock()
 
     def _clear_orphans(self) -> None:
         """T22 controller review a: a task marked running with no job of this runner (its result could not be applied

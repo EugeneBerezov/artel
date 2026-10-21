@@ -375,6 +375,16 @@ class ArgvTest(unittest.TestCase):
         self.assertNotIn("git commit", allowed)
         self.assertNotIn("git add", allowed)
 
+    def test_build_argv_attacker_profile(self):
+        """Mutation caught: `attacker` rejected (vet and attack then crash) or run with write tools."""
+        argv = self.build("attacker")
+        self.assertEqual(argv[argv.index("--permission-mode") + 1], "default")
+        denied = argv[argv.index("--disallowedTools") + 1].split(" ")
+        self.assertIn("Bash(git * --output*)", " ".join(denied))
+        for tool in ("Edit", "Write", "NotebookEdit"):
+            self.assertIn(tool, denied)
+        self.assertNotIn("Edit", argv[argv.index("--tools") + 1].split(","))
+
     def test_writer_and_reviewer_tools_allowlist(self):
         """Mutation caught: a missing or widened --tools list (compared as a set: `Task` in `TaskOutput` is not it)."""
         for profile in ("writer", "reviewer"):

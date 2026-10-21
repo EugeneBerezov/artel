@@ -445,7 +445,7 @@ def _has_permission_mode(tokens: list[str]) -> bool:
 
 
 def build_argv(cfg, *, profile: str, model: str, notice_path: Path) -> list[str]:
-    if profile not in ("writer", "reviewer"):
+    if profile not in ("writer", "reviewer", "attacker"):
         raise ValueError(f"unknown profile: {profile!r}")
     template = [*cfg["profiles.common"], *cfg[f"profiles.{profile}"]]
     if not _has_permission_mode(template):   # checked before substitution: a model name cannot satisfy it

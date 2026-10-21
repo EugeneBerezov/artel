@@ -103,6 +103,24 @@ class RunTreeTest(unittest.TestCase):
         grandchild = int(lines[0])
         self.assertTrue(wait_dead(grandchild))
 
+    def test_deadline_callable_is_reevaluated(self):
+        """Mutation caught: the deadline read once (a lock wait that extends it while the agent runs is lost)
+        or `timeout` still applied when a deadline is given (PD-74)."""
+        sleeper = py_cmd("import time; time.sleep(60)")
+        calls = []
+
+        def deadline():
+            calls.append(1)
+            return time.monotonic() + 0.8 if len(calls) < 4 else time.monotonic() - 1   # extended, then due
+        start = time.monotonic()
+        res = procs.run_tree(sleeper, cwd=self.dir, timeout=0.1, deadline=deadline, kill_grace=1.0)
+        self.assertTrue(res.timed_out)
+        self.assertGreaterEqual(len(calls), 4)       # read at each poll
+        self.assertGreater(time.monotonic() - start, 0.2)   # `timeout=0.1` did not end it
+        res = procs.run_tree(py_cmd("print('ok')"), cwd=self.dir, timeout=0.1, kill_grace=1.0,
+                             deadline=lambda: time.monotonic() + 30)
+        self.assertEqual((res.returncode, res.timed_out), (0, False))
+
     def test_soft_stop_ignored_gets_hard_kill(self):
         code = IGNORE_SOFT_STOP + "import time\nprint('up', flush=True)\ntime.sleep(60)\n"
         up = threading.Event()

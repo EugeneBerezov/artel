@@ -112,7 +112,10 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
              log_path: Path | None = None, merge_stderr: bool = False,
              on_start: Callable[[int, int, str | None], None] | None = None,
              on_line: Callable[[str], None] | None = None,
-             stop_event: threading.Event | None = None) -> ProcResult:
+             stop_event: threading.Event | None = None,
+             deadline: Callable[[], float] | None = None) -> ProcResult:
+    """`deadline`: when given it replaces `timeout`: a callable returning the `time.monotonic()` instant at which
+    the tree is stopped, evaluated at every poll (the runner moves it while a lock is waited for, PD-74)."""
     started = time.monotonic()
     if not argv:
         raise ArtelError("cannot start an empty command")
@@ -151,11 +154,12 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
         feeder.start()
         threads.append((feeder, proc.stdin))
 
-        deadline = None if timeout is None else started + timeout
+        fixed = None if timeout is None else started + timeout
         while proc.poll() is None:
+            limit = deadline() if deadline is not None else fixed
             if stop_event is not None and stop_event.is_set():
                 stopped = True
-            elif deadline is not None and time.monotonic() >= deadline:
+            elif limit is not None and time.monotonic() >= limit:
                 timed_out = True
             if (stopped or timed_out) and proc.poll() is not None:
                 stopped = timed_out = False   # it finished by itself between the poll and the check

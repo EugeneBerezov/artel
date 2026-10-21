@@ -125,7 +125,7 @@ class TemplateNameTest(unittest.TestCase):
         self.assertEqual(prompts.template_name("review", make_task(round=3, review_closure=2)),
                          "review-verify-fix.md")   # the fix-review wins over the round-based closure rule
         self.assertEqual(prompts.template_name("review", make_task(round=1, review_closure=1)),
-                         "review-closure.md")
+                         "review-conflict.md")
         self.assertEqual(prompts.template_name("review", make_task(round=2, review_closure=0)),
                          "review-closure.md")
         self.assertEqual(prompts.template_name("review", make_task(round=1, review_closure=0)), "review.md")
@@ -134,7 +134,7 @@ class TemplateNameTest(unittest.TestCase):
         self.assertEqual(prompts.template_name("review", make_task(round=1)), "review.md")
         self.assertEqual(prompts.template_name("review", make_task(round=2)), "review-closure.md")
         self.assertEqual(prompts.template_name("review", make_task(round=1, review_closure=1)),
-                         "review-closure.md")
+                         "review-conflict.md")
         for stage in ("vet", "attack", "write", "fix"):
             self.assertEqual(prompts.template_name(stage, make_task(round=3)), f"{stage}.md")
         with self.assertRaises(ValueError):

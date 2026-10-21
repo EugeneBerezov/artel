@@ -5,11 +5,12 @@ Decisions come only from the structured result, git state and the board — neve
 import json
 import re
 import threading
-from collections.abc import Callable, Mapping, Sequence
+import time
+from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import agent_claude, cmd_agent, journal, procs, prompts, protect, slots, templates, testguard, transitions
+from artel import agent_claude, cmd_agent, journal, procs, prompts, protect, repocheck, slots, templates, testguard, transitions
 from artel.agent_claude import RateLimit, StreamParser, validate_result
 from artel.board import Task
 from artel.errors import ArtelError
@@ -20,7 +21,13 @@ from artel.transitions import Limits, Transition
 STATE_TO_STAGE = {"vetting": "vet", "attacking": "attack", "writing": "write",
                   "reviewing": "review", "fixing": "fix"}
 SUPPORTED_STAGES = {"attack", "write", "review", "fix"}        # Task 21 adds "vet"
-DOWNGRADE_PREFIX = "[downgraded: closure round] "              # PD-4
+
+
+def downgrade_prefix(severity: str) -> str:
+    """PD-4 (amended): the downgraded finding keeps the reviewer's severity in its text (finding fates, PD-69)."""
+    return f"[downgraded from {severity}: closure round] "
+
+
 SIGNATURE_LIMIT = 200                                          # PD-61
 _DIGIT = re.compile(r"\d")
 NOT_COUNTED = ("requeue", "agent_unavailable", "setup_failed")  # events that never add to stage_runs (§3.1)
@@ -85,7 +92,7 @@ class StagePlan:
     round: int
     model: str
     model_reason: str
-    profile: str                    # "writer" | "reviewer"
+    profile: str                    # "writer" | "reviewer" | "attacker"
     prompt: str
     argv: list[str]
     env: dict[str, str]
@@ -116,6 +123,9 @@ class StageRun:
     agent_started: bool = False     # the agent process was spawned (spec §3.1 Counters: stage_runs)
     unavailable: bool = False       # PD-57, decided by agent_claude.is_unavailable
     signature: str | None = None    # PD-61: only when unavailable
+    repo_changes: tuple[str, ...] = ()   # PD-66: what the stage changed in the shared repository
+    unrestored: tuple[str, ...] = ()     # ... and what `repocheck.restore` could not put back
+    left_tracked: bool = False           # a review left tracked changes in its slot (restored)
 
 
 def unavailable_signature(exit_code: int | None, stderr_path: Path) -> str:
@@ -164,10 +174,27 @@ def _latest_verify_log(repo, task_id: int) -> str:
     return max(numbered)[1].read_text(encoding="utf-8", errors="replace")
 
 
-def _diff_range(task: Task) -> str:
-    if task.review_closure == 2 and task.fix_base:                  # PD-48: the verify-fix review sees the fix only
+def _diff_range(task: Task, stage: str = "review") -> str:
+    if closure_round(task, stage) and task.fix_base:     # PD-48, PD-67: a closure-kind review sees the fix only
         return f"{task.fix_base}..{task_branch(task.id)}"
     return f"{INTEGRATION}...{task_branch(task.id)}"
+
+
+_CLOSURE_TEMPLATES = ("review-closure.md", "review-verify-fix.md", "review-conflict.md")
+
+
+def _required_tests_text(task: Task) -> str:
+    names = testguard.required_tests(task.body)
+    if not names:
+        return ""
+    return "## Required tests (must exist and pass)\n" + "".join(f"- {name}\n" for name in names) + "\n"
+
+
+def _mutation_check(cfg, task: Task, stage: str) -> str:
+    """Spec §4 "Mutation check": only the round-1 review of a risky or attacked task."""
+    if stage != "review" or closure_round(task, stage) or not (task.risky or task.attack):
+        return ""
+    return prompts.MUTATION_CHECK if cfg["commands.project_tools"] else prompts.MUTATION_SKIPPED
 
 
 def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[str, str],
@@ -205,13 +232,14 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
             task, journal.recent_entries(board, exclude_task=task.id), areas, cfg["context_budget"])
         inputs = prompts.PromptInputs(
             task=task, stage=stage, history=history, findings=findings,
-            closure_list=open_review if template in ("review-closure.md", "review-verify-fix.md") else [],
+            closure_list=open_review if template in _CLOSURE_TEMPLATES else [],
             context=context,
             verify_log=_latest_verify_log(repo, task.id) if stage == "fix" or task.review_closure == 2 else "",
-            conflict_paths=conflict_paths, diff_range=_diff_range(task))
+            conflict_paths=conflict_paths, diff_range=_diff_range(task, stage),
+            mutation_check=_mutation_check(cfg, task, stage), required_tests=_required_tests_text(task))
         prompt = prompts.render(templates.load_template(repo, cfg, template), inputs,
                                 budget=cfg["context_budget"])
-        profile = "writer" if stage in ("write", "fix") else "reviewer"
+        profile = {"write": "writer", "fix": "writer", "review": "reviewer"}.get(stage, "attacker")
         argv = agent_claude.build_argv(cfg, profile=profile, model=model,
                                        notice_path=templates.notice_path(repo, cfg))
         env = cmd_agent.agent_env(repo, task_id=task.id, stage=stage, round=task.round, base_env=base_env)
@@ -266,8 +294,31 @@ def _commit_facts(repo, path: Path, task: Task, plan: StagePlan, merge_target: s
     return new, merged
 
 
+def _tracked_state(repo, path: Path) -> tuple[bytes, bytes]:
+    """What differs from HEAD in the working tree and in the index (setup may rewrite a tracked file)."""
+    return tuple(repo.git_bytes("diff", "--binary", *args, cwd=path) for args in (("HEAD",), ("--cached",)))
+
+
+def _restore_tracked(repo, path: Path, before: tuple[bytes, bytes]) -> bool:
+    """A reviewer may write new probe files but not change what the branch tracks (its verdict would describe
+    code that does not exist): a difference from the state before the agent started is put back. True when
+    there was one."""
+    dirty = _tracked_state(repo, path) != before
+    if dirty:
+        slots._git(repo, "reset", "-q", cwd=path, check=False)
+        slots._git(repo, "checkout", "--", ".", cwd=path, check=False)
+    return dirty
+
+
 def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnStart,
-              on_rate_limit: Callable[[RateLimit], None], stop_event: threading.Event) -> StageRun:
+              on_rate_limit: Callable[[RateLimit], None], stop_event: threading.Event,
+              skip_refs: Callable[[], Collection[str]] = lambda: (),
+              runner_changed_worktrees: Callable[[], bool] = lambda: False,
+              idle_slots: Callable[[], Sequence[tuple[int, Path]]] = lambda: (),
+              extra_time: Callable[[], float] = lambda: 0.0) -> StageRun:
+    """`skip_refs`, `runner_changed_worktrees`, `idle_slots` and `extra_time` are the runner's view of the stage
+    (PD-66, PD-74): the task branches it moved itself, whether it added or removed a slot, the slots without a
+    job, and the time the agent spent waiting for the machine-wide lock."""
     parser = StreamParser()
     setup = "skipped"
     outcome, exit_code, timed_out, stopped = "error", None, False, False
@@ -276,6 +327,9 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
     agent_started = unavailable = False
     signature = None
     res = None
+    repo_changes: list[str] = []
+    unrestored: list[str] = []
+    left_tracked = False
     try:
         task = board.get_task(plan.task_id)
         path = slots.slot_path(repo, cfg, slot_n)
@@ -295,9 +349,14 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                 if event is not None:
                     on_rate_limit(event)
 
+            own = task_branch(plan.task_id) if repo.branch_exists(task_branch(plan.task_id)) else None
+            before = repocheck.take(repo, path, idle_slots=idle_slots())
+            tracked_before = _tracked_state(repo, path) if plan.stage == "review" else ()
+            started = time.monotonic()
             try:
                 res = procs.run_tree(
                     plan.argv, cwd=path, env=plan.env, stdin_text=plan.prompt, timeout=cfg["stage_timeout"],
+                    deadline=lambda: started + cfg["stage_timeout"] + extra_time(),
                     kill_grace=cfg["kill_grace"], log_path=plan.log_path, on_line=on_line, stop_event=stop_event,
                     on_start=lambda pid, group, fp: on_start("agent", pid, group, fp))
             except procs.CannotStart as exc:   # owner 2026-10-21: no process, so agent_unavailable, never counted
@@ -305,6 +364,14 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                 signature = cannot_start_signature(reason)
         if res is not None:
             agent_started = True                                 # run_tree returned: the process was spawned
+            after = repocheck.take(repo, path, idle_slots=idle_slots())
+            repo_changes = repocheck.compare(before, after, own_branch=own, may_commit=plan.stage in ("write", "fix"),
+                                             skip_refs=skip_refs(), runner_changed_worktrees=runner_changed_worktrees(),
+                                             repo=repo)
+            if repo_changes:
+                unrestored = repocheck.restore(repo, before, after, repo_changes)
+            elif plan.stage == "review":
+                left_tracked = _restore_tracked(repo, path, tracked_before)
             exit_code, timed_out, stopped = res.returncode, res.timed_out, res.stopped
             unavailable = (not timed_out and not stopped and not parser.limit_hit()
                            and agent_claude.is_unavailable(parser, exit_code))           # PD-57
@@ -340,7 +407,8 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                     new_commits=new_commits, merge_committed=merge_committed, setup=setup,
                     denials=list(parser.denials), session_id=parser.session_id,
                     first_context=usage.first_context_tokens(), last_context=usage.context_tokens(),
-                    agent_started=agent_started, unavailable=unavailable, signature=signature)
+                    agent_started=agent_started, unavailable=unavailable, signature=signature,
+                    repo_changes=tuple(repo_changes), unrestored=tuple(unrestored), left_tracked=left_tracked)
 
 
 def _effective_severity(task: Task, stage: str, severity: str) -> str:
@@ -354,6 +422,8 @@ def classify(task: Task, stage: str, run: StageRun, board) -> str:
         return "requeue"
     if run.unavailable:                                                             # PD-57: after the two above
         return "agent_unavailable"
+    if run.repo_changes or run.left_tracked:                                        # PD-66: the verdict is void
+        return "stage_failed"
     if run.setup in ("failed", "timeout"):
         return "setup_failed"
     if run.timed_out or run.result is None:
@@ -420,7 +490,7 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
             severity = _effective_severity(task, plan.stage, finding["severity"])
             text = finding["text"]
             if severity != finding["severity"]:
-                text = DOWNGRADE_PREFIX + text                                       # PD-4
+                text = downgrade_prefix(finding["severity"]) + text                  # PD-4
             journal.add_finding(board, task_id=task.id, stage=plan.stage, round=plan.round, severity=severity,
                                 text=journal.truncate_utf8(text, journal.TEXT_LIMIT),            # PD-21
                                 basis=journal.truncate_utf8(finding["basis"], journal.BASIS_LIMIT), author=author)
@@ -434,6 +504,13 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     if event == "agent_unavailable":                                                # a fact; the runner pauses
         journal.append(board, "FAIL", _clip(f"agent unavailable, requeued without a counter: {run.signature}"),
                        author="runner", **common)
+    if run.repo_changes:
+        shown = "; ".join(run.repo_changes[:3]) + (f"; +{len(run.repo_changes) - 3}" if len(run.repo_changes) > 3 else "")
+        left = f"; not restored: {'; '.join(run.unrestored)}" if run.unrestored else ""
+        journal.append(board, "FAIL", _clip(f"{plan.stage} changed the shared repository: {shown} (restored{left})"),
+                       author="runner", **common)
+    elif run.left_tracked:
+        journal.append(board, "FAIL", "review left tracked changes in its slot; restored", author="runner", **common)
     record_denials(board, task, plan, run)
     label = {"ready": "READY", "review_clear": "PASS", "attack_clear": "PASS", "review_blocking": "FINDINGS",
              "attack_blocker": "FINDINGS", "stage_failed": "FAIL",
@@ -445,6 +522,8 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
                 why = "ready without new commits"
             elif run.timed_out:
                 why = "timed out"
+            elif run.repo_changes or run.left_tracked:
+                why = "changed the repository, the result is void"
             elif result is None:
                 why = run.invalid_reason or "no valid result"
             elif result["outcome"] == "fail":
