@@ -268,8 +268,11 @@ def apply_pending(repo, board, cfg, hooks: RunnerHooks, *, now: float | None = N
     leaves the rest pending for the next tick (a human's answer is never dropped for a lock). `now`: the runner's
     clock, the `since` of a pause a request adds (T22 review); None = the wall clock."""
     applied = []
+    touch = getattr(hooks, "touch", None)   # the runner records the branch a request may move (PD-66 N1)
     for request in board.pending_requests():
         try:
+            if touch is not None and request.task_id is not None:
+                touch(request.task_id)
             applied.append(_apply_one(repo, board, cfg, request, hooks, now))
             continue
         except BoardBusy:

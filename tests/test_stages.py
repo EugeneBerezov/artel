@@ -4,6 +4,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -1297,7 +1298,7 @@ class RepoCheckStageTest(StagesCase):
         self.assertEqual(git(self.repo_path, "rev-parse", f"artel/{tid}"), tip)
         (fail,) = self.fail_entries(tid)
         self.assertIn("review changed the shared repository", fail)
-        self.assertIn("(restored)", fail)
+        self.assertIn("(restored", fail)
         self.assert_slot_left()
 
     def test_writer_moving_integration_or_other_branch_fails(self):
@@ -1399,11 +1400,85 @@ class RepoCheckStageTest(StagesCase):
         tid = self.review_task()
         self.attributes_scenario(tid)
         plan, run, tr = self.go(tid, overlapping=lambda: [tid, 99])
-        self.assertEqual((tr.event, run.overlapped), ("review_clear", (99,)))
-        self.assertEqual(self.task(tid).state, "verifying")
+        self.assertEqual((tr, run.overlapped), (None, (99,)))   # requeued: nothing judged, nothing charged
+        self.assertEqual((self.task(tid).state, self.task(tid).attempts, self.task(tid).stage_runs),
+                         ("reviewing", 0, 0))
         self.assertFalse((self.repo.common_dir / "info" / "attributes").exists())
         (fail,) = self.fail_entries(tid)
-        self.assertIn("stage not failed, overlapping: #99", fail)
+        self.assertIn("others running meanwhile: #99; stage not failed", fail)
+
+    def test_overlapping_review_tracked_edit_still_fails(self):
+        """Mutation caught: the overlap exemption covering the slot's own tracked files (a reviewer that edits the
+        code under review and touches a shared file passes, and closes findings)."""
+        tid = self.review_task(round=2)
+        found = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
+                                    text="open one", basis="", author="agent:review")
+        target = str(self.repo.common_dir / "info" / "attributes")
+        self.scenario({f"{tid}:review": [{"write": ["work.txt", "edited\n"]}, {"write": [target, "x\n"]},
+                                         {"result": {"outcome": "pass", "summary": "fine", "closed": [found]}}]})
+        plan, run, tr = self.go(tid, overlapping=lambda: [99])
+        self.assertEqual((tr.event, run.left_tracked), ("stage_failed", True))
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid)], [found])
+        self.assertEqual(len(self.fail_entries(tid)), 1)   # one FAIL entry for both
+
+    def test_overlapping_reviewer_commit_still_fails(self):
+        """Mutation caught: the own branch moving unnoticed because another stage ran meanwhile."""
+        tid = self.review_task(round=2)
+        found = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
+                                    text="open one", basis="", author="agent:review")
+        self.scenario({f"{tid}:review": [*self.commit_action("x.txt", "sneaky"),
+                                         {"result": {"outcome": "pass", "summary": "fine", "closed": [found]}}]})
+        plan, run, tr = self.go(tid, overlapping=lambda: [99])
+        self.assertEqual((tr.event, run.own_change), ("stage_failed", True))
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid)], [found])
+
+    def test_writer_rewriting_its_branch_is_charged_despite_overlap(self):
+        """Mutation caught: own-branch moves exempted by the overlap rule (the writer's work is rewound and the
+        run must be a failed stage, not `ready` without commits)."""
+        tid = self.task_in("writing", with_commit=True)   # the branch already holds a commit
+        self.scenario({f"{tid}:write": [{"git": ["commit", "--amend", "-q", "-m", "again"]}, {"result": READY}]})
+        plan, run, tr = self.go(tid, overlapping=lambda: [99])
+        self.assertEqual((tr.event, run.own_change), ("stage_failed", True))
+
+    def test_shared_change_with_overlap_closes_nothing(self):
+        """Mutation caught: a review that touched the shared repository (overlap: not charged) still closing the
+        finding it names."""
+        tid = self.review_task(round=2)
+        found = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
+                                    text="open one", basis="", author="agent:review")
+        target = str(self.repo.common_dir / "info" / "attributes")
+        self.scenario({f"{tid}:review": [{"write": [target, "x\n"]},
+                                         {"result": {"outcome": "pass", "summary": "fine", "closed": [found]}}]})
+        plan, run, tr = self.go(tid, overlapping=lambda: [99])
+        self.assertIsNone(tr)
+        self.assertEqual([e.id for e in journal.open_findings(self.board, tid)], [found])
+        self.assertIn("others running meanwhile: #99; stage not failed", self.fail_entries(tid)[0])
+
+    def test_base_job_is_named_in_the_overlap_text(self):
+        """Mutation caught: the base job shown as `#0`."""
+        tid = self.review_task()
+        self.attributes_scenario(tid)
+        self.go(tid, overlapping=lambda: [0])
+        self.assertIn("base job", self.fail_entries(tid)[0])
+        self.assertNotIn("#0", self.fail_entries(tid)[0])
+
+    def test_stopped_stage_journals_its_repository_changes(self):
+        """Mutation caught: a stage stopped (requeued) after it changed the repository leaving no record."""
+        tid = self.review_task()
+        target = str(self.repo.common_dir / "info" / "attributes")
+        stop = threading.Event()
+        self.scenario({f"{tid}:review": [{"write": [target, "x\n"]}, {"sleep": 30}, self.PASS]})
+
+        def stop_soon():
+            deadline = time.monotonic() + 20
+            while not (self.repo.common_dir / "info" / "attributes").exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            stop.set()
+        threading.Thread(target=stop_soon, daemon=True).start()
+        plan, run, tr = self.go(tid, stop=stop)
+        self.assertTrue(run.stopped)
+        self.assertIsNone(tr)
+        self.assertIn("review changed the shared repository", self.fail_entries(tid)[0])
 
     def test_idle_slot_cleaned_by_the_check_loses_its_setup_hash(self):
         """Mutation caught: an idle slot scrubbed of setup output keeping a hash that says setup is done."""

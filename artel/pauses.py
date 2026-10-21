@@ -6,9 +6,9 @@ Each kind ends on its own; a kind that ends by itself never removes another kind
 import json
 from dataclasses import dataclass
 
-KINDS = ("manual", "base_conflict", "integration_moved", "failures", "limit", "agent_unavailable", "quota",
-         "disk", "setup_failed")
-HUMAN_KINDS = ("manual", "base_conflict", "integration_moved", "failures")   # plain resume removes them (PD-60)
+KINDS = ("manual", "base_conflict", "integration_moved", "failures", "repo_changed", "limit", "agent_unavailable",
+         "quota", "disk", "setup_failed")
+HUMAN_KINDS = ("manual", "base_conflict", "integration_moved", "failures", "repo_changed")   # plain resume removes them (PD-60)
 PROBED_KINDS = ("limit", "agent_unavailable", "quota")      # probed when the pause has no known end (PD-60)
 TOKEN_FREE_KINDS = ("limit", "quota", "agent_unavailable")  # verify and integration continue under these only
 

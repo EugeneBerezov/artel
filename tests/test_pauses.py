@@ -17,9 +17,9 @@ class PausesTest(unittest.TestCase):
 
     def test_kind_tuples(self):
         # PD-54, PD-60, PD-65 d: the tuples the other tasks take their rules from
-        self.assertEqual(pauses.KINDS, ("manual", "base_conflict", "integration_moved", "failures", "limit",
+        self.assertEqual(pauses.KINDS, ("manual", "base_conflict", "integration_moved", "failures", "repo_changed", "limit",
                                         "agent_unavailable", "quota", "disk", "setup_failed"))
-        self.assertEqual(pauses.HUMAN_KINDS, ("manual", "base_conflict", "integration_moved", "failures"))
+        self.assertEqual(pauses.HUMAN_KINDS, ("manual", "base_conflict", "integration_moved", "failures", "repo_changed"))
         self.assertEqual(pauses.PROBED_KINDS, ("limit", "agent_unavailable", "quota"))
         self.assertEqual(pauses.TOKEN_FREE_KINDS, ("limit", "quota", "agent_unavailable"))
 
