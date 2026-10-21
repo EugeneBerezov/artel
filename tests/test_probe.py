@@ -120,6 +120,14 @@ class RunProbeTest(ProbeCase):
         self.assertEqual(result.outcome, "unavailable")
 
 
+    def test_probe_timeout_is_unavailable_even_after_an_assistant_record(self):
+        """Mutation caught: a timed-out probe read as ok (it would lift the pause)."""
+        from unittest import mock
+        self.scenario({":probe": [{"assistant": {"input_tokens": 1, "output_tokens": 1}}, {"sleep": 30}]})
+        with mock.patch.object(probe, "PROBE_TIMEOUT", 1):
+            self.assertEqual(self.run_probe().outcome, "unavailable")
+
+
 class DueTest(ProbeCase):
     def test_first_probe_is_due_one_retry_after_since(self):
         """Mutation caught: k = 0 (a probe at once), or measuring from the wrong anchor."""

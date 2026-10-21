@@ -379,6 +379,37 @@ class SetupPauseTest(OpsCase):
         finally:
             r.shutdown()
 
+    def test_timed_lift_after_a_restart_announces_the_end(self):
+        """T35 review m1(ii). Mutation caught: the persisted pause removed silently once the in-memory outage is gone."""
+        r = self.failed_once()
+        r.shutdown()
+        self.events.clear()
+        r2 = self.started(max_agents=1)
+        try:
+            self.clock.advance(15 * 60 + 1)
+            r2.tick()
+            self.assertNotIn("setup_failed", pauses.active(self.board))
+            self.assertIn("setup_failed", [e.text for e in self.sent(r2, "resumed")])
+        finally:
+            r2.shutdown()
+
+    def test_older_stage_finishing_does_not_end_the_outage(self):
+        """T35 review m1(iii). Mutation caught: any stage with setup ok after the timed lift announcing the end."""
+        r = self.failed_once()
+        try:
+            self.clock.advance(15 * 60 + 1)
+            started_before = self.clock() - 1
+            r.tick()                                   # the timed lift (a retry may start; we call by hand below)
+            r._setup_outage = r._setup_outage or {"hash": "h", "since": 0.0, "line": ""}
+            pauses.remove(self.board, "setup_failed")
+            self.events.clear()
+            r._setup_worked(started_before)
+            self.assertEqual(self.sent(r, "resumed"), [])
+            r._setup_worked(self.clock() + 1)
+            self.assertEqual([e.text for e in self.sent(r, "resumed")], ["setup_failed"])
+        finally:
+            r.shutdown()
+
     def test_setup_pause_lifts_after_setup_retry(self):
         r = self.failed_once()
         try:

@@ -96,6 +96,27 @@ def add(board, kind: str, detail: str, *, now: float, until: float | None = None
     return new
 
 
+def drop_cause(board, kind: str, detail: str) -> str:
+    """Removes the causes of `kind` with this detail (a window that fell below its threshold). -> "none" when there
+    was no such cause, "dropped", or "emptied" when it was the last one and the kind is gone (the caller notifies
+    `resumed`)."""
+    _check_kind(kind)
+    with board.tx():
+        records = _load(board)
+        record = records.get(kind)
+        if record is None:
+            return "none"
+        left = [c for c in record["causes"] if c["detail"] != detail]
+        if len(left) == len(record["causes"]):
+            return "none"
+        if left:
+            record["causes"] = left
+        else:
+            del records[kind]
+        _store(board, records)
+    return "dropped" if left else "emptied"
+
+
 def set_exhausted(board, kind: str) -> None:
     _check_kind(kind)
     with board.tx():
