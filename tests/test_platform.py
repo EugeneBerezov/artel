@@ -260,6 +260,61 @@ class StopHandlerTest(unittest.TestCase):
         self.assertIn("stopped 1", out)
 
 
+    def stopper(self, prelude=""):
+        code = (prelude + "import time\nfrom artel import platform as P\ns = P.install_stop_handlers()\n"
+                "print('up', flush=True)\n"
+                "while not s.requested():\n    time.sleep(0.05)\nprint('stopped', s.count, flush=True)\n")
+        proc = subprocess.Popen(py_cmd(code), stdout=subprocess.PIPE, encoding="utf-8",
+                                env=subprocess_env(), cwd=REPO_ROOT, **P.popen_kwargs())
+        P.register_tree(proc)
+        self.addCleanup(proc.wait)
+        self.addCleanup(lambda: P.hard_kill(proc.pid, P.group_of(proc)))
+        self.addCleanup(proc.stdout.close)
+        self.assertEqual(proc.stdout.readline().strip(), "up")
+        return proc
+
+    @unittest.skipIf(P.IS_WINDOWS, "POSIX only")
+    def test_sighup_is_soft_stop(self):
+        """Mutation caught: SIGHUP left at its default (an ssh drop kills the runner, its agents keep running)."""
+        import signal
+        proc = self.stopper()
+        proc.send_signal(signal.SIGHUP)
+        out = proc.stdout.read()
+        self.assertEqual(proc.wait(timeout=10), 0)   # killed by SIGHUP: -1
+        self.assertIn("stopped 1", out)
+
+    @unittest.skipIf(P.IS_WINDOWS, "POSIX only")
+    def test_nohup_ignored_sighup_stays_ignored(self):
+        """Mutation caught: the SIGHUP handler replacing nohup's SIG_IGN (a nohup'ed runner would stop on an ssh
+        drop and end the night)."""
+        import signal
+        proc = self.stopper("import signal\nsignal.signal(signal.SIGHUP, signal.SIG_IGN)\n")
+        proc.send_signal(signal.SIGHUP)
+        time.sleep(0.5)
+        self.assertIsNone(proc.poll())           # still running: the SIGHUP was ignored
+        proc.send_signal(signal.SIGTERM)
+        out = proc.stdout.read()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertIn("stopped 1", out)          # only the SIGTERM counted
+
+    @unittest.skipUnless(P.IS_WINDOWS, "Windows only")
+    def test_nohup_pair_on_windows(self):
+        """The pair of test_nohup_ignored_sighup_stays_ignored: Windows has no SIGHUP to keep ignored."""
+        import signal
+        self.assertFalse(hasattr(signal, "SIGHUP"))
+
+    @unittest.skipUnless(P.IS_WINDOWS, "Windows only")
+    def test_stop_handlers_without_sighup_on_windows(self):
+        """The pair of test_sighup_is_soft_stop. Mutation caught: SIGHUP installed unconditionally (no such
+        signal on Windows: install_stop_handlers would raise and the runner could not start)."""
+        import signal
+        self.assertFalse(hasattr(signal, "SIGHUP"))
+        proc = self.stopper()
+        P.soft_terminate(proc.pid, P.group_of(proc))
+        out = proc.stdout.read()
+        self.assertEqual(proc.wait(timeout=10), 0)
+        self.assertIn("stopped 1", out)
+
 class ShellTest(unittest.TestCase):
     def test_shell_argv_variants(self):
         self.assertEqual(P.shell_argv("auto", "x", windows=False), ["sh", "-c", "x"])

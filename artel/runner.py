@@ -4,7 +4,9 @@ Single writer (§3.1): workers run stages, verify and the base job and store the
 applies transitions, and human requests at the start of every tick (`requests.apply_pending`, Task 18). While
 any pause is active the runner keeps ticking (§3.1 Pauses); notifications go out on one sender thread, never on
 the tick thread. Usage events, quota windows, the night budget and the probes that end an open-ended pause are
-here too (Task 35); vetting belongs to Task 21.
+here too (Task 35), and so are the guards of an unattended night: the `stage_runs` cap, the failure breaker,
+the `agent_unavailable` pause and its escalation streak, and the run records of PD-71 (Task 37). Vetting belongs to
+Task 21.
 """
 import json
 import os
@@ -38,6 +40,11 @@ LIMIT_WINDOW_MIN = 0.9                  # a window this full is the one a reset-
 LIMIT_DETAIL = "usage limit"             # one cause per kind: a probe that learns the reset time replaces it
 LIMIT_KINDS = ("limit", "quota", "agent_unavailable")   # end at `until`, or by a probe when there is none
 _QUOTA_KEYS = (("five_hour", "quota_stop_five_hour"), ("seven_day", "quota_stop_seven_day"))
+BREAKER_MIN_TASKS = 2                    # PD-60 a: the failure breaker needs failures of this many distinct tasks
+_FAILURE_STREAK = "failure_streak"       # PD-58: {"count": n, "tasks": [ids]}
+_UNAVAILABLE_STREAK = "unavailable_streak"   # PD-58, PD-61: {"signature": str, "count": n}
+_PROBE_KEY = "probe_running"             # like PD-34's base_running: the probe job's pid, group and fingerprint
+PROBE_LOG_KEEP = 7 * 24 * 3600.0         # probe logs older than this are pruned (they belong to no task)
 
 
 @dataclass
@@ -55,6 +62,7 @@ class Job:
     finished: bool = False      # the work returned: the thread is about to end, collect it now
     probe_kind: str | None = None   # the pause kind a probe job was started for
     started_at: float = 0.0         # the injected clock when it was spawned
+    agent_started: bool = False     # a stage job's agent process was spawned (spec §3.1 Counters: stage_runs)
 
 
 @dataclass(frozen=True)
@@ -70,12 +78,16 @@ def _tail(text: str, limit: int = 1200) -> str:
 
 class Runner:
     def __init__(self, repo: Repo, cfg, *, env: Mapping[str, str] | None = None,
-                 clock: Callable[[], float] = time.time, notify: Notify = null_notify):
+                 clock: Callable[[], float] = time.time, notify: Notify = null_notify,
+                 notify_kill: Callable[[], None] | None = None):
+        """`notify_kill`: ends a notifier still busy when shutdown's flush deadline has passed (a hung notify
+        command, notify.Dispatcher.kill)."""
         self.repo = repo
         self.cfg = cfg
         self.env = dict(os.environ if env is None else env)
         self.clock = clock
         self.notify = notify
+        self.notify_kill = notify_kill
         self.board: Board | None = None
         self.jobs: list[Job] = []
         self._rate_events: queue.SimpleQueue = queue.SimpleQueue()   # RateLimit events from worker threads
@@ -96,6 +108,13 @@ class Runner:
         self._outbox: queue.Queue = queue.Queue()      # events for the sender thread
         self._sender: threading.Thread | None = None
         self._notify_errors: list[str] = []            # tracebacks of a raising notifier, journaled by the tick
+        self.workers: int = cfg["max_agents"]          # PD-71 a: the effective worker count (`-n`, else max_agents)
+        self._verify_due: dict[int, float] = {}        # PD-71 c: task id -> when it was first seen due for verify
+        self._idle: dict[int, str] = {}                # PD-71 b: slot -> the reason of its open idle span
+        self._pick_inputs: tuple | None = None         # (tasks, deps, busy) this tick gave pick.select
+        self._unavailable_reset_at: float = float("-inf")   # PD-61: the streak's last reset by another outcome
+        self._unavailable_counted_probe: float | None = None   # PD-61: the passing probe that counted the last run
+        self._announced: set[str] | None = None        # while requests are applied: kinds already notified as paused
 
     # lifecycle ----------------------------------------------------------------------------------------------
 
@@ -118,10 +137,17 @@ class Runner:
             except ArtelError as exc:
                 raise ArtelError(f"agent_command {self.cfg['agent_command']!r} is not usable: {exc}") from exc
             integrate.ensure_integration_branch(self.repo, self.cfg["base"])
-            self._adopt_integration_tip()
+            self._adopt_integration_tip(visibly=True)
             slots.ensure_slots(self.repo, self.board, self.cfg, self.cfg["max_agents"])
-            self.reconcile()
-            self._guarded("the stored usage windows", lambda: self._evaluate_usage(fresh=False))   # before the first pick
+            self._report_reconcile(self.reconcile())
+            now = self.clock()
+            for span in self.board.idle_spans():   # PD-71 b: left open by a crashed runner; its length is unknown
+                if span.until is None:
+                    self.board.close_idle(span.slot, span.since)
+            self._verify_due = {t.id: now for t in self.board.list_tasks(["verifying"])}   # PD-71 c
+            self._unavailable_reset_at = now   # PD-61: only a probe that passes from now on qualifies a crash
+            # before the first pick; no window is fresh from the store
+            self._guarded("the stored usage windows", lambda: self._evaluate_usage(reported=set()))
             if self.cfg["review_rounds"] == 0:   # PD-51
                 print("warning: review_rounds = 0 behaves like 1: one review, blocking findings go to you"
                       " (no fix round)", file=sys.stderr)
@@ -130,6 +156,22 @@ class Runner:
         except BaseException:
             self._release()
             raise
+
+    def _report_reconcile(self, report: "ReconcileReport") -> None:
+        """T22 controller review d: one FACT per stage a previous runner left behind, and its open `runs` rows
+        closed (outcome `stopped`): nobody waits for a run that no process will finish."""
+        board = self.board
+        for task_id in report.requeued:
+            task = board.get_task(task_id)
+            stage = stages.STATE_TO_STAGE.get(task.state, task.state)
+            killed = task_id in report.terminated
+            what = "terminated and requeued" if killed else "requeued (its process was gone)"
+            journal.append(board, "FACT", f"reconcile: {stage} left running by a previous runner {what}"
+                                          " without a counter", author="runner", task_id=task_id, stage=stage)
+            for run in board.list_runs(task_id):
+                if run.ended_at is None:
+                    board.finish_run(run.id, outcome="stopped", usage={}, exit_code=None, timed_out=False,
+                                     killed=killed)
 
     def _clear_stale_stop(self) -> None:
         """PD-26 amended: a stop file or stop request left from before must not stop this runner at once."""
@@ -155,14 +197,15 @@ class Runner:
                 terminated.append(task.id)
             board.clear_running(task.id)          # requeue: no counter
             requeued.append(task.id)
-        raw = board.get_meta("base_running")
-        if raw:
-            try:
-                base = json.loads(raw)
-                self._terminate_recorded(int(base["pid"]), base.get("group"), base.get("fingerprint"))
-            except (ValueError, KeyError, TypeError):
-                pass   # unreadable: nothing can be signalled safely
-        board.del_meta("base_running")
+        for key in ("base_running", _PROBE_KEY):   # PD-34; the probe job is recorded the same way (T35 SPEC-GAP)
+            raw = board.get_meta(key)
+            if raw:
+                try:
+                    rec = json.loads(raw)
+                    self._terminate_recorded(int(rec["pid"]), rec.get("group"), rec.get("fingerprint"))
+                except (ValueError, KeyError, TypeError):
+                    pass   # unreadable: nothing can be signalled safely
+            board.del_meta(key)
         slots.reconcile_slots(self.repo, board, self.cfg)
         return ReconcileReport(terminated, requeued, self._heavy_lock_check())
 
@@ -213,6 +256,23 @@ class Runner:
             directory = self.repo.logs_dir / str(task.id)
             if directory.is_dir():
                 shutil.rmtree(directory, ignore_errors=True)   # Windows: a file still open stays; next prune
+        self._prune_probe_logs()
+
+    def _prune_probe_logs(self) -> None:
+        """Probe logs belong to no task: they go by age, PROBE_LOG_KEEP after the probe started (the UTC stamp
+        probe.py puts in the name, from the runner clock). A name without a stamp is not artel's and stays."""
+        directory = self.repo.logs_dir / "probe"
+        if not directory.is_dir():
+            return
+        cutoff = self.clock() - PROBE_LOG_KEEP
+        for path in directory.iterdir():
+            started = probe.log_time(path)
+            if started is None or started >= cutoff:
+                continue
+            try:
+                path.unlink()
+            except OSError:
+                pass   # Windows: a file still open stays; next prune
 
     def _release(self) -> None:
         if self.board is not None:
@@ -262,6 +322,11 @@ class Runner:
         if "setup_failed" in kinds:
             self._setup_outage = None
         for kind in kinds:
+            if self._announced is not None:
+                if kind not in self._announced:   # paused and resumed in one tick: never a lone `resumed`
+                    detail = requests.MANUAL_DETAIL if kind == "manual" else "paused"
+                    self._emit(Event("paused", text=f"{kind}: {detail}"))
+                self._announced.discard(kind)
             self._emit(Event("resumed", text=kind))
 
     # pauses (§3.1 Pauses) -----------------------------------------------------------------------------------
@@ -311,8 +376,8 @@ class Runner:
             self._setup_hashes.clear()
 
     def _setup_worked(self, started_at: float) -> None:
-        """A stage whose setup ran ok ends the outage — only one that started after the timed lift: an older stage
-        finishing proves nothing about the retry."""
+        """A stage that got past setup (ran ok, or skipped with its inputs unchanged) ends the outage — only one that
+        started after the timed lift: an older stage finishing proves nothing about the retry."""
         if (self._setup_outage is not None and started_at >= self._setup_lifted_at
                 and "setup_failed" not in pauses.active(self.board)):
             self._setup_outage = None
@@ -377,7 +442,8 @@ class Runner:
         for ev in events:   # one bad event (or a stored record of the wrong shape) must not drop the others
             self._guarded("a rate-limit event", lambda ev=ev: self._usage_event(ev))
         if events:
-            self._guarded("the usage windows", lambda: self._evaluate_usage(fresh=True))
+            reported = {name for ev in events for name in probe.event_windows(ev)}
+            self._guarded("the usage windows", lambda: self._evaluate_usage(reported=reported))
 
     def _json_meta(self, key: str, default):
         raw = self.board.get_meta(key)
@@ -420,8 +486,7 @@ class Runner:
         """A limit hit without a reset time (owner 2026-10-21, T35 M3b): the recorded window with the highest last
         utilization; at 0.9 or more with a future reset it is the window that ran out, and its reset ends the limit.
         Otherwise None: the probe schedule decides."""
-        windows = [w for w in self._json_meta("usage_windows", {}).values()
-                   if isinstance(w, dict) and isinstance(w.get("utilization"), (int, float))]
+        windows = list(self._usage_windows().values())
         if not windows:
             return None
         top = max(windows, key=lambda w: w["utilization"])
@@ -430,11 +495,26 @@ class Runner:
             return float(reset)
         return None
 
+    def _usage_windows(self) -> dict:
+        """Meta `usage_windows` with every window of the wrong inner shape dropped (T35-2 m-c): the record is
+        rewritten without it and one FAIL names it, so a bad window can never stop the limit pauses."""
+        stored = self._json_meta("usage_windows", {})
+        bad = [name for name, w in stored.items()
+               if not isinstance(w, dict) or not _is_number(w.get("utilization"))
+               or not (w.get("resets_at") is None or _is_number(w.get("resets_at")))]
+        if bad:
+            for name in bad:
+                del stored[name]
+            self.board.set_meta("usage_windows", json.dumps(stored))
+            journal.append(self.board, "FAIL", stages._clip(
+                "usage_windows: ignored a malformed window record: " + ", ".join(map(str, bad))), author="runner")
+        return stored
+
     def _store_windows(self, windows: dict, now: float) -> None:
         """PD-56: the latest event per window; the weekly utilization is also sampled for the night budget."""
         if not windows:
             return
-        stored = self._json_meta("usage_windows", {})
+        stored = self._usage_windows()
         samples = [s for s in self._json_meta("usage_samples", []) if s[0] > now - SAMPLE_KEEP]
         rolled = stored.get("seven_day", {}).get("resets_at")
         if isinstance(rolled, (int, float)) and rolled <= now:   # the weekly window rolled: older samples are another week
@@ -449,16 +529,18 @@ class Runner:
         self.board.set_meta("usage_windows", json.dumps(stored))
         self.board.set_meta("usage_samples", json.dumps(samples))
 
-    def _evaluate_usage(self, *, fresh: bool) -> None:
-        """Quota thresholds per window and the night budget over the stored samples. `fresh` = just reported by
-        an event: a window with no reset time then pauses (and is probed); from the store at start only a window
-        with a future reset does, so a stale record cannot pause a new runner for ever."""
+    def _evaluate_usage(self, *, reported: set[str]) -> None:
+        """Quota thresholds per window and the night budget over the stored samples. A window in `reported` was
+        just reported by an event or a probe: with no future reset time it then pauses (and is probed); any other
+        stored window pauses only with a future reset, so a stale record (one whose reset has passed, T35-2 m-b)
+        cannot pause again on a result that did not report it."""
         now = self.clock()
-        windows = self._json_meta("usage_windows", {})
+        windows = self._usage_windows()
         for name, key in _QUOTA_KEYS:
             window = windows.get(name)
-            if not isinstance(window, dict) or not isinstance(window.get("utilization"), (int, float)):
+            if window is None:
                 continue
+            fresh = name in reported
             detail = f"{name} window at or above {key}"
             if window["utilization"] < self.cfg[key]:
                 if fresh and pauses.drop_cause(self.board, "quota", detail) == "emptied":   # it no longer holds
@@ -506,7 +588,9 @@ class Runner:
                 self._spawn("probe", None, -1, self._probe_work).probe_kind = kind
 
     def _probe_work(self, board: Board, job: Job):
-        return probe.run_probe(self.repo, self.cfg, self.child_env(), now=self.clock(), stop_event=job.stop)
+        on_start = self._on_start(board, job)
+        return probe.run_probe(self.repo, self.cfg, self.child_env(), now=self.clock(), stop_event=job.stop,
+                               on_start=lambda pid, group, fp: on_start("probe", pid, group, fp))
 
     def _finish_probe(self, job: Job) -> None:
         """Applies a probe's result to the pause it was started for (PD-55). Never touches a task."""
@@ -517,25 +601,48 @@ class Runner:
                            author="runner")
             pauses.record_probe(board, now=now, kind=kind, outcome="unavailable")
             return
+        if result.error is not None:   # the agent cannot start: a failed probe (owner 2026-10-21)
+            journal.append(board, "FAIL", stages._clip(f"probe: the agent cannot start: {result.error}"),
+                           author="runner")
         pauses.record_probe(board, now=now, kind=kind, outcome=result.outcome)
         self._store_windows(result.windows, now)
-        self._evaluate_usage(fresh=True)
+        self._evaluate_usage(reported=set(result.windows))
         pause = pauses.active(board).get(kind)
         if pause is None:
             return                                         # a `resume` already ended it
         if probe.ended(pause, result, self.cfg, now=now):
-            self.unpause(kind)
+            if kind == "quota":
+                self._end_quota_windows(pause)
+            else:
+                self.unpause(kind)
         elif result.outcome == "limit" and result.resets_at is not None and result.resets_at > now:
             # a probed `limit` gets its end (same cause, replaced, no second notification); for another probed
             # kind the pause stays and the limit is its own kind
             self._set_limit(result.resets_at, None)
 
+    def _end_quota_windows(self, pause) -> None:
+        """A probe ends only the window causes of `quota` (T35-2 m-a): the night budget ends at its own end, 24 h
+        after the baseline sample."""
+        for cause in pause.causes:
+            if cause.setting == "night_budget_seven_day":
+                continue
+            if pauses.drop_cause(self.board, "quota", cause.detail) == "emptied":
+                self._emit(Event("resumed", text="quota"))
+
     # the integration tip (PD-65 d) ----------------------------------------------------------------------------
 
-    def _adopt_integration_tip(self) -> None:
+    def _adopt_integration_tip(self, visibly: bool = False) -> None:
+        """`visibly` (at start, T22 controller review c): a ref moved while no runner ran is adopted — a human repair
+        is normal — but journaled and announced, so a foreign move is never taken over unseen."""
         tip = self.repo.rev(INTEGRATION)
-        if tip is not None:
-            self.board.set_meta(_TIP_KEY, tip)
+        if tip is None:
+            return
+        left = self.board.get_meta(_TIP_KEY)
+        if visibly and left and left != tip:
+            text = f"integration moved while stopped: {left}..{tip} adopted"
+            journal.append(self.board, "FACT", text, author="runner")
+            self._emit(Event("error", text=text))
+        self.board.set_meta(_TIP_KEY, tip)
 
     def _keep_tip_if_moved_to(self, sha: str | None) -> None:
         if sha is not None and self.repo.rev(INTEGRATION) == sha:
@@ -569,6 +676,7 @@ class Runner:
                     print(f"warning: {who} did not stop", file=sys.stderr)
             if self.board is not None:
                 self._guarded("collecting results", self._collect)
+                self._guarded("closing the idle spans", self._close_idle_spans)
         finally:
             try:
                 self._close_sender(max(self.cfg["kill_grace"], NOTIFY_FLUSH_MIN))
@@ -633,13 +741,21 @@ class Runner:
         return True
 
     def _close_sender(self, timeout: float) -> None:
-        if self._sender is None:
+        sender = self._sender
+        if sender is None:
             return
-        if not self.flush_notifications(timeout):
+        flushed = self.flush_notifications(timeout)
+        if not flushed:
             print(f"warning: {self._outbox.unfinished_tasks} notification(s) not sent: the notifier did not finish"
                   f" within {timeout:g} s", file=sys.stderr)
         self._outbox.put(None)   # a sender still busy ends after its event; it is a daemon either way
         self._sender = None
+        if not flushed and self.notify_kill is not None:
+            try:
+                self.notify_kill()   # a hung notify command: its process tree is terminated, later sends refused
+            except Exception as exc:   # noqa: BLE001 - shutdown goes on
+                print(f"warning: the notifier could not be stopped: {exc}", file=sys.stderr)
+            sender.join(self.cfg["kill_grace"] + procs.JOIN_DEADLINE)
 
     def _journal_notify_errors(self) -> None:
         while self._notify_errors:
@@ -686,25 +802,32 @@ class Runner:
 
     def _on_start(self, board: Board, job: Job):
         def on_start(kind: str, pid: int, group: int, fingerprint: str | None) -> None:
-            if job.kind == "base":   # PD-34: the base job belongs to no task
-                board.set_meta("base_running", json.dumps({"pid": pid, "group": group, "fingerprint": fingerprint,
-                                                           "slot": job.slot, "started_at": self.clock()}))
+            if job.kind in ("base", "probe"):   # PD-34: the base job and the probe belong to no task
+                board.set_meta("base_running" if job.kind == "base" else _PROBE_KEY,
+                               json.dumps({"pid": pid, "group": group, "fingerprint": fingerprint,
+                                           "slot": job.slot, "started_at": self.clock()}))
             else:
+                if kind == "agent":
+                    job.agent_started = True
                 board.set_running(job.task_id, kind=kind, pid=pid, group=group, fingerprint=fingerprint,
                                   slot=job.slot)
         return on_start
 
     def _stage_work(self, board: Board, job: Job):
         task = board.get_task(job.task_id)
-        plan = stages.plan_stage(self.repo, board, self.cfg, task, job.slot, base_env=self.child_env())
+        try:
+            plan = stages.plan_stage(self.repo, board, self.cfg, task, job.slot, base_env=self.child_env(),
+                                     workers=self.workers)                                     # PD-71 a
+        except agent_claude.CannotStartAgent as exc:   # owner 2026-10-21: agent_unavailable, not an internal error
+            return stages.unstarted_stage(task, str(exc))
         run = stages.run_stage(self.repo, board, self.cfg, plan, job.slot, on_start=self._on_start(board, job),
                                on_rate_limit=self.on_rate_limit, stop_event=job.stop)
         return plan, run
 
-    def _verify_work(self, board: Board, job: Job):
+    def _verify_work(self, board: Board, job: Job, queued_at: float | None = None):
         task = board.get_task(job.task_id)
         return integrate.verify_task(self.repo, board, self.cfg, task, job.slot, on_start=self._on_start(board, job),
-                                     stop_event=job.stop, env=self.child_env())
+                                     stop_event=job.stop, env=self.child_env(), queued_at=queued_at)
 
     def _base_work(self, board: Board, job: Job):
         return integrate.base_update(self.repo, board, self.cfg, job.slot, on_start=self._on_start(board, job),
@@ -715,7 +838,9 @@ class Runner:
     def tick(self) -> None:
         self._wake.clear()   # before collecting: a job that ends from here on sets it again, no lost wakeup
         self._tick_failed = False
+        self._pick_inputs = None
         self._tick()
+        self._guarded("the idle spans", self._update_idle)
         if not self._tick_failed:
             self._last_tick_error = None   # the same error later is recorded again
 
@@ -727,6 +852,8 @@ class Runner:
         self._guarded("applying requests", self._apply_requests)
         self._guarded("reading the stop file", self._read_stop_file)
         collect_failed = self._guarded("collecting results", self._collect)
+        self._guarded("clearing orphaned running flags", self._clear_orphans)
+        self._guarded("noting verify waits", self._note_verify_due)
         self._guarded("checking the integration branch", self._integration_moved)
         self._guarded("updating pauses", self.update_pauses)
         if collect_failed:
@@ -749,11 +876,14 @@ class Runner:
             self._guarded("picking work", self._pick_and_start)
 
     def _apply_requests(self) -> None:
-        before = set(pauses.active(self.board))
-        requests.apply_pending(self.repo, self.board, self.cfg, self)
-        for kind in pauses.active(self.board):   # `artel pause`: every pause notifies (§3.1)
-            if kind not in before:
-                self._notify_paused(kind)
+        self._announced = set(pauses.active(self.board))   # kinds whose `paused` the human has already been sent
+        try:
+            requests.apply_pending(self.repo, self.board, self.cfg, self, now=self.clock())
+            for kind in pauses.active(self.board):   # `artel pause`: every pause notifies (§3.1)
+                if kind not in self._announced:
+                    self._notify_paused(kind)
+        finally:
+            self._announced = None
 
     def _prune_logs_if_finished(self) -> None:
         if len(self.board.list_tasks(FINISHED_STATES)) != self._finished_count:
@@ -807,6 +937,23 @@ class Runner:
                 tail = traceback.format_exc()
                 self._guarded("finishing a job", lambda: self._finish_failed(job, tail))
 
+    def _clear_orphans(self) -> None:
+        """T22 controller review a: a task marked running with no job of this runner (its result could not be applied
+        and even `clear_running` failed, e.g. the board was locked) is requeued without a counter, like reconcile
+        does at start; a failing clear raises and is tried again next tick."""
+        board = self.board
+        live = {j.task_id for j in self.jobs if j.task_id is not None}
+        for task in board.list_tasks():
+            if not task.running or task.id in live:
+                continue
+            stage = stages.STATE_TO_STAGE.get(task.state, task.state)
+            board.clear_running(task.id)
+            journal.append(board, "FAIL", f"running flag of {stage} cleared: its job ended but its result was not"
+                                          " applied; requeued without a counter", author="runner", task_id=task.id,
+                           stage=stage)
+            self._emit(Event("error", task.id, task.title, task.state,
+                             f"internal error in {stage}; see artel show {task.id}"))
+
     def _finish_failed(self, job: Job, tail: str) -> None:
         """The result of a job could not be applied. A task job is charged like any internal error, so the
         stage cannot run (and spend quota) forever; if even that fails the FAIL entry is all that is left."""
@@ -820,10 +967,13 @@ class Runner:
                 self._record_finish_failure(job.task_id, tail)
                 return
             stage = stages.STATE_TO_STAGE.get(task.state, task.state)
-            tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, tail)
+            tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, tail,
+                                              agent_started=job.kind == "stage" and job.agent_started)
             self._emit(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,
                               f"internal error in {stage}; see artel show {job.task_id}"))
             self._after_transition(job.task_id, tr, "internal error")
+            if job.kind == "stage":
+                self._guarded("the failure breaker", lambda: self._agent_outcome(job, tr, None))
         except Exception:   # noqa: BLE001
             self._record_finish_failure(job.task_id, tail)
 
@@ -840,7 +990,9 @@ class Runner:
         board = self.board
         if job.kind == "probe":
             try:
+                board.del_meta(_PROBE_KEY)
                 self._finish_probe(job)
+                self._prune_probe_logs()
             except Exception:   # noqa: BLE001 - a probe belongs to no task: nothing else may be charged for it
                 self._record_tick_error("the probe", traceback.format_exc())
             return
@@ -860,7 +1012,7 @@ class Runner:
                 return   # PD-65 d: the result is discarded; after resume the base check runs again
             was_paused = "base_conflict" in pauses.active(board)
             try:
-                outcome = integrate.finish_base_update(self.repo, board, self.cfg, job.result)
+                outcome = integrate.finish_base_update(self.repo, board, self.cfg, job.result, now=self.clock())
             except Exception:
                 if moves:
                     self._keep_tip_if_moved_to(job.result.new)   # it may have failed after moving the ref itself
@@ -876,24 +1028,29 @@ class Runner:
         if job.error is not None:
             task = board.get_task(job.task_id)
             stage = stages.STATE_TO_STAGE.get(task.state, task.state)
-            tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, job.error)
+            tr = stages.finish_internal_error(self.repo, board, self.cfg, job.task_id, job.error,
+                                              agent_started=job.kind == "stage" and job.agent_started)
             self._emit(Event("error", job.task_id, task.title, board.get_task(job.task_id).state,
                               f"internal error in {stage}; see artel show {job.task_id}"))   # PD-38: no traceback
             self._after_transition(job.task_id, tr, "internal error")
+            if job.kind == "stage":
+                self._guarded("the failure breaker", lambda: self._agent_outcome(job, tr, None))
             return
         if job.kind == "stage":
             plan, run = job.result
             tr = stages.finish_stage(self.repo, board, self.cfg, job.task_id, plan, run)
             detail = f"setup {run.setup}"
-            if run.setup == "ok":
+            # T35-2 F1: a skipped setup (inputs unchanged) got past setup too; a conflict fix's `not_run` did not
+            if run.setup in ("ok", "skipped"):
                 self._setup_worked(job.started_at)
-        else:
-            try:
-                tr = integrate.finish_verify(self.repo, board, self.cfg, job.task_id, job.result)
-            finally:
-                board.clear_running(job.task_id)   # the job is over, whatever happened to the transition
-            detail = job.result.detail
-        self._after_transition(job.task_id, tr, detail, slot=job.slot)
+            self._after_transition(job.task_id, tr, detail, slot=job.slot)
+            self._guarded("the failure breaker", lambda: self._agent_outcome(job, tr, run))
+            return
+        try:
+            tr = integrate.finish_verify(self.repo, board, self.cfg, job.task_id, job.result)
+        finally:
+            board.clear_running(job.task_id)   # the job is over, whatever happened to the transition
+        self._after_transition(job.task_id, tr, job.result.detail, slot=job.slot)
 
     def _base_failed(self, error: str, log_path: Path | None = None) -> None:
         """PD-34: the traceback goes into the runner FAIL entry only; the pause and its event stay one line."""
@@ -969,17 +1126,147 @@ class Runner:
             tasks = [t for t in tasks if t.state == "verifying" or t.running or t.id in busy]
         tasks = [t for t in tasks if not (t.id in held and t.state == "open")]
         busy |= {t.id for t in tasks if t.id in held}
-        selected = pick.select(tasks, board.all_deps(), free_slots=len(free),
+        deps = board.all_deps()
+        selected = pick.select(tasks, deps, free_slots=len(free),
                                verify_busy=any(j.kind == "verify" for j in self.jobs), busy=busy)
+        self._pick_inputs = (tasks, deps, set(busy))   # PD-71 b: idle_reason sees exactly what select saw
         for task in selected:
             if not free:
                 break
             task = self._start_transition(task)
-            slot = free.pop(0)
             if task.state == "verifying":
-                self._spawn("verify", task.id, slot, self._verify_work)
+                queued_at = self._verify_due.pop(task.id, self.clock())                 # PD-71 c
+                self._spawn("verify", task.id, free.pop(0),
+                            lambda board_, job, q=queued_at: self._verify_work(board_, job, q))
+            elif self._at_cap(task):
+                continue   # R39 applied: no run, no slot
             else:
-                self._spawn("stage", task.id, slot, self._stage_work)
+                self._spawn("stage", task.id, free.pop(0), self._stage_work)
+
+    def _at_cap(self, task) -> bool:
+        """§3.1 R39: a task whose `stage_runs` reached `max_stage_runs` goes `stuck` instead of starting an agent
+        stage (no run, no slot, no agent call). A human command that moves it sets `stage_runs` to 0."""
+        limits = transitions.Limits.from_cfg(task, self.cfg)
+        if task.state not in transitions.STAGE_STATES or task.stage_runs < limits.max_stage_runs:
+            return False
+        board = self.board
+        stage = stages.STATE_TO_STAGE.get(task.state, task.state)
+        with board.tx():
+            tr = transitions.apply(board, task.id, "due_at_cap", limits)
+            journal.append(board, "VERDICT", stages._clip(f"STUCK {stage} r{task.round}: {tr.cause}"),
+                           author="runner", task_id=task.id, stage=stage, round=task.round)
+        self._after_transition(task.id, tr, "")
+        return True
+
+    def _note_verify_due(self) -> None:
+        """PD-71 c: the time each task was first seen due for verify without a job; the verify run records it."""
+        live = {j.task_id for j in self.jobs if j.task_id is not None}
+        due = {t.id for t in self.board.list_tasks(["verifying"]) if not t.running and t.id not in live}
+        now = self.clock()
+        self._verify_due = {i: self._verify_due.get(i, now) for i in due}
+
+    # idle spans (PD-71 b) ---------------------------------------------------------------------------------------
+
+    def _update_idle(self) -> None:
+        """After the pick: every slot without a job gets the reason it is idle; a span is written only when a
+        slot's reason changes and closed when the slot gets a job."""
+        if self.stopping or self.board is None:
+            return
+        board, now = self.board, self.clock()
+        used = {j.slot for j in self.jobs}
+        for n in [n for n in self._idle if n in used]:
+            board.close_idle(n, now)
+            del self._idle[n]
+        idle = [n for n in range(1, self.cfg["max_agents"] + 1) if n not in used]
+        if not idle:
+            return
+        active = pauses.active(board)
+        if active:
+            reason = f"paused:{next(iter(active))}"   # pauses.active is in pauses.KINDS order
+        elif self._pick_inputs is not None:
+            tasks, deps, busy = self._pick_inputs
+            reason = pick.idle_reason(tasks, deps, busy=busy)
+        else:
+            return   # nothing was picked this tick (a base update, a failed step): the spans stay as they are
+        for n in idle:
+            if self._idle.get(n) != reason:
+                board.open_idle(n, reason, now)   # closes the slot's previous span
+                self._idle[n] = reason
+
+    def _close_idle_spans(self) -> None:
+        now = self.clock()
+        for n in list(self._idle):
+            self.board.close_idle(n, now)
+            del self._idle[n]
+
+    # the failure breaker and the agent_unavailable streak (spec §5 step 6, PD-58, PD-60, PD-61) -----------------
+
+    def _agent_outcome(self, job: Job, tr, run) -> None:
+        """After a classified agent outcome. Requeues (tr None) and setup failures neither count nor reset;
+        `agent_unavailable` pauses (or escalates) and leaves the failure count alone; every other outcome resets
+        the unavailable streak, and counts for the breaker when it increments `attempts`, else resets it."""
+        if tr is None or tr.event == "setup_failed":
+            return
+        if tr.event == "agent_unavailable":
+            self._agent_unavailable(job, run)
+            return
+        self._reset_unavailable_streak()
+        failed = tr.event in ("stage_failed", "internal_error") or \
+            (tr.event == "ready_no_commits" and "attempts" in tr.updates)   # R17r; R15b asks a human instead
+        streak = self._json_meta(_FAILURE_STREAK, {})
+        count = streak.get("count") if isinstance(streak.get("count"), int) else 0
+        ids = [i for i in streak.get("tasks", []) if isinstance(i, int)] if isinstance(streak.get("tasks"), list) else []
+        if not failed:
+            if count or ids:
+                self.board.set_meta(_FAILURE_STREAK, json.dumps({"count": 0, "tasks": []}))
+            return
+        count += 1
+        if job.task_id not in ids:
+            ids.append(job.task_id)
+        self.board.set_meta(_FAILURE_STREAK, json.dumps({"count": count, "tasks": ids}))
+        if (count >= self.cfg["max_consecutive_failures"] and len(ids) >= BREAKER_MIN_TASKS
+                and "failures" not in pauses.active(self.board)):
+            self.pause("failures", f"{count} failed stages in a row: " + ", ".join(f"#{i}" for i in ids),
+                       setting="max_consecutive_failures")
+
+    def _reset_unavailable_streak(self) -> None:
+        self._unavailable_reset_at = self.clock()   # a new outage needs a new passing probe to qualify
+        self._unavailable_counted_probe = None
+        streak = self._json_meta(_UNAVAILABLE_STREAK, {})
+        if streak.get("count") or streak.get("signature"):
+            self.board.set_meta(_UNAVAILABLE_STREAK, json.dumps({"signature": "", "count": 0}))
+
+    def _passing_probe_at(self, started_at: float) -> float | None:
+        """PD-61: the time of the passing probe the run started after, if that probe passed since the streak was
+        last reset; else None."""
+        last = self._json_meta("last_probe", {})
+        at = last.get("at")
+        if last.get("outcome") == "ok" and _is_number(at) and self._unavailable_reset_at < at <= started_at:
+            return at
+        return None
+
+    def _agent_unavailable(self, job: Job, run) -> None:
+        """R38 was applied by finish_stage (requeue, no counter, branch kept). Pause `agent_unavailable` until a
+        probe passes; the same signature `max_consecutive_failures` times in a row, each run started after a
+        passing probe, is a permanent fault: pause `failures` instead (PD-61; one task is enough)."""
+        signature = (run.signature if run is not None else None) or "unknown"
+        probe_at = self._passing_probe_at(job.started_at)
+        if probe_at is not None:
+            streak = self._json_meta(_UNAVAILABLE_STREAK, {})
+            count = streak.get("count") if isinstance(streak.get("count"), int) else 0
+            # controller decision (T37 review m1): at most one run per passing probe counts — the runs started in
+            # parallel after one probe are one piece of evidence, not `max_agents` of them. In memory: a restart
+            # moves `_unavailable_reset_at`, so a probe from before it never qualifies anyway.
+            if probe_at != self._unavailable_counted_probe:
+                count = count + 1 if streak.get("signature") == signature else 1
+                self.board.set_meta(_UNAVAILABLE_STREAK, json.dumps({"signature": signature, "count": count}))
+                self._unavailable_counted_probe = probe_at   # after the write: a failed write counts nothing
+            if count >= self.cfg["max_consecutive_failures"]:
+                if "failures" not in pauses.active(self.board):
+                    self.pause("failures", f"agent unavailable {count} times with {signature} although probes pass"
+                                           " — check models.* and agent_command", setting="max_consecutive_failures")
+                return
+        self.pause("agent_unavailable", signature, until=None)
 
     def _held_elsewhere(self, tasks) -> set[int]:
         """Tasks whose branch a human (any non-slot worktree) has checked out; journaled once when a task becomes
@@ -1010,6 +1297,10 @@ class Runner:
         return task
 
 
+def _is_number(value) -> bool:
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
 def _size(n: int) -> str:
     for unit, scale in (("G", 1 << 30), ("M", 1 << 20), ("K", 1 << 10)):
         if n >= scale:
@@ -1024,4 +1315,4 @@ def run_command(args) -> int:
     cli = {"max_agents": (args.n, "flag -n")} if getattr(args, "n", None) else None
     cfg = config_mod.load_config(repo, cli=cli)
     dispatcher = notify_mod.Dispatcher.from_config(cfg, os.environ)
-    return Runner(repo, cfg, notify=dispatcher.emit).run_forever()
+    return Runner(repo, cfg, notify=dispatcher.emit, notify_kill=dispatcher.kill).run_forever()

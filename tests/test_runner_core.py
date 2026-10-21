@@ -927,7 +927,8 @@ class RunnerReopenTest(E2ECase):
             r.shutdown()
 
     def test_a_failure_while_charging_a_failed_job_does_not_end_the_runner(self):
-        # catches _collect calling _finish_failed unguarded: a second error would escape tick()
+        # catches _collect calling _finish_failed unguarded: a second error would escape tick(). (Task 37: the task
+        # left `running` is then requeued by the orphan check and picked again, so jobs keep coming.)
         self.scenario({"write": WRITE, "review": PASS})
         self.add_task("Add hello")
         r = self.runner(max_agents=1)
@@ -935,13 +936,13 @@ class RunnerReopenTest(E2ECase):
         try:
             with mock.patch.object(Runner, "_finish", side_effect=RuntimeError("finish broke")), \
                     mock.patch.object(Runner, "_finish_failed", side_effect=RuntimeError("charge broke")):
-                self.drive(r, lambda: not r.jobs and self.board.conn.execute(
+                self.drive(r, lambda: self.board.conn.execute(
                     "SELECT 1 FROM entries WHERE kind = 'FAIL' AND text LIKE '%charge broke%'").fetchone())
                 r.tick()
         finally:
             r.shutdown()
         rows = self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'").fetchall()
-        self.assertIn("finishing a job", rows[-1]["text"])
+        self.assertTrue(any("internal error in finishing a job" in row["text"] for row in rows))
 
     def test_an_error_while_integrating_does_not_end_the_runner(self):
         # catches tick calling _integrate_verified unguarded, or returning before picking after its failure

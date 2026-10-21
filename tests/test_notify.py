@@ -296,6 +296,18 @@ class DispatcherTest(NotifyBase):
         self.assertTrue(notify.CommandNotifier(cmd, "auto").send_event(Event("stuck", 2, "t", "stuck", "why")))
         self.assertEqual(out.read_text(encoding="utf-8"), "artel: #2 stuck — t\nwhy")
 
+    def test_notify_command_env_has_artel_child(self):
+        """Mutation caught: the notify command run without ARTEL_CHILD=1 (a notify script could then answer,
+        approve or accept in the human's name, PD-65)."""
+        out = self.tmp / "child.txt"
+        cmd = [sys.executable, "-c",
+               "import os, sys; open(sys.argv[1], 'w', encoding='utf-8').write(os.environ.get('ARTEL_CHILD', '-'))",
+               str(out)]
+        with mock.patch.dict(os.environ):
+            os.environ.pop("ARTEL_CHILD", None)   # the runner's own environment does not carry it
+            self.assertTrue(notify.CommandNotifier(cmd, "auto", ["ARTEL_CHILD"]).send_event(Event("stuck", 1)))
+        self.assertEqual(out.read_text(encoding="utf-8"), "1")
+
     def test_command_notifier_does_not_pass_the_bot_token(self):
         """Mutation caught: the whole environment (bot token included) handed to a user-supplied command."""
         out = self.tmp / "env-keys.json"

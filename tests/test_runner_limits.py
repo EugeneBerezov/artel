@@ -746,3 +746,73 @@ class ReviewFixesTest(LimitCase):
         self.clock.now = T0 + 30 * MIN
         self.finish_probe(r, 1)
         self.assertIsNone(self.active()["limit"].until)
+
+
+class CrossReview2Test(LimitCase):
+    """Task 37: the T35 cross-review 2 items (reviews/T35-2.md) and their controller decisions."""
+
+    def test_probe_does_not_end_night_budget(self):
+        """m-a. Mutation caught: a probe started for a reset-less window cause lifting the whole `quota` pause, the
+        night budget's cause (until baseline + 24 h) with it."""
+        self.scenario({":probe": [{"assistant": {"input_tokens": 1, "output_tokens": 1}},
+                                  {"rate_limit": ["allowed", T0 + DAY, "five_hour", 0.5]},
+                                  {"result": {"summary": "OK"}}]})
+        r = self.started()
+        self.feed(r, week(0.30, T0 + 6 * DAY))
+        self.clock.now = T0 + 20 * MIN
+        self.feed(r, week(0.46, T0 + 6 * DAY))                       # the night budget: until T0 + 24 h
+        self.feed(r, limit_event("allowed", None, "five_hour", 0.97))   # a window cause without a reset: probed
+        self.assertIsNone(self.active()["quota"].until)
+        self.clock.now = T0 + 50 * MIN
+        self.finish_probe(r, 1)
+        quota = self.active()["quota"]
+        self.assertEqual([c.setting for c in quota.causes], ["night_budget_seven_day"])
+        self.assertEqual(quota.until, T0 + DAY)
+        self.assertNotIn("quota", [e.text for e in self.sent(r, "resumed")])
+        self.clock.now = T0 + DAY
+        r.tick()
+        self.assertNotIn("quota", self.active())                       # it ends at its own end
+
+    def test_past_reset_window_not_readded(self):
+        """m-b. Mutation caught: a stored window whose reset has passed coming back as a probed quota cause on a
+        result that did not report it (a 429-only result)."""
+        r = self.started()
+        self.feed(r, week(0.85, T0 + HOUR))
+        self.clock.now = T0 + 2 * HOUR
+        r.tick()
+        self.assertEqual(self.kinds(), [])
+        self.feed(r, limit_event("rejected", None, None))               # 429 only: no windows
+        self.assertEqual(self.kinds(), ["limit"])
+        self.assertEqual(len([e for e in self.sent(r, "paused") if e.text.startswith("quota:")]), 1)
+
+    def test_bad_usage_windows_shape_keeps_limits(self):
+        """m-c. Mutation caught: a window of the wrong inner shape raising in every event (no limit pause ever
+        again), or ignored silently / journaled on every read."""
+        self.board.set_meta("usage_windows", json.dumps({"seven_day": 5, "five_hour": {"utilization": "x"},
+                                                         "other": {"utilization": 0.1, "resets_at": "soon"}}))
+        r = self.started()
+        self.feed(r, limit_event("rejected", T0 + HOUR))
+        self.feed(r, week(0.9, T0 + DAY))
+        self.assertEqual(self.kinds(), ["limit", "quota"])
+        fails = [row["text"] for row in self.board.conn.execute("SELECT text FROM entries WHERE kind = 'FAIL'")]
+        self.assertEqual(len(fails), 1, fails)
+        self.assertIn("usage_windows", fails[0])
+        self.assertEqual(set(json.loads(self.board.get_meta("usage_windows"))), {"seven_day"})
+
+    def test_limit_guess_at_exactly_point_nine(self):
+        """m-d N1, N2. Mutation caught: `>` for `>=` at LIMIT_WINDOW_MIN, or a floor above 0.9."""
+        r = self.started()
+        self.feed(r, limit_event("allowed", T0 + 2 * HOUR, "five_hour", 0.9), week(0.4, T0 + 5 * DAY))
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertEqual(self.active()["limit"].until, T0 + 2 * HOUR)
+
+    def test_reset_less_hit_after_known_end_expired_keeps_limit(self):
+        """m-d N3. Events are applied before the pause ends are checked: a reset-less hit in the tick where a known
+        end has passed must keep the limit. Mutation caught: the M3a guard without `known.until > now` (the hit is
+        dropped and the limit lifted into a running limit)."""
+        r = self.started()
+        self.feed(r, limit_event("rejected", T0 + HOUR))
+        self.clock.now = T0 + HOUR + 1
+        self.feed(r, limit_event("rejected", None, None))
+        self.assertIn("limit", self.active())
+        self.assertIsNone(self.active()["limit"].until)

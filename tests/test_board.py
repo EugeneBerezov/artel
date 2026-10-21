@@ -311,6 +311,27 @@ class BoardTest(unittest.TestCase):
 
     test_migration_adds_round2_columns_and_idle = test_board_migrates_old_tasks_table
 
+    def test_migrate_adds_missing_idle_table(self):
+        """Mutation caught: `_migrate` returning early when every column is present (a board with all task/run
+        columns but no `idle` table would raise `no such table: idle` at the first idle span)."""
+        path = Path(self._tmp.name) / "no-idle.db"
+        B.open_board(path).close()
+        raw = sqlite3.connect(str(path), isolation_level=None)
+        raw.execute("DROP TABLE idle")
+        raw.close()
+        reopened = B.open_board(path)
+        self.addCleanup(reopened.close)
+        self.assertEqual(reopened.idle_spans(), [])
+        reopened.open_idle(1, "no_task", 5.0)
+        self.assertEqual(reopened.idle_spans(), [B.IdleSpan(1, "no_task", 5.0, None)])
+
+    def test_idle_span_ending_at_since_included(self):
+        """Mutation caught: `until > ?` for `until >= ?` in idle_spans (a span closed exactly at `since` lost)."""
+        self.board.open_idle(1, "area", 10.0)
+        self.board.close_idle(1, 20.0)
+        self.assertEqual(self.board.idle_spans(since=20.0), [B.IdleSpan(1, "area", 10.0, 20.0)])
+        self.assertEqual(self.board.idle_spans(since=20.5), [])
+
     def test_migration_waits_for_no_lock_on_a_current_board(self):
         """Mutation caught: `_migrate` always opening a write transaction (read-only commands hit BoardBusy)."""
         with self.board.tx():

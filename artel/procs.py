@@ -27,6 +27,10 @@ class ProcResult:
     duration: float
 
 
+class CannotStart(ArtelError):
+    """The OS refused to start the program (Popen raised OSError): no process exists."""
+
+
 def command_argv(cmd: Command, shell: str) -> list[str]:
     if isinstance(cmd, str):
         if not cmd.strip():
@@ -118,7 +122,9 @@ def run_tree(argv: Sequence[str], *, cwd: Path, env: Mapping[str, str] | None = 
             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
             **platform.popen_kwargs())   # binary pipes: decoded here as UTF-8, "\n" untouched
-    except (OSError, ValueError) as exc:
+    except OSError as exc:   # FileNotFoundError, PermissionError, …: the program cannot be started at all
+        raise CannotStart(f"cannot start {argv[0]}: {exc}") from exc
+    except ValueError as exc:
         raise ArtelError(f"cannot start {argv[0]}: {exc}") from exc
     pid = proc.pid
     group = pid

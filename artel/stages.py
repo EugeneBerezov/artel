@@ -3,6 +3,7 @@
 Decisions come only from the structured result, git state and the board — never from journal text.
 """
 import json
+import re
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -20,6 +21,9 @@ STATE_TO_STAGE = {"vetting": "vet", "attacking": "attack", "writing": "write",
                   "reviewing": "review", "fixing": "fix"}
 SUPPORTED_STAGES = {"attack", "write", "review", "fix"}        # Task 21 adds "vet"
 DOWNGRADE_PREFIX = "[downgraded: closure round] "              # PD-4
+SIGNATURE_LIMIT = 200                                          # PD-61
+_DIGIT = re.compile(r"\d")
+NOT_COUNTED = ("requeue", "agent_unavailable", "setup_failed")  # events that never add to stage_runs (§3.1)
 BLOCKING = ("blocker", "major")
 
 
@@ -100,11 +104,47 @@ class StageRun:
     rate_limited: bool
     new_commits: bool
     merge_committed: bool
-    setup: str                      # "skipped" | "ok" | "failed" | "timeout" | "stopped"
+    setup: str                      # "skipped" | "ok" | "failed" | "timeout" | "stopped" | "not_run" (no slot, or a
+    #                                   conflict fix: PD-43, the markers would break setup — it proves nothing about it)
     denials: list[dict]
     session_id: str | None
     first_context: int | None
     last_context: int | None
+    agent_started: bool = False     # the agent process was spawned (spec §3.1 Counters: stage_runs)
+    unavailable: bool = False       # PD-57, decided by agent_claude.is_unavailable
+    signature: str | None = None    # PD-61: only when unavailable
+
+
+def unavailable_signature(exit_code: int | None, stderr_path: Path) -> str:
+    """PD-61: the exit code and the first non-empty stderr line, every digit of the line replaced by `#`
+    (pids and times differ between equal faults), at most 200 characters."""
+    first = ""
+    try:
+        with open(stderr_path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                if line.strip():
+                    first = line.strip()
+                    break
+    except OSError:
+        pass
+    return f"exit {exit_code}: {_DIGIT.sub('#', first)}"[:SIGNATURE_LIMIT]
+
+
+def cannot_start_signature(error: str) -> str:
+    """Owner 2026-10-21: the signature of an agent that cannot be started is the error text, every digit `#`."""
+    return _DIGIT.sub("#", " ".join(error.split()))[:SIGNATURE_LIMIT]
+
+
+def unstarted_stage(task: Task, error: str) -> tuple["StagePlan", "StageRun"]:
+    """The stage of a task whose agent command cannot be resolved (plan_stage raised CannotStartAgent before any
+    slot command): no slot, no `runs` row, no process. finish_stage classifies it `agent_unavailable` (R38)."""
+    stage = STATE_TO_STAGE.get(task.state, task.state)
+    plan = StagePlan(task.id, stage, task.round, "", "", "", "", [], {}, {}, Path(), 0, "", ())
+    run = StageRun(result=None, invalid_reason=error, usage={}, exit_code=None, timed_out=False, stopped=False,
+                   rate_limited=False, new_commits=False, merge_committed=False, setup="not_run", denials=[],
+                   session_id=None, first_context=None, last_context=None, agent_started=False, unavailable=True,
+                   signature=cannot_start_signature(error))
+    return plan, run
 
 
 def _latest_verify_log(repo, task_id: int) -> str:
@@ -127,10 +167,12 @@ def _diff_range(task: Task) -> str:
     return f"{INTEGRATION}...{task_branch(task.id)}"
 
 
-def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[str, str]) -> StagePlan:
+def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[str, str],
+               workers: int | None = None) -> StagePlan:
     stage = STATE_TO_STAGE.get(task.state)
     if stage not in SUPPORTED_STAGES:
         raise ArtelError(f"task {task.id} in state {task.state} has no supported stage")
+    agent_claude.agent_argv(cfg)   # CannotStartAgent before any slot command: the stage is agent_unavailable
     guarded = protect.hits(repo, cfg, task_branch(task.id)) if stage == "review" else []
     model, model_reason = choose_model(cfg, task, stage, diff_lines(repo, task.id) if stage == "review" else 0,
                                        protected=guarded)
@@ -168,7 +210,8 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
         n = 1 + sum(1 for r in board.list_runs(task.id) if r.stage == stage)
         log_path = repo.logs_dir / str(task.id) / f"{stage}-{n}.jsonl"
         run = board.start_run(task_id=task.id, stage=stage, round=task.round, model=model,
-                              model_reason=model_reason, slot=slot_n, log_path=str(log_path))
+                              model_reason=model_reason, slot=slot_n, log_path=str(log_path),
+                              workers=workers)                                      # PD-71
     except BaseException:
         try:
             slots.leave_slot(repo, board, cfg, slot_n)
@@ -222,11 +265,16 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
     outcome, exit_code, timed_out, stopped = "error", None, False, False
     result, reason = None, None
     new_commits = merge_committed = False
+    agent_started = unavailable = False
+    signature = None
+    res = None
     try:
         task = board.get_task(plan.task_id)
         path = slots.slot_path(repo, cfg, slot_n)
         merge_target = _merge_target(repo, path, task, plan)
-        if merge_target is None:                                                    # PD-43: markers break setup
+        if merge_target is not None:                                                # PD-43: markers break setup
+            setup = "not_run"   # not "skipped": a conflict fix must not end a setup outage (T37 review m3)
+        else:
             setup = slots.run_setup_if_needed(repo, board, cfg, slot_n, path, task_id=plan.task_id,
                                               on_start=on_start, stop_event=stop_event, env=plan.base_env)
         if setup in ("failed", "timeout", "stopped"):
@@ -239,11 +287,21 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                 if event is not None:
                     on_rate_limit(event)
 
-            res = procs.run_tree(
-                plan.argv, cwd=path, env=plan.env, stdin_text=plan.prompt, timeout=cfg["stage_timeout"],
-                kill_grace=cfg["kill_grace"], log_path=plan.log_path, on_line=on_line, stop_event=stop_event,
-                on_start=lambda pid, group, fp: on_start("agent", pid, group, fp))
+            try:
+                res = procs.run_tree(
+                    plan.argv, cwd=path, env=plan.env, stdin_text=plan.prompt, timeout=cfg["stage_timeout"],
+                    kill_grace=cfg["kill_grace"], log_path=plan.log_path, on_line=on_line, stop_event=stop_event,
+                    on_start=lambda pid, group, fp: on_start("agent", pid, group, fp))
+            except procs.CannotStart as exc:   # owner 2026-10-21: no process, so agent_unavailable, never counted
+                unavailable, outcome, reason = True, "unavailable", str(exc)
+                signature = cannot_start_signature(reason)
+        if res is not None:
+            agent_started = True                                 # run_tree returned: the process was spawned
             exit_code, timed_out, stopped = res.returncode, res.timed_out, res.stopped
+            unavailable = (not timed_out and not stopped and not parser.limit_hit()
+                           and agent_claude.is_unavailable(parser, exit_code))           # PD-57
+            if unavailable:
+                signature = unavailable_signature(exit_code, Path(str(plan.log_path) + ".stderr"))   # PD-61
             if parser.limit_hit() and parser.max_rank < 2:       # PD-40: only the error result showed the limit
                 on_rate_limit(RateLimit(status=f"error {parser.api_error_status}", rank=2, resets_at=None,
                                         limit_type=None, utilization=None, windows={}))
@@ -257,7 +315,8 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                 reason = "the agent returned no structured output"
             new_commits, merge_committed = _commit_facts(repo, path, task, plan, merge_target)
             outcome = ("stopped" if stopped else "timeout" if timed_out else
-                       result["outcome"] if result else "rate_limited" if parser.limit_hit() else "invalid")
+                       result["outcome"] if result else "rate_limited" if parser.limit_hit() else
+                       "unavailable" if unavailable else "invalid")
     finally:
         try:
             slots.leave_slot(repo, board, cfg, slot_n)
@@ -272,7 +331,8 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                     timed_out=timed_out, stopped=stopped, rate_limited=parser.limit_hit(),
                     new_commits=new_commits, merge_committed=merge_committed, setup=setup,
                     denials=list(parser.denials), session_id=parser.session_id,
-                    first_context=usage.first_context_tokens(), last_context=usage.context_tokens())
+                    first_context=usage.first_context_tokens(), last_context=usage.context_tokens(),
+                    agent_started=agent_started, unavailable=unavailable, signature=signature)
 
 
 def _effective_severity(task: Task, stage: str, severity: str) -> str:
@@ -284,6 +344,8 @@ def classify(task: Task, stage: str, run: StageRun, board) -> str:
         return "requeue"
     if run.rate_limited and run.result is None:                                     # PD-40
         return "requeue"
+    if run.unavailable:                                                             # PD-57: after the two above
+        return "agent_unavailable"
     if run.setup in ("failed", "timeout"):
         return "setup_failed"
     if run.timed_out or run.result is None:
@@ -361,6 +423,9 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     if event == "setup_failed":
         journal.append(board, "FAIL", f"setup {run.setup}: the stage was not started (see the setup log)",
                        author="runner", **common)
+    if event == "agent_unavailable":                                                # a fact; the runner pauses
+        journal.append(board, "FAIL", _clip(f"agent unavailable, requeued without a counter: {run.signature}"),
+                       author="runner", **common)
     record_denials(board, task, plan, run)
     label = {"ready": "READY", "review_clear": "PASS", "attack_clear": "PASS", "review_blocking": "FINDINGS",
              "attack_blocker": "FINDINGS", "stage_failed": "FAIL",
@@ -435,9 +500,11 @@ def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun)
     try:
         with board.tx():   # the entries and the transition are one unit: a lost CAS must not leave duplicates
             record_stage(board, task, plan, run, event)
+            counted = run.agent_started and event not in NOT_COUNTED                 # spec §3.1 Counters
             tr = transitions.apply(board, task_id, event, Limits.from_cfg(task, cfg), stage=plan.stage,
                                    has_branch=repo.branch_exists(task_branch(task_id)),
-                                   tip=repo.rev(task_branch(task_id)))
+                                   tip=repo.rev(task_branch(task_id)),
+                                   extra_sets=("stage_runs+1",) if counted else ())
             if "reset_branch" in tr.effects:
                 supersede_review_findings(board, task_id, plan.round)       # PD-46
     finally:
@@ -450,7 +517,10 @@ def finish_stage(repo, board, cfg, task_id: int, plan: StagePlan, run: StageRun)
     return tr
 
 
-def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Transition:
+def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str, *,
+                          agent_started: bool = False) -> Transition:
+    """`agent_started`: the stage's agent process was spawned before the error; the run then counts in
+    `stage_runs` (spec §3.1 Counters: its agent started and it was not requeued)."""
     task = board.get_task(task_id)
     stage = STATE_TO_STAGE.get(task.state, task.state)   # verifying has no agent stage; its state names the job
     try:
@@ -458,7 +528,8 @@ def finish_internal_error(repo, board, cfg, task_id: int, error_tail: str) -> Tr
                        task_id=task_id, stage=stage)
         tr = transitions.apply(board, task_id, "internal_error", Limits.from_cfg(task, cfg),
                                has_branch=repo.branch_exists(task_branch(task_id)),
-                               tip=repo.rev(task_branch(task_id)))
+                               tip=repo.rev(task_branch(task_id)),
+                               extra_sets=("stage_runs+1",) if agent_started else ())
     finally:
         board.clear_running(task_id)
     _cause_verdict(board, tr, StagePlan(task_id, stage, task.round, "", "", "", "", [], {}, {}, Path(), 0, "", ()),

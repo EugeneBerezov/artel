@@ -1,7 +1,7 @@
 """The limit probe (spec §5 step 5, PD-55): one tiny model call, no tools, no schema, no notice, that tells whether a
 pause without a known end can lift. A probe never counts: no `runs` row, no attempt, no failure streak."""
 import threading
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,6 +23,7 @@ class ProbeResult:
     resets_at: float | None         # the limit's reset time, when the probe reported one
     log_path: Path
     windows: dict = field(default_factory=dict)   # {"five_hour": {"utilization": u, "resets_at": t}, ...}
+    error: str | None = None        # the agent could not be started (not found, not runnable): why
 
 
 def _setting_sources(tokens: Sequence[str]) -> list[str]:
@@ -44,8 +45,19 @@ def probe_argv(cfg) -> list[str]:
     return agent_claude.agent_argv(cfg) + tokens
 
 
+_STAMP = "%Y%m%dT%H%M%S%fZ"   # no ':' (Windows)
+
+
+def log_time(path: Path) -> float | None:
+    """When the probe whose log (or stderr log) this is started: the stamp in its name; None for another name."""
+    try:
+        return datetime.strptime(path.name.split("Z", 1)[0] + "Z", _STAMP).replace(tzinfo=timezone.utc).timestamp()
+    except ValueError:
+        return None
+
+
 def _log_path(repo: Repo, now: float) -> Path:
-    stamp = datetime.fromtimestamp(now, timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")   # no ':' (Windows)
+    stamp = datetime.fromtimestamp(now, timezone.utc).strftime(_STAMP)
     directory = repo.logs_dir / "probe"
     path = directory / f"{stamp}.jsonl"
     n = 1
@@ -74,8 +86,11 @@ def event_windows(event) -> dict:
     return out
 
 
-def run_probe(repo: Repo, cfg, env, *, now: float, stop_event: threading.Event | None = None) -> ProbeResult:
-    """cwd is an empty directory of its own: no slot, no task, so the probe cannot touch the project."""
+def run_probe(repo: Repo, cfg, env, *, now: float, stop_event: threading.Event | None = None,
+              on_start: Callable[[int, int, str | None], None] | None = None) -> ProbeResult:
+    """cwd is an empty directory of its own: no slot, no task, so the probe cannot touch the project. `on_start`
+    records the probe's process like a stage's, so reconcile can end a probe a crashed runner left behind. An agent
+    that cannot be started (not found, not runnable) is a failed probe (owner 2026-10-21)."""
     cwd = repo.artel_dir / "probe"
     cwd.mkdir(parents=True, exist_ok=True)
     log = _log_path(repo, now)
@@ -93,8 +108,12 @@ def run_probe(repo: Repo, cfg, env, *, now: float, stop_event: threading.Event |
                 limit_reset.append(event.resets_at)
                 warned.append(True)
 
-    res = procs.run_tree(probe_argv(cfg), cwd=cwd, env=env, stdin_text=PROMPT, timeout=PROBE_TIMEOUT,
-                         kill_grace=cfg["kill_grace"], log_path=log, on_line=on_line, stop_event=stop_event)
+    try:
+        res = procs.run_tree(probe_argv(cfg), cwd=cwd, env=env, stdin_text=PROMPT, timeout=PROBE_TIMEOUT,
+                             kill_grace=cfg["kill_grace"], log_path=log, on_line=on_line, stop_event=stop_event,
+                             on_start=on_start)
+    except (procs.CannotStart, agent_claude.CannotStartAgent) as exc:
+        return ProbeResult("unavailable", None, log, windows, error=str(exc))
     if parser.limit_hit() or warned:
         resets = next((r for r in reversed(limit_reset) if r is not None), None)
         return ProbeResult("limit", resets, log, windows)

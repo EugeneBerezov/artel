@@ -1,14 +1,17 @@
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
-from artel import agent_claude, board as B, config as C, journal, protect, slots, stages, transitions
+from artel import agent_claude, board as B, config as C, journal, procs, protect, slots, stages, transitions
 from artel.agent_claude import RateLimit
+from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION, Repo
 from tests.factories import make_task
 from tests.helpers import RepoTestCase, git, py_cmd, subprocess_env
@@ -21,6 +24,7 @@ def noop(*args, **kwargs):
 
 
 READY = {"outcome": "ready", "summary": "done"}
+TURN = {"assistant": {"input_tokens": 1, "output_tokens": 1}}   # the model was reached: not agent_unavailable (PD-57)
 
 
 class StagesCase(RepoTestCase):
@@ -334,14 +338,14 @@ class WriteTest(StagesCase):
 
     def test_error_result_is_failure(self):
         tid = self.task_in("writing")
-        self.scenario({f"{tid}:write": [{"result_error": True}]})
+        self.scenario({f"{tid}:write": [TURN, {"result_error": True}]})
         self.go(tid)
         self.assertEqual(self.task(tid).attempts, 1)
         self.assertIn("reported an error", self.entries(tid, "VERDICT")[0].text)
 
     def test_no_result_is_failure(self):
         tid = self.task_in("writing")
-        self.scenario({f"{tid}:write": [{"write": ["a.txt", "x"]}]})
+        self.scenario({f"{tid}:write": [TURN, {"write": ["a.txt", "x"]}]})
         self.go(tid)
         self.assertIn("no result", self.entries(tid, "VERDICT")[0].text)
         self.assertEqual(self.task(tid).attempts, 1)
@@ -461,7 +465,7 @@ class WriteTest(StagesCase):
 
     def test_leave_slot_runs_even_when_agent_crashes(self):
         tid = self.task_in("writing")
-        self.scenario({f"{tid}:write": [{"write": ["half.txt", "x"]}, {"exit": 9}]})
+        self.scenario({f"{tid}:write": [TURN, {"write": ["half.txt", "x"]}, {"exit": 9}]})
         plan, run, tr = self.go(tid)
         self.assertEqual(run.exit_code, 9)
         self.assert_slot_left()
@@ -699,7 +703,7 @@ class FixTest(StagesCase):
         task = self.task(tid)
         self.assertEqual((task.state, task.review_closure, task.round), ("reviewing", 1, 1))
         self.assertTrue(run.merge_committed)
-        self.assertEqual(run.setup, "skipped")   # PD-43
+        self.assertEqual(run.setup, "not_run")   # PD-43; not "skipped" (T37 review m3)
         self.assert_slot_left()
 
     def test_conflict_fix_without_merge_commit_fails(self):
@@ -717,7 +721,7 @@ class FixTest(StagesCase):
         tid = self.conflict_task()
         self.scenario({f"{tid}:fix": [{"result": {"outcome": "fail", "summary": "gave up"}}]})
         plan, run, tr = self.go(tid)
-        self.assertEqual(run.setup, "skipped")
+        self.assertEqual(run.setup, "not_run")
         self.assertEqual(len(self.calls()), 1)   # the agent was started despite the failing setup
 
     def test_leave_slot_clears_a_merge_when_a_conflict_fixer_crashes(self):
@@ -925,6 +929,266 @@ class AttackTest(StagesCase):
         self.assert_slot_left()
         self.assertEqual(plan.model, "opus")
 
+
+
+class NightGuardTest(StagesCase):
+    """Task 37: agent_unavailable (PD-57, PD-61), stage_runs (spec §3.1 Counters), run records (PD-71 a)."""
+
+    def run_of(self, **kw):
+        base = dict(result=None, invalid_reason=None, usage={}, exit_code=1, timed_out=False, stopped=False,
+                    rate_limited=False, new_commits=False, merge_committed=False, setup="skipped", denials=[],
+                    session_id=None, first_context=None, last_context=None, agent_started=True)
+        base.update(kw)
+        return stages.StageRun(**base)
+
+    def test_stage_run_defaults_keep_old_constructors(self):
+        # catches: new StageRun fields without defaults (every older caller breaks) or a default that counts
+        run = PureTest.plain_run(self)
+        self.assertEqual((run.agent_started, run.unavailable, run.signature), (False, False, None))
+
+    def test_classify_agent_unavailable_order(self):
+        # catches: unavailable checked before stopped / the PD-40 requeue, or after the result checks
+        task = make_task(state="writing")
+        ok = {"outcome": "ready", "summary": "x", "question": "", "findings": [], "closed": []}
+        cases = [
+            ("agent_unavailable", self.run_of(unavailable=True)),
+            ("agent_unavailable", self.run_of(unavailable=True, result=ok, new_commits=True)),
+            ("requeue", self.run_of(unavailable=True, stopped=True)),
+            ("requeue", self.run_of(unavailable=True, rate_limited=True)),
+            ("stage_failed", self.run_of()),
+        ]
+        for want, run in cases:
+            with self.subTest(want=want, run=run):
+                self.assertEqual(stages.classify(task, "write", run, self.board), want)
+
+    def assert_requeued_unavailable(self, tid, run, tr, tip):
+        self.assertTrue(run.agent_started)
+        self.assertTrue(run.unavailable)
+        self.assertEqual((tr.rid, tr.event, tr.to_state), ("R38", "agent_unavailable", "writing"))
+        task = self.task(tid)
+        self.assertEqual((task.state, task.attempts, task.stage_runs, task.running), ("writing", 0, 0, False))
+        self.assertEqual(self.repo.rev(f"artel/{tid}"), tip)   # branch kept, not reset
+        self.assertEqual(self.entries(tid, "VERDICT"), [])     # not a failure verdict (the breaker reads none)
+        self.assertEqual(self.board.list_runs(tid)[-1].outcome, "unavailable")
+        self.assert_slot_left()
+
+    def test_crash_before_first_call_requeues_without_counters(self):
+        # catches: a crash before any record classified stage_failed (an attempt, a reset branch), or counted in
+        # stage_runs, or `running` left set
+        tid = self.task_in("writing", with_commit=True)
+        tip = self.repo.rev(f"artel/{tid}")
+        self.scenario({f"{tid}:write": [{"crash": 3, "stderr": "error: unknown option --bogus (pid 4242)"}]})
+        plan, run, tr = self.go(tid)
+        self.assertEqual(run.exit_code, 3)
+        self.assert_requeued_unavailable(tid, run, tr, tip)
+        self.assertEqual(run.signature, "exit 3: error: unknown option --bogus (pid ####)")
+        (fail,) = self.entries(tid, "FAIL")
+        self.assertIn(run.signature, fail.text)
+
+    def test_exit_after_init_without_a_turn_is_unavailable(self):
+        # catches: only "no record at all" taken as unavailable (PD-57 a: no assistant record and no good result)
+        tid = self.task_in("writing", with_commit=True)
+        tip = self.repo.rev(f"artel/{tid}")
+        self.scenario({f"{tid}:write": [{"exit": 1}]})
+        plan, run, tr = self.go(tid)
+        self.assert_requeued_unavailable(tid, run, tr, tip)
+        self.assertEqual(run.signature, "exit 1: ")
+
+    def test_result_529_is_unavailable(self):
+        # catches: PD-57 (b) missing — an overloaded API (5xx, 529) charged to the task as a failed attempt
+        for status, turn in ((529, False), (503, False), (500, True), (599, True)):
+            with self.subTest(status=status, turn=turn):
+                tid = self.task_in("writing", with_commit=True)
+                tip = self.repo.rev(f"artel/{tid}")
+                self.scenario({f"{tid}:write": [*([TURN] if turn else []), {"result_error": status}]})
+                plan, run, tr = self.go(tid)
+                self.assertFalse(run.rate_limited)
+                self.assert_requeued_unavailable(tid, run, tr, tip)
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [TURN, {"result_error": 400}]})
+        plan, run, tr = self.go(tid)   # catches: any error result taken as unavailable
+        self.assertFalse(run.unavailable)
+        self.assertEqual((tr.event, self.task(tid).attempts), ("stage_failed", 1))
+
+    def test_agent_that_cannot_start_is_unavailable_without_counters(self):
+        # owner 2026-10-21. catches: Popen's OSError (not found, not runnable) taken as an internal error (an attempt
+        # per pick), counted in stage_runs, the branch reset, the slot left checked out, or digits kept in the
+        # signature (an errno would make every failure a new streak)
+        tid = self.task_in("writing", with_commit=True)
+        tip = self.repo.rev(f"artel/{tid}")
+
+        def refuse(*args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+        fake = SimpleNamespace(Popen=refuse, PIPE=subprocess.PIPE, STDOUT=subprocess.STDOUT,
+                               TimeoutExpired=subprocess.TimeoutExpired)
+        with mock.patch.object(procs, "subprocess", fake):
+            plan, run, tr = self.go(tid)
+        self.assertEqual((run.agent_started, run.unavailable, run.exit_code), (False, True, None))
+        self.assertEqual((tr.rid, tr.event, tr.to_state), ("R38", "agent_unavailable", "writing"))
+        task = self.task(tid)
+        self.assertEqual((task.attempts, task.stage_runs, task.running), (0, 0, False))
+        self.assertEqual(self.repo.rev(f"artel/{tid}"), tip)
+        self.assertTrue(run.signature.startswith("cannot start "), run.signature)
+        self.assertIn("[Errno ##] Permission denied", run.signature)
+        self.assertEqual(self.board.list_runs(tid)[-1].outcome, "unavailable")
+        self.assert_slot_left()
+
+    def test_unresolvable_agent_is_unavailable_before_the_slot(self):
+        # owner 2026-10-21. catches: plan_stage preparing the slot or writing a `runs` row before it finds the agent
+        # command missing; unstarted_stage counted (stage_runs, attempts) or not classified agent_unavailable
+        tid = self.task_in("writing", with_commit=True)
+        missing = str(self.tmp / "gone" / "claude7")
+        self.configure(agent_command=[missing])
+        with mock.patch.object(slots, "prepare_slot", side_effect=AssertionError("slot prepared")):
+            with self.assertRaises(agent_claude.CannotStartAgent) as cm:
+                stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+        self.assertEqual(self.board.list_runs(tid), [])
+        plan, run = stages.unstarted_stage(self.task(tid), str(cm.exception))
+        self.assertEqual(run.setup, "not_run")
+        tr = stages.finish_stage(self.repo, self.board, self.cfg, tid, plan, run)
+        self.assertEqual((tr.rid, tr.event), ("R38", "agent_unavailable"))
+        task = self.task(tid)
+        self.assertEqual((task.attempts, task.stage_runs), (0, 0))
+        self.assertEqual(run.signature, re.sub(r"\d", "#", f"cannot find {missing} on PATH")[:200])
+        self.assertEqual(stages.cannot_start_signature("x" * 300 + " 12"), "x" * 200)
+
+    def test_rate_limit_wins_over_unavailable(self):
+        # catches: a 429 without an assistant turn classified agent_unavailable (pause kind and probes differ)
+        tid = self.task_in("writing", with_commit=True)
+        self.scenario({f"{tid}:write": [{"result_error": 429}]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.rate_limited)
+        self.assertFalse(run.unavailable)
+        self.assertIsNone(run.signature)
+        self.assertIsNone(tr)   # the PD-40 requeue, not R38
+        self.assertEqual([lim.status for lim in self.limits], ["error 429"])
+        self.assertEqual(self.board.list_runs(tid)[-1].outcome, "rate_limited")
+
+    def test_stopped_is_not_unavailable(self):
+        # catches: dropping `not stopped` — a stop before the first turn would pause the board agent_unavailable
+        tid = self.task_in("writing", with_commit=True)
+        self.scenario({f"{tid}:write": [{"sleep": 30}]})
+        stop = threading.Event()
+        threading.Timer(1.0, stop.set).start()
+        plan, run, tr = self.go(tid, stop=stop)
+        self.assertTrue(run.stopped)
+        self.assertFalse(run.unavailable)
+        self.assertIsNone(tr)
+        self.assertEqual((self.task(tid).stage_runs, self.task(tid).attempts), (0, 0))
+
+    def test_timeout_before_first_turn_is_stage_failed(self):
+        # catches: dropping `not timed_out` — a hung agent (PD-57: never unavailable) would loop with no counter
+        self.configure(stage_timeout="1s", kill_grace="1s")
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [{"sleep": 30}]})
+        plan, run, tr = self.go(tid)
+        self.assertTrue(run.timed_out)
+        self.assertFalse(run.unavailable)
+        self.assertEqual(tr.event, "stage_failed")
+        self.assertEqual((self.task(tid).attempts, self.task(tid).stage_runs), (1, 1))
+
+    def test_unavailable_signature_rules(self):
+        # catches: digits kept (a pid makes every crash a new signature), no truncation, the first line taken even
+        # when blank, or a missing stderr file raising. (The streak across two crashes, plan
+        # test_signature_ignores_digits, is the runner's: tests/test_runner_night.py.)
+        path = self.tmp / "agent.stderr"
+        path.write_text("\n   \nfatal: pid 123 at 10:42:07\nsecond line 9\n", encoding="utf-8", newline="\n")
+        self.assertEqual(stages.unavailable_signature(2, path), "exit 2: fatal: pid ### at ##:##:##")
+        other = self.tmp / "other.stderr"
+        other.write_text("fatal: pid 98765 at 23:01:59\n", encoding="utf-8", newline="\n")
+        self.assertNotEqual(stages.unavailable_signature(2, path), stages.unavailable_signature(2, other))
+        other.write_text("fatal: pid 987 at 23:01:59\n", encoding="utf-8", newline="\n")
+        self.assertEqual(stages.unavailable_signature(2, path), stages.unavailable_signature(2, other))
+        path.write_text("x" * 500 + "\n", encoding="utf-8", newline="\n")
+        signature = stages.unavailable_signature(1, path)
+        self.assertEqual(len(signature), stages.SIGNATURE_LIMIT)
+        self.assertTrue(signature.startswith("exit 1: xxx"))
+        self.assertEqual(stages.unavailable_signature(1, self.tmp / "missing.stderr"), "exit 1: ")
+
+    def test_signature_only_when_unavailable(self):
+        # catches: a signature computed for every run (the runner would treat it as an unavailable streak)
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [TURN, {"exit": 4}]})
+        plan, run, tr = self.go(tid)
+        self.assertFalse(run.unavailable)
+        self.assertIsNone(run.signature)
+        self.assertEqual(tr.event, "stage_failed")
+
+    def test_stage_runs_counts_finished_runs_only(self):
+        # catches: counting at start (a requeued, stopped, unavailable or setup-failed run counted), or not
+        # counting a finished run (success or failure)
+        tid = self.task_in("reviewing", with_commit=True, round=1)
+        self.scenario({f"{tid}:review#1": [{"sleep": 30}],                      # stopped → requeue
+                       f"{tid}:review#2": [{"result_error": 429}],               # limit → requeue
+                       f"{tid}:review#3": [{"crash": 1, "stderr": "boom"}],      # agent_unavailable
+                       f"{tid}:review#4": [TURN, {"exit": 2}],                   # stage_failed (R13): counted
+                       f"{tid}:review#5": [{"result": {"outcome": "pass", "summary": "ok"}}]})   # counted
+        stop = threading.Event()
+        threading.Timer(1.0, stop.set).start()
+        self.go(tid, stop=stop)
+        self.go(tid)
+        self.go(tid)
+        self.assertEqual((self.task(tid).stage_runs, self.task(tid).attempts), (0, 0))
+        self.go(tid)
+        self.assertEqual((self.task(tid).stage_runs, self.task(tid).attempts), (1, 1))
+        plan, run, tr = self.go(tid)
+        self.assertEqual(tr.event, "review_clear")
+        self.assertEqual((self.task(tid).state, self.task(tid).stage_runs), ("verifying", 2))
+        # a setup failure: the agent never started
+        self.configure(**{"commands.setup": py_cmd("import sys; sys.exit(3)")})
+        tid2 = self.task_in("fixing", fix_kind="review", with_commit=True)
+        plan, run, tr = self.go(tid2)
+        self.assertEqual((run.setup, run.agent_started, tr.event), ("failed", False, "setup_failed"))
+        self.assertEqual(self.task(tid2).stage_runs, 0)
+
+    def test_stage_runs_needs_agent_started(self):
+        # catches: counting by event alone — a classified run whose agent never started must not count
+        tid = self.task_in("reviewing", with_commit=True, round=1)
+        task = self.task(tid)
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, task, 1, base_env=self.base_env)
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        tr = stages.finish_stage(self.repo, self.board, self.cfg, tid, plan, self.run_of(agent_started=False))
+        self.assertEqual(tr.event, "stage_failed")
+        self.assertEqual((self.task(tid).attempts, self.task(tid).stage_runs), (1, 0))
+        tr = stages.finish_stage(self.repo, self.board, self.cfg, tid, plan, self.run_of())
+        self.assertEqual((self.task(tid).attempts, self.task(tid).stage_runs), (2, 1))
+
+    def test_internal_error_before_spawn_not_counted(self):
+        # catches: an internal error (here: the agent process cannot be started) counted in stage_runs
+        tid = self.task_in("writing")
+        task = self.task(tid)
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, task, 1, base_env=self.base_env)
+        with mock.patch.object(stages.procs, "run_tree", side_effect=ArtelError("cannot start the agent")):
+            with self.assertRaises(ArtelError):
+                stages.run_stage(self.repo, self.board, self.cfg, plan, 1, on_start=noop, on_rate_limit=noop,
+                                 stop_event=threading.Event())
+        self.assert_slot_left()
+        self.assertEqual(self.calls(), [])
+        tr = stages.finish_internal_error(self.repo, self.board, self.cfg, tid, "cannot start the agent")
+        task = self.task(tid)
+        self.assertEqual((tr.event, task.attempts, task.stage_runs), ("internal_error", 1, 0))
+
+    def test_nochange_ask_text_is_clipped(self):
+        # catches: removing _clip from the "fixer made no change" ASK — EntryTooLong inside finish_stage
+        tid = FixTest.verify_fix_task(self, attempts=1)
+        self.scenario({f"{tid}:fix": [{"result": {"outcome": "ready", "summary": "é" * 1000}}]})   # 2 000 bytes
+        plan, run, tr = self.go(tid)
+        self.assertEqual(tr.event, "ready_no_commits")
+        (ask,) = self.entries(tid, "ASK")
+        self.assertTrue(ask.text.startswith("fixer made no change: éé"))
+        self.assertLessEqual(len(ask.text.encode("utf-8")), journal.TEXT_LIMIT)
+        self.assertEqual(self.task(tid).state, "blocked")
+
+    def test_plan_stage_records_workers(self):
+        # catches: plan_stage dropping `workers` (PD-71 a: the run row records the runner's worker count)
+        tid = self.task_in("writing")
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env,
+                                 workers=3)
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        plan2 = stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        workers = {r.id: r.workers for r in self.board.list_runs(tid)}
+        self.assertEqual((workers[plan.run_id], workers[plan2.run_id]), (3, None))
 
 if __name__ == "__main__":
     unittest.main()
