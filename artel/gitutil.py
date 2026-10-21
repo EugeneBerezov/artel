@@ -31,10 +31,11 @@ def _run(args: list[str], cwd: Path, input: str | None = None, env: dict | None 
         raise
 
 
-def _run_bytes(args: list[str], cwd: Path):
+def _run_bytes(args: list[str], cwd: Path, env: dict | None = None):
     """Like `_run`, but the output stays bytes: no decoding, no newline translation."""
     try:
-        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, **platform.popen_kwargs())
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, env=env,
+                              **platform.popen_kwargs())
     except FileNotFoundError as exc:
         if Path(cwd).is_dir():
             raise ArtelError("git not found on PATH") from exc
@@ -85,9 +86,9 @@ class Repo:
             raise GitError(list(args), result.stderr)
         return result
 
-    def git_bytes(self, *args: str, cwd: Path | None = None) -> bytes:
+    def git_bytes(self, *args: str, cwd: Path | None = None, env: dict | None = None) -> bytes:
         """stdout of a git command as it was written (a lone CR stays a CR). Raises GitError."""
-        result = _run_bytes(list(args), cwd or self.root)
+        result = _run_bytes(list(args), cwd or self.root, env)
         if result.returncode != 0:
             raise GitError(list(args), result.stderr.decode("utf-8", "replace"))
         return result.stdout

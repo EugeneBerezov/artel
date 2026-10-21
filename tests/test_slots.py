@@ -731,6 +731,39 @@ class SetupTest(SlotsCase):
         self.assertEqual(self.run_setup(), "skipped")
         self.assertEqual(self.runs(), "x")
 
+    def test_gitignored_setup_output_invalidates_the_hash(self):
+        """Mutation caught: `!!` entries dropped from the setup-output record (a gitignored `build/` is the common
+        case, and the scrub deletes it)."""
+        exclude = self.repo.common_dir / "info" / "exclude"
+        exclude.parent.mkdir(exist_ok=True)
+        with open(exclude, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("build/\n")
+        [n] = self.slot(1, **{"commands.setup": self.counter_cmd(
+            "import os; os.makedirs('build', exist_ok=True); open('build/x', 'w', encoding='utf-8').write('1')")})
+        self.assertEqual(self.run_setup(), "ok")
+        self.assertEqual(json.loads(self.board.get_meta(f"setup_outputs:{n}")), ["build"])
+        self.leave()
+        self.assertIsNone(self.board.list_slots()[0].setup_hash)
+
+    def test_untracked_files_all_does_not_hide_setup_output(self):
+        """Mutation caught: `status.showUntrackedFiles=no` hiding the setup output from the record."""
+        git(self.repo_path, "config", "status.showUntrackedFiles", "no")
+        [n] = self.slot(1, **{"commands.setup": self.counter_cmd(
+            "import os; os.makedirs('out', exist_ok=True); open('out/x', 'w', encoding='utf-8').write('1')")})
+        self.assertEqual(self.run_setup(), "ok")
+        self.assertEqual(json.loads(self.board.get_meta(f"setup_outputs:{n}")), ["out"])
+
+    def test_leave_slot_clears_the_hash_before_the_scrub(self):
+        """Mutation caught: the hash cleared after the scrub (a crash in between leaves no environment and a valid
+        hash)."""
+        [n] = self.slot(1, **{"commands.setup": self.counter_cmd(
+            "import os; os.makedirs('.cache-env', exist_ok=True); open('.cache-env/x', 'w', encoding='utf-8').write('1')")})
+        self.assertEqual(self.run_setup(), "ok")
+        with mock.patch.object(slots, "scrub", side_effect=RuntimeError("crash")):
+            with self.assertRaises(RuntimeError):
+                self.leave()
+        self.assertIsNone(self.board.list_slots()[0].setup_hash)
+
     def test_setup_that_leaves_nothing_untracked_keeps_hash(self):
         """Mutation caught: a tracked file rewritten by setup counted as output (reset restores it anyway)."""
         [n] = self.slot(1, **{"commands.setup": self.counter_cmd("open('README', 'w', encoding='utf-8').write('changed')")})

@@ -126,6 +126,13 @@ class StageRun:
     repo_changes: tuple[str, ...] = ()   # PD-66: what the stage changed in the shared repository
     unrestored: tuple[str, ...] = ()     # ... and what `repocheck.restore` could not put back
     left_tracked: bool = False           # a review left tracked changes in its slot (restored)
+    overlapped: tuple[int, ...] = ()     # other tasks whose stage or setup ran meanwhile: the change is not charged
+    quarantined: str | None = None       # the directory under artel/repo-changes holding the changed versions
+
+    @property
+    def blamed(self) -> bool:
+        """The stage itself is held to its repository changes (a lone stage) or left tracked changes."""
+        return bool(self.repo_changes and not self.overlapped) or self.left_tracked
 
 
 def unavailable_signature(exit_code: int | None, stderr_path: Path) -> str:
@@ -294,31 +301,17 @@ def _commit_facts(repo, path: Path, task: Task, plan: StagePlan, merge_target: s
     return new, merged
 
 
-def _tracked_state(repo, path: Path) -> tuple[bytes, bytes]:
-    """What differs from HEAD in the working tree and in the index (setup may rewrite a tracked file)."""
-    return tuple(repo.git_bytes("diff", "--binary", *args, cwd=path) for args in (("HEAD",), ("--cached",)))
-
-
-def _restore_tracked(repo, path: Path, before: tuple[bytes, bytes]) -> bool:
-    """A reviewer may write new probe files but not change what the branch tracks (its verdict would describe
-    code that does not exist): a difference from the state before the agent started is put back. True when
-    there was one."""
-    dirty = _tracked_state(repo, path) != before
-    if dirty:
-        slots._git(repo, "reset", "-q", cwd=path, check=False)
-        slots._git(repo, "checkout", "--", ".", cwd=path, check=False)
-    return dirty
-
-
 def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnStart,
               on_rate_limit: Callable[[RateLimit], None], stop_event: threading.Event,
               skip_refs: Callable[[], Collection[str]] = lambda: (),
               runner_changed_worktrees: Callable[[], bool] = lambda: False,
               idle_slots: Callable[[], Sequence[tuple[int, Path]]] = lambda: (),
-              extra_time: Callable[[], float] = lambda: 0.0) -> StageRun:
+              extra_time: Callable[[], float] = lambda: 0.0,
+              overlapping: Callable[[], Collection[int]] = lambda: ()) -> StageRun:
     """`skip_refs`, `runner_changed_worktrees`, `idle_slots` and `extra_time` are the runner's view of the stage
     (PD-66, PD-74): the task branches it moved itself, whether it added or removed a slot, the slots without a
-    job, and the time the agent spent waiting for the machine-wide lock."""
+    job, and the time the agent spent waiting for the machine-wide lock. `overlapping`: the other tasks whose agent
+    stage or setup ran during this one (owner 2026-10-21: a shared change is then reported, not charged)."""
     parser = StreamParser()
     setup = "skipped"
     outcome, exit_code, timed_out, stopped = "error", None, False, False
@@ -330,6 +323,8 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
     repo_changes: list[str] = []
     unrestored: list[str] = []
     left_tracked = False
+    overlapped: list[int] = []
+    quarantine: Path | None = None
     try:
         task = board.get_task(plan.task_id)
         path = slots.slot_path(repo, cfg, slot_n)
@@ -351,7 +346,7 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
 
             own = task_branch(plan.task_id) if repo.branch_exists(task_branch(plan.task_id)) else None
             before = repocheck.take(repo, path, idle_slots=idle_slots())
-            tracked_before = _tracked_state(repo, path) if plan.stage == "review" else ()
+            tracked_before = repocheck.tracked_state(repo, path) if plan.stage == "review" else ()
             started = time.monotonic()
             try:
                 res = procs.run_tree(
@@ -369,9 +364,17 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                                              skip_refs=skip_refs(), runner_changed_worktrees=runner_changed_worktrees(),
                                              repo=repo)
             if repo_changes:
-                unrestored = repocheck.restore(repo, before, after, repo_changes)
-            elif plan.stage == "review":
-                left_tracked = _restore_tracked(repo, path, tracked_before)
+                overlapped = sorted(set(overlapping()) - {plan.task_id})
+                stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+                quarantine = repo.artel_dir / "repo-changes" / f"{stamp}-T{plan.task_id}-{plan.stage}"
+                unrestored = repocheck.restore(repo, before, after, repo_changes, quarantine=quarantine,
+                                               slot_keep=cfg["slot_keep"])
+                for change in repo_changes:   # an idle slot the restore cleaned may have lost its setup output
+                    m = re.match(r"idle slot (\d+) changed$", change)
+                    if m:
+                        slots.forget_setup(board, int(m.group(1)))
+            if plan.stage == "review":
+                left_tracked = repocheck.restore_tracked(repo, path, tracked_before) and not repo_changes   # one report
             exit_code, timed_out, stopped = res.returncode, res.timed_out, res.stopped
             unavailable = (not timed_out and not stopped and not parser.limit_hit()
                            and agent_claude.is_unavailable(parser, exit_code))           # PD-57
@@ -408,7 +411,9 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
                     denials=list(parser.denials), session_id=parser.session_id,
                     first_context=usage.first_context_tokens(), last_context=usage.context_tokens(),
                     agent_started=agent_started, unavailable=unavailable, signature=signature,
-                    repo_changes=tuple(repo_changes), unrestored=tuple(unrestored), left_tracked=left_tracked)
+                    repo_changes=tuple(repo_changes), unrestored=tuple(unrestored), left_tracked=left_tracked,
+                    overlapped=tuple(overlapped),
+                    quarantined=(quarantine.name if quarantine is not None and quarantine.exists() else None))
 
 
 def _effective_severity(task: Task, stage: str, severity: str) -> str:
@@ -422,7 +427,7 @@ def classify(task: Task, stage: str, run: StageRun, board) -> str:
         return "requeue"
     if run.unavailable:                                                             # PD-57: after the two above
         return "agent_unavailable"
-    if run.repo_changes or run.left_tracked:                                        # PD-66: the verdict is void
+    if run.blamed:                                                                  # PD-66: the verdict is void
         return "stage_failed"
     if run.setup in ("failed", "timeout"):
         return "setup_failed"
@@ -475,7 +480,8 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     author = f"agent:{plan.stage}"
     common = dict(task_id=task.id, stage=plan.stage, round=plan.round)
     result = run.result
-    judged = result is not None and result["outcome"] in ("pass", "findings")   # not for fail / ask results
+    judged = (result is not None and result["outcome"] in ("pass", "findings")   # not for fail / ask results
+              and not run.blamed)                                                 # a void review closes nothing
     if judged and plan.stage == "review":
         open_ids = {e.id for e in journal.open_findings(board, task.id)}
         for finding_id in dict.fromkeys(result["closed"]):
@@ -507,9 +513,12 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     if run.repo_changes:
         shown = "; ".join(run.repo_changes[:3]) + (f"; +{len(run.repo_changes) - 3}" if len(run.repo_changes) > 3 else "")
         left = f"; not restored: {'; '.join(run.unrestored)}" if run.unrestored else ""
-        journal.append(board, "FAIL", _clip(f"{plan.stage} changed the shared repository: {shown} (restored{left})"),
-                       author="runner", **common)
-    elif run.left_tracked:
+        saved = f"; saved in artel/repo-changes/{run.quarantined}" if run.quarantined else ""
+        others = (f"; stage not failed, overlapping: {', '.join(f'#{t}' for t in run.overlapped)}"
+                  if run.overlapped else "")
+        journal.append(board, "FAIL", _clip(f"{plan.stage} changed the shared repository: {shown} "
+                                            f"(restored{left}{saved}{others})"), author="runner", **common)
+    if run.left_tracked:
         journal.append(board, "FAIL", "review left tracked changes in its slot; restored", author="runner", **common)
     record_denials(board, task, plan, run)
     label = {"ready": "READY", "review_clear": "PASS", "attack_clear": "PASS", "review_blocking": "FINDINGS",
@@ -522,7 +531,7 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
                 why = "ready without new commits"
             elif run.timed_out:
                 why = "timed out"
-            elif run.repo_changes or run.left_tracked:
+            elif run.blamed:
                 why = "changed the repository, the result is void"
             elif result is None:
                 why = run.invalid_reason or "no valid result"

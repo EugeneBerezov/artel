@@ -108,15 +108,17 @@ class RunTreeTest(unittest.TestCase):
         or `timeout` still applied when a deadline is given (PD-74)."""
         sleeper = py_cmd("import time; time.sleep(60)")
         calls = []
+        start = time.monotonic()
 
         def deadline():
             calls.append(1)
-            return time.monotonic() + 0.8 if len(calls) < 4 else time.monotonic() - 1   # extended, then due
-        start = time.monotonic()
+            if time.monotonic() - start < 1.0:
+                return time.monotonic() + 5.0   # extended again at every poll while the first second runs
+            return time.monotonic() - 1         # then due
         res = procs.run_tree(sleeper, cwd=self.dir, timeout=0.1, deadline=deadline, kill_grace=1.0)
         self.assertTrue(res.timed_out)
-        self.assertGreaterEqual(len(calls), 4)       # read at each poll
-        self.assertGreater(time.monotonic() - start, 0.2)   # `timeout=0.1` did not end it
+        self.assertGreater(len(calls), 3)                    # read at each poll
+        self.assertGreater(time.monotonic() - start, 0.9)    # `timeout=0.1` did not end it, nor the first value
         res = procs.run_tree(py_cmd("print('ok')"), cwd=self.dir, timeout=0.1, kill_grace=1.0,
                              deadline=lambda: time.monotonic() + 30)
         self.assertEqual((res.returncode, res.timed_out), (0, False))
