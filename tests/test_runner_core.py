@@ -82,7 +82,7 @@ class RunnerCoreTest(E2ECase):
         marker = self.tmp / "verify-ran.flag"
         self.write_toml({"commands.verify": py_cmd(
             f"import os, sys; p = {str(marker)!r}; ok = os.path.exists(p); "
-            "open(p, 'w', encoding='utf-8').close(); sys.exit(0 if ok else 1)")})
+            "open(p, 'w', encoding='utf-8').close(); sys.exit(0 if ok else 1)"), "verify_reruns": 0})
         tid = self.add_task("Add hello")
         self.scenario({"write": WRITE, "review": PASS,
                        "fix": [{"result": {"outcome": "ready", "summary": "nothing to change"}}]})   # no commit

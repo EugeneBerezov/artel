@@ -4,6 +4,7 @@
 this module pushes or checks that branch out.
 """
 import dataclasses
+import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -37,11 +38,19 @@ def ensure_integration_branch(repo: Repo, base: str) -> str:
 # --- verify on the merged tree ------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
+class VerifyRun:
+    outcome: str         # "green" | "red" | "timeout" | "stopped" ("conflict" for Task 40, never a runs row)
+    duration_ms: int
+    log_path: Path
+
+
+@dataclass(frozen=True)
 class VerifyResult:
-    kind: str            # "green" | "red" | "conflict" | "timeout" | "stopped" | "setup_failed"
-    commit: str | None   # task branch tip after the merge (green only)
+    kind: str            # "green" | "green_flaky" | "red" | "conflict" | "timeout" | "stopped" | "setup_failed"
+    commit: str | None   # task branch tip after the merge (green and green_flaky only)
     log_path: Path
     detail: str
+    runs: tuple[VerifyRun, ...] = ()
 
 
 def _rel(repo: Repo, path: Path) -> str:
@@ -91,8 +100,51 @@ def _verify_command(cfg, repo: Repo, path: Path, *, log_path: Path, env, on_star
     return "red", f"exit {result.returncode}", result.returncode
 
 
+def _verify_job(repo: Repo, board, cfg, task: Task, slot_n: int, path: Path, commit: str, *, env, on_start,
+                stop_event, queued_at) -> VerifyResult:
+    """Run commands.verify, and again after a red run (spec §5 step 7): the same merged tree, no setup, each run
+    under its own heavy_lock, one `runs` row each. Green on a rerun is flaky. A task that has been red before
+    (`red_seen`, PD-72) needs every one of its 1 + verify_reruns runs green."""
+    total = 1 + cfg["verify_reruns"]
+    runs: list[VerifyRun] = []
+    detail = ""
+    for _ in range(total):
+        n = 1 + sum(1 for r in board.list_runs(task.id) if r.stage == "verify")
+        log_path = repo.logs_dir / str(task.id) / f"verify-{n}.log"
+        run = board.start_run(task_id=task.id, stage="verify", round=task.round, model=None, model_reason=None,
+                              slot=slot_n, log_path=str(log_path), queued_at=queued_at)
+        kind, detail, code = "red", "internal error", None
+        started = time.monotonic()
+        try:
+            kind, detail, code = _verify_command(cfg, repo, path, log_path=log_path, env=env, on_start=on_start,
+                                                 stop_event=stop_event)
+        finally:
+            outcome = "red" if kind == "not_started" else kind
+            board.finish_run(run.id, outcome=outcome, usage={}, exit_code=code, timed_out=kind == "timeout",
+                             killed=kind in ("timeout", "stopped"),
+                             duration_ms=int((time.monotonic() - started) * 1000))
+        runs.append(VerifyRun(outcome, int((time.monotonic() - started) * 1000), log_path))
+        if kind == "not_started":   # like a failing setup: pause the board, burn no fix and no agent
+            return VerifyResult("setup_failed", None, log_path, detail, tuple(runs))
+        if kind in ("timeout", "stopped"):   # never rerun
+            return VerifyResult(kind, None, log_path, detail, tuple(runs))
+        if kind == "green" and not task.red_seen:
+            break
+    outcomes = [r.outcome for r in runs]
+    last = runs[-1].log_path
+    if all(o == "green" for o in outcomes):
+        return VerifyResult("green", commit, last, detail, tuple(runs))
+    if all(o == "red" for o in outcomes):
+        return VerifyResult("red", None, last, detail, tuple(runs))
+    first_red = next(r for r in runs if r.outcome == "red")
+    return VerifyResult("green_flaky", commit, first_red.log_path,
+                        f"mixed results ({', '.join(outcomes)}; verify_reruns {cfg['verify_reruns']})",
+                        tuple(runs))
+
+
 def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: OnStart | None = None,
-                stop_event=None, env: Mapping[str, str] | None = None) -> VerifyResult:
+                stop_event=None, env: Mapping[str, str] | None = None, queued_at: float | None = None
+                ) -> VerifyResult:
     n = 1 + sum(1 for r in board.list_runs(task.id) if r.stage == "verify")
     log_path = repo.logs_dir / str(task.id) / f"verify-{n}.log"
     if not repo.branch_exists(task_branch(task.id)):   # prepare_slot would re-create it empty: green on nothing
@@ -118,24 +170,13 @@ def verify_task(repo: Repo, board, cfg, task: Task, slot_n: int, *, on_start: On
         commit = slots._git(repo, "rev-parse", "HEAD", cwd=path).stdout.strip()
         if not cfg["commands.verify"]:
             return VerifyResult("green", commit, log_path, 'verify not configured (commands.verify="")')   # PD-14
-        run = board.start_run(task_id=task.id, stage="verify", round=task.round, model=None, model_reason=None,
-                              slot=slot_n, log_path=str(log_path))
-        kind, detail, code = "red", "internal error", None
-        try:
-            kind, detail, code = _verify_command(cfg, repo, path, log_path=log_path, env=env, on_start=on_start,
-                                                 stop_event=stop_event)
-        finally:
-            board.finish_run(run.id, outcome={"green": "ok", "red": "failed", "not_started": "failed"}.get(kind, kind),
-                             usage={},
-                             exit_code=code, timed_out=kind == "timeout", killed=kind in ("timeout", "stopped"))
-        if kind == "not_started":   # like a failing setup: pause the board, burn no fix and no agent
-            return VerifyResult("setup_failed", None, log_path, detail)
-        return VerifyResult(kind, commit if kind == "green" else None, log_path, detail)
+        return _verify_job(repo, board, cfg, task, slot_n, path, commit, env=env, on_start=on_start,
+                           stop_event=stop_event, queued_at=queued_at)
     finally:
         slots.leave_slot(repo, board, cfg, slot_n)
 
 
-_EVENT = {"green": "verify_green", "red": "verify_red", "timeout": "verify_red", "conflict": "verify_conflict",
+_EVENT = {"green": "verify_green", "green_flaky": "verify_green_flaky", "red": "verify_red", "timeout": "verify_red", "conflict": "verify_conflict",
           "setup_failed": "setup_failed"}
 
 
@@ -161,7 +202,9 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
         sources = ", ".join(sorted({h.source for h in guarded}))
         tr = dataclasses.replace(
             tr, cause=f"merge=ask: touches protected path(s) {protect.summary(guarded)} ({sources})")
-    if result.kind == "green" and result.commit:
+    if result.kind == "green_flaky":
+        tr = dataclasses.replace(tr, cause="merge=ask: flaky verify (verify_reruns)")
+    if result.kind in ("green", "green_flaky") and result.commit:
         board.set_meta(_verified_key(task_id), result.commit)   # PD-45: exactly this commit may be integrated
     elif result.kind != "setup_failed":
         board.del_meta(_verified_key(task_id))
@@ -176,7 +219,51 @@ def finish_verify(repo: Repo, board, cfg, task_id: int, result: VerifyResult):
                                                             journal.TEXT_LIMIT),
                        author=_RUNNER, task_id=task_id, stage="verify", round=task.round,
                        basis=journal.truncate_utf8(log, 200))
+    elif result.kind == "green_flaky":   # a FAIL, never a FACT: the first run was red
+        failed = failed_tests(result.log_path)
+        text = f"flaky verify: {_command_text(cfg['commands.verify'])}, red log {log}"
+        if failed:
+            text += "; failed: " + ", ".join(failed)
+        journal.append(board, "FAIL", journal.truncate_utf8(text, journal.TEXT_LIMIT), author=_RUNNER,
+                       task_id=task_id, stage="verify", round=task.round, basis=journal.truncate_utf8(log, 200))
     return tr
+
+
+def _command_text(command, limit: int = 100) -> str:
+    """(`limit` in bytes) The command for a journal line, cut so the log path and failed tests after it survive the 400-byte limit."""
+    text = " ".join(command) if isinstance(command, (list, tuple)) else str(command)
+    text = " ".join(text.split())
+    return journal.truncate_utf8(text, limit)
+
+
+_ANSI = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def failed_tests(log_path: Path, limit: int = 3) -> list[str]:
+    """Up to `limit` failed test ids from a verify log: unittest `FAIL: id` / `ERROR: id`, pytest `FAILED id - why`
+    or `id FAILED [ 50%]`."""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace", newline="") as fh:
+            lines = [line.rstrip("\r\n") for line in fh]
+    except OSError:
+        return []
+    found: list[str] = []
+    for line in lines:
+        test = None
+        line = _ANSI.sub("", line)
+        if line.startswith("FAILED ("):   # unittest's summary line
+            continue
+        if line.startswith(("FAIL: ", "ERROR: ")):
+            test = line.split(": ", 1)[1].strip()
+        elif line.startswith("FAILED "):
+            test = line[len("FAILED "):].split(" - ", 1)[0].strip()
+        elif " FAILED " in line:
+            test = line.split(" FAILED ", 1)[0].strip().split()[-1] if line.split(" FAILED ", 1)[0].strip() else None
+        if test and test not in found:
+            found.append(test)
+            if len(found) == limit:
+                break
+    return found
 
 
 # --- integrate ----------------------------------------------------------------------------------------------

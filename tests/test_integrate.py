@@ -102,10 +102,10 @@ class VerifyTest(IntegrateCase):
         self.assertEqual(git(self.repo_path, "show", f"{task_branch(tid)}:b.txt"), "i")
         self.slot_clean()
         (run,) = [r for r in self.board.list_runs(tid) if r.stage == "verify"]
-        self.assertEqual((run.outcome, run.exit_code, run.slot), ("ok", 0, 1))
+        self.assertEqual((run.outcome, run.exit_code, run.slot), ("green", 0, 1))
 
     def test_verify_red_goes_to_fix_with_counter(self):
-        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        self.configure(**{"commands.verify": py_cmd(RED_CODE), "verify_reruns": 0})
         tid = self.task_with_commit("verifying", "a.txt")
         result = self.verify(tid)
         self.assertEqual((result.kind, result.detail), ("red", "exit 1"))
@@ -541,6 +541,15 @@ class IntegrateTaskTest(IntegrateCase):
         self.assertEqual(tr.rid, "R31a")
         self.assertNotIn("touches protected", tr.cause)
 
+    def test_git_error_forces_merge_ask(self):
+        """Mutation caught: fail-open (a green verify whose protected-path check could not run merging on its own)."""
+        tid = self.task_with_commit("verifying", "src/app.py", "x\n")
+        good = self.verify(tid)
+        broken = integrate.VerifyResult("green", "0" * 40, good.log_path, "exit 0")   # a commit git cannot diff
+        tr = self.finish(tid, broken)
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31b", "awaiting_accept"))
+        self.assertIn("<git error>", tr.cause)
+
     def test_protected_hit_with_merge_ask_keeps_plain_cause(self):
         """Mutation caught: the protected reason replacing the cause of a task that was `merge = ask` anyway."""
         self.configure(merge="ask")
@@ -712,6 +721,264 @@ class BaseTest(IntegrateCase):
         self.commit_on_base("c.txt")
         self.assertEqual(integrate.base_update(self.repo, self.board, self.cfg, 1).log_path,
                          self.repo.logs_dir / "base" / "verify-2.log")   # n = 1 + existing files
+
+
+class RerunTest(IntegrateCase):
+    """Spec §5 step 7: a red verify runs again within the job (T36)."""
+
+    def flaky_script(self, flag, heads):
+        """Verify: red on the first run, green after; records the merged tree's HEAD on every run."""
+        return py_cmd(
+            "import os, subprocess, sys\n"
+            f"open({json.dumps(str(heads))}, 'a', encoding='utf-8').write(\n"
+            "    subprocess.check_output(['git', 'rev-parse', 'HEAD'], encoding='utf-8'))\n"
+            f"first = not os.path.exists({json.dumps(str(flag))})\n"
+            f"open({json.dumps(str(flag))}, 'w', encoding='utf-8').close()\n"
+            "print('FAIL: test_a (tests.test_x.A.test_a)' if first else 'fine')\n"
+            "sys.exit(1 if first else 0)\n")
+
+    def lock_script(self, calls):
+        script = self.tmp / "lock.py"
+        script.write_text(
+            "import subprocess, sys\n"
+            f"log = open({json.dumps(str(calls))}, 'a', encoding='utf-8')\n"
+            "log.write('acquire\\n'); log.flush()\n"
+            "code = subprocess.call(sys.argv[1:])\n"
+            "log.write('release\\n'); log.flush()\n"
+            "sys.exit(code)\n", encoding="utf-8", newline="\n")
+        return [sys.executable, str(script)]
+
+    def mark_red_seen(self, tid):
+        task = self.board.get_task(tid)
+        self.assertTrue(self.board.update_task(tid, expect_state=task.state, expect_version=task.version,
+                                               red_seen=True))
+
+    def verify_rows(self, tid):
+        return [r for r in self.board.list_runs(tid) if r.stage == "verify"]
+
+    def test_verify_red_then_green_is_flaky_awaiting_accept(self):
+        """Mutation caught: auto-merging a rerun green, rerunning setup, re-merging, holding one lock across runs."""
+        flag, heads, setups, locks = (self.tmp / n for n in ("flag", "heads", "setups", "locks"))
+        self.configure(**{"commands.verify": self.flaky_script(flag, heads),
+                          "commands.setup": py_cmd(f"open({json.dumps(str(setups))}, 'a', encoding='utf-8').write('x')"),
+                          "commands.heavy_lock": self.lock_script(locks)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "green_flaky")
+        self.assertEqual([r.outcome for r in result.runs], ["red", "green"])
+        self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red", "green"])
+        self.assertEqual(setups.read_text(encoding="utf-8"), "x")                       # setup once, not per run
+        self.assertEqual(len(set(heads.read_text(encoding="utf-8").split())), 1)       # the same merged tree
+        self.assertEqual(len(heads.read_text(encoding="utf-8").split()), 2)
+        self.assertEqual(locks.read_text(encoding="utf-8").split(),
+                         ["acquire", "release"] * 3)       # setup once, then one lock per verify run
+        self.assertEqual(result.commit, git(self.repo_path, "rev-parse", task_branch(tid)))
+        tr = self.finish(tid, result)
+        task = self.board.get_task(tid)
+        self.assertEqual((tr.rid, task.state, task.flaky), ("R31c", "awaiting_accept", True))
+        self.assertEqual(tr.cause, "merge=ask: flaky verify (verify_reruns)")
+        (fail,) = self.entries("FAIL")
+        self.assertTrue(fail["text"].startswith("flaky verify: "))
+        self.assertIn("verify-1.log", fail["text"])                                     # the first (red) log
+        self.assertIn("failed: test_a (tests.test_x.A.test_a)", fail["text"])
+        self.assertIn("flaky verify (verify_reruns)", " ".join(e["text"] for e in self.entries("VERDICT")))
+        self.assertEqual(self.entries("FACT"), [])
+        self.assertEqual(self.board.get_meta(f"verified:{tid}"), result.commit)         # accept can still integrate it
+
+    def test_flaky_never_writes_fact(self):
+        """Mutation caught: a FACT entry for a flaky verify (it must be a FAIL)."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.finish(tid, self.verify(tid))
+        self.assertEqual([e["kind"] for e in self.entries() if e["kind"] in ("FACT", "FAIL")], ["FAIL"])
+
+    def test_flaky_after_accept_still_awaits(self):
+        """Mutation caught: a flaky green of an accepted task going to verified (R31a instead of R31c)."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        task = self.board.get_task(tid)
+        self.board.update_task(tid, expect_state="verifying", expect_version=task.version, accepted=True)
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31c", "awaiting_accept"))
+
+    def test_verify_reruns_zero_counts_red_at_once(self):
+        """Mutation caught: a rerun although verify_reruns = 0."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h"), "verify_reruns": 0})
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "red")
+        self.assertEqual(len(self.verify_rows(tid)), 1)
+
+    def test_red_twice_is_red(self):
+        """Mutation caught: a second red run counted as flaky or as green."""
+        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "red")
+        self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["red", "red"])
+        tr = self.finish(tid, result)
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R33", "fixing"))
+
+    def test_verify_timeout_stopped_conflict_setup_failed_not_rerun(self):
+        """Mutation caught: rerunning a timeout, a stop, a conflict or a failed setup."""
+        with self.subTest("timeout"):
+            self.configure(**{"commands.verify": py_cmd("import time; time.sleep(30)"), "verify_timeout": "1s",
+                              "kill_grace": "1s"})
+            tid = self.task_with_commit("verifying", "a.txt")
+            self.assertEqual(self.verify(tid).kind, "timeout")
+            self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["timeout"])
+        with self.subTest("stopped"):
+            self.configure(**{"commands.verify": py_cmd("import time; time.sleep(30)"), "kill_grace": "1s"})
+            tid = self.task_with_commit("verifying", "b.txt")
+            stop = threading.Event()
+            threading.Timer(1.0, stop.set).start()
+            self.assertEqual(self.verify(tid, stop_event=stop).kind, "stopped")
+            self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["stopped"])
+        with self.subTest("conflict"):
+            self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+            tid = self.task_with_commit("verifying", "c.txt", "task\n")
+            self.commit_on_integration("c.txt", "integration\n")
+            self.assertEqual(self.verify(tid).kind, "conflict")
+            self.assertEqual(self.verify_rows(tid), [])
+        with self.subTest("setup_failed"):
+            self.configure(**{"commands.setup": py_cmd("import sys; sys.exit(3)")})
+            tid = self.task_with_commit("verifying", "d.txt")
+            self.assertEqual(self.verify(tid).kind, "setup_failed")
+            self.assertEqual(self.verify_rows(tid), [])
+
+    def test_verify_runs_vocabulary(self):
+        """Mutation caught: Task 14's ok/failed values left on verify rows."""
+        self.configure(**{"commands.verify": py_cmd(OK_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.verify(tid)
+        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        other = self.task_with_commit("verifying", "b.txt")
+        self.verify(other)
+        outcomes = {r.outcome for t in (tid, other) for r in self.verify_rows(t)}
+        self.assertEqual(outcomes, {"green", "red"})
+
+    def test_verify_runs_record_queued_at(self):
+        """Mutation caught: queued_at not passed to start_run for every run of the job."""
+        self.configure(**{"commands.verify": py_cmd(RED_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.verify(tid, queued_at=1234.5)
+        self.assertEqual([r.queued_at for r in self.verify_rows(tid)], [1234.5, 1234.5])
+
+    def test_red_seen_task_needs_every_run_green(self):
+        """Mutation caught: stopping at the first green of a task that has been red before (PD-72)."""
+        self.configure(**{"commands.verify": self.flaky_script(self.tmp / "f", self.tmp / "h")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.mark_red_seen(tid)
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "green_flaky")                                    # red, green
+        self.assertEqual(len(self.verify_rows(tid)), 2)
+
+    def test_red_seen_all_green_is_green(self):
+        """Mutation caught: a strict job that is never green, or one that runs only once."""
+        self.configure(**{"commands.verify": py_cmd(OK_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.mark_red_seen(tid)
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "green")
+        self.assertEqual([r.outcome for r in self.verify_rows(tid)], ["green", "green"])
+
+    def test_rerun_takes_heavy_lock_again(self):
+        """Mutation caught: one lock held across the runs of a job (the second run acquires after the release)."""
+        locks = self.tmp / "locks"
+        self.configure(**{"commands.verify": py_cmd(RED_CODE), "commands.heavy_lock": self.lock_script(locks)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.verify(tid)
+        self.assertEqual(locks.read_text(encoding="utf-8").split(), ["acquire", "release", "acquire", "release"])
+
+    def test_verify_rerun_starts_after_previous_tree_is_gone(self):
+        """Regression guard for procs.run_tree: a grandchild of run 1 is dead before run 2 starts."""
+        pids, order = self.tmp / "gc.pid", self.tmp / "order"
+        code = (
+            "import os, subprocess, sys, time\n"
+            f"order = {json.dumps(str(order))}; pids = {json.dumps(str(pids))}\n"
+            "if os.path.exists(pids):\n"
+            "    pid = int(open(pids, encoding='utf-8').read())\n"
+            "    try:\n"
+            "        os.kill(pid, 0); alive = True\n"
+            "    except OSError:\n"
+            "        alive = False\n"
+            "    open(order, 'a', encoding='utf-8').write('alive\\n' if alive else 'gone\\n')\n"
+            "    sys.exit(0)\n"
+            "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+            "open(pids, 'w', encoding='utf-8').write(str(child.pid))\n"
+            "sys.exit(1)\n")
+        self.configure(**{"commands.verify": py_cmd(code), "kill_grace": "1s"})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.verify(tid)
+        self.assertEqual(order.read_text(encoding="utf-8").split(), ["gone"])
+        logs = [r.log_path for r in self.verify_rows(tid)]
+        self.assertEqual(len(set(logs)), 2)
+
+    def test_base_update_verify_never_reruns(self):
+        """Mutation caught: the base-update verify rerunning a red run (spec §5 step 7)."""
+        counter = self.tmp / "base-runs"
+        self.configure(**{"commands.verify": py_cmd(
+            f"open({json.dumps(str(counter))}, 'a', encoding='utf-8').write('x'); import sys; sys.exit(1)")})
+        self.commit_on_integration("i.txt", "integration has work of its own\n")
+        self.commit_file("m.txt", "m\n", "main moves")
+        bu = integrate.base_update(self.repo, self.board, self.cfg, 1)
+        self.assertEqual(bu.kind, "red")
+        self.assertEqual(counter.read_text(encoding="utf-8"), "x")
+
+    def test_failed_tests_parsing(self):
+        """Mutation caught: unittest/pytest failure lines not read, more than three listed, duplicates."""
+        log = self.tmp / "v.log"
+        log.write_text("\n".join([
+            "FAIL: test_a (m.A.test_a)", "ERROR: test_b (m.A.test_b)", "FAIL: test_a (m.A.test_a)",
+            "FAILED tests/t.py::test_c - AssertionError: x", "tests/t.py::test_d FAILED [ 50%]",
+            "FAIL: test_e (m.A.test_e)"]) + "\r\n", encoding="utf-8", newline="")
+        self.assertEqual(integrate.failed_tests(log),
+                         ["test_a (m.A.test_a)", "test_b (m.A.test_b)", "tests/t.py::test_c"])
+        self.assertEqual(integrate.failed_tests(log, limit=9)[3:], ["tests/t.py::test_d", "test_e (m.A.test_e)"])
+        self.assertEqual(integrate.failed_tests(self.tmp / "missing.log"), [])
+
+    def test_red_seen_green_then_red_is_flaky(self):
+        """Mutation caught: the first run deciding a strict job (green first, red second must not be green)."""
+        flag = self.tmp / "g"
+        self.configure(**{"commands.verify": py_cmd(
+            "import os, sys\n"
+            f"first = not os.path.exists({json.dumps(str(flag))})\n"
+            f"open({json.dumps(str(flag))}, 'w', encoding='utf-8').close()\n"
+            "sys.exit(0 if first else 1)\n")})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.mark_red_seen(tid)
+        result = self.verify(tid)
+        self.assertEqual(result.kind, "green_flaky")
+        self.assertEqual([r.outcome for r in result.runs], ["green", "red"])
+
+    def test_verify_that_cannot_start_is_not_rerun(self):
+        """Mutation caught: rerunning a verify command that does not start (one setup_failed row, no second try)."""
+        self.configure(**{"commands.verify": ["artel-no-such-program-xyz"]})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.assertEqual(self.verify(tid).kind, "setup_failed")
+        self.assertEqual(len(self.verify_rows(tid)), 1)
+
+    def test_verify_rows_record_duration(self):
+        """Mutation caught: duration_ms left empty on a verify row (spec §5 step 7)."""
+        self.configure(**{"commands.verify": py_cmd(OK_CODE)})
+        tid = self.task_with_commit("verifying", "a.txt")
+        self.verify(tid)
+        (row,) = self.verify_rows(tid)
+        self.assertIsNotNone(row.duration_ms)
+
+    def test_command_text_clips_by_bytes(self):
+        """Mutation caught: clipping by characters (100 non-ASCII characters are 200+ bytes)."""
+        text = integrate._command_text(["x" * 10, "я" * 100])
+        self.assertLessEqual(len(text.encode("utf-8")), 100)
+        self.assertTrue(text.endswith("…"))
+        self.assertEqual(integrate._command_text(["a", "b"]), "a b")
+
+    def test_failed_tests_skips_unittest_summary_and_ansi(self):
+        """Mutation caught: 'FAILED (failures=1)' listed as a test; coloured pytest lines missed."""
+        log = self.tmp / "u.log"
+        log.write_text("FAIL: test_a (m.A.test_a)\nFAILED (failures=1)\n\x1b[31mFAILED\x1b[0m t.py::test_b - x\n",
+                       encoding="utf-8", newline="")
+        self.assertEqual(integrate.failed_tests(log), ["test_a (m.A.test_a)", "t.py::test_b"])
 
 
 if __name__ == "__main__":

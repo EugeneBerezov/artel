@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from artel import config as C, protect
+from artel.errors import GitError
 from artel.gitutil import INTEGRATION, Repo, task_branch
 from artel.protect import Entry, Hit
 from tests.helpers import RepoTestCase, git
@@ -171,6 +172,30 @@ class EntriesTest(RepoCase):
         self.assertEqual({e.path for e in protect.entries(self.repo, cfg) if e.source == "commands.verify"},
                          {"tools/check.py"})
 
+    def test_absolute_templates_dir_matches(self):
+        """Mutation caught: an absolute templates_dir becoming an entry whose components never match."""
+        cfg = self.cfg(templates_dir=str(self.repo.root / "my" / "prompts"))
+        self.assertIn(("my/prompts", False, "templates_dir"), self.sources(cfg))
+        self.branch_with(1, {"my/prompts/review.md": "t\n"})
+        self.assertEqual(protect.hits(self.repo, cfg, task_branch(1)), [Hit("my/prompts/review.md", "templates_dir")])
+
+    def test_absolute_path_case_insensitive(self):
+        """Mutation caught: dropping casefold from the repository-root prefix of an absolute argument."""
+        self.on_integration("tools/check.py")
+        shouted = str(self.repo.root).upper() + "/tools/check.py"
+        cfg = self.cfg(**{"commands.verify": [sys.executable, shouted]})
+        self.assertIn(("tools/check.py", True, "commands.verify"), self.sources(cfg))
+
+    def test_dot_components_ignored(self):
+        """Mutation caught: `./scripts/./verify.sh` escaping an entry `scripts/verify.sh`."""
+        self.assertTrue(protect.matches("./scripts/./verify.sh", entry("scripts/verify.sh")))
+
+    def test_dotdot_outside_repo_ignored(self):
+        """Mutation caught: `../x/verify.sh` (outside the repository) becoming an entry."""
+        self.on_integration("x/verify.sh")
+        cfg = self.cfg(**{"commands.verify": [sys.executable, "../x/verify.sh", "a/../../x/verify.sh"]})
+        self.assertFalse({e for e in self.sources(cfg) if e[2] == "commands.verify"})
+
     def test_entries_are_sorted_and_deduplicated(self):
         """Mutation caught: duplicates (one path hit twice) or an unstable order."""
         cfg = self.cfg(protected_paths='["b", "a", "a"]')
@@ -193,9 +218,33 @@ class HitsTest(RepoCase):
         self.on_integration("theirs.txt")
         self.assertEqual(protect.changed_paths(self.repo, task_branch(1)), ["mine.txt"])
 
-    def test_changed_paths_of_a_missing_branch_is_empty(self):
-        """Mutation caught: a git failure raising out of plan_stage."""
-        self.assertEqual(protect.changed_paths(self.repo, "artel/999"), [])
+    def test_git_error_counts_as_protected_hit(self):
+        """Mutation caught: fail-open (a git failure leaving the task unprotected)."""
+        self.assertEqual(protect.hits(self.repo, self.cfg(), "artel/999"),
+                         [Hit("<git error>", "protected_paths", "git failed while looking for protected paths")])
+        with self.assertRaises(GitError):
+            protect.changed_paths(self.repo, "artel/999")
+
+    def test_is_blob_kinds_and_fail_closed(self):
+        """Mutation caught: a submodule path read as a git error (every task protected), a directory read as a
+        file, or a git failure read as 'not a file' (fail open)."""
+        self.on_integration("dir/f.txt")
+        path = self.tmp / "gl"
+        git(self.repo_path, "worktree", "add", "-q", "-b", "gitlink", str(path), INTEGRATION)
+        git(path, "update-index", "--add", "--cacheinfo", f"160000,{'1' * 40},vendor/lib")
+        git(path, "commit", "-q", "-m", "gitlink")
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        self.assertTrue(protect._is_blob(self.repo, "gitlink", "dir/f.txt"))
+        self.assertFalse(protect._is_blob(self.repo, "gitlink", "dir"))
+        self.assertFalse(protect._is_blob(self.repo, "gitlink", "vendor/lib"))
+        self.assertFalse(protect._is_blob(self.repo, "gitlink", "missing.txt"))
+        with self.assertRaises(GitError):
+            protect._is_blob(self.repo, "no-such-branch", "dir/f.txt")
+
+    def test_changed_paths_sorted(self):
+        """Mutation caught: an unsorted list (a summary whose order changes between runs)."""
+        self.branch_with(1, {"z.txt": "z\n", "a.txt": "a\n", "m/n.txt": "m\n"})
+        self.assertEqual(protect.changed_paths(self.repo, task_branch(1)), ["a.txt", "m/n.txt", "z.txt"])
 
     def test_hits_empty_when_setting_empty_and_no_commands(self):
         """Mutation caught: a built-in entry surviving an empty setting."""
