@@ -75,7 +75,12 @@ def _list_from(raw: object, key: str) -> list[str]:
         text = raw.strip()
         if text.startswith("["):
             return _str_items(_toml_array(text, key), key)
-        return [part.strip() for part in text.split(",") if part.strip()]
+        parts = [part.strip() for part in text.split(",")]
+        if key.startswith("profiles.") and text and not all(parts):
+            # `--tools,,--disallowedTools` would silently lose the empty value `--tools` takes
+            raise UsageError(f"{key}: an empty item cannot be written in the comma form; "
+                             'use a TOML array, e.g. ["--tools", ""]')
+        return [part for part in parts if part]
     raise UsageError(f"{key}: expected a list of strings, got {raw!r}")
 
 

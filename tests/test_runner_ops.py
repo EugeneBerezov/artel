@@ -353,6 +353,32 @@ class SetupPauseTest(OpsCase):
         finally:
             r.shutdown()
 
+    def test_failing_setup_retry_notifies_once(self):
+        """T22 SPEC-GAP, PD-31. Mutation caught: a `resumed`/`paused` pair per failed retry (~64 messages a night);
+        the original `since` lost; a successful retry announcing nothing; a retry not journaled."""
+        flag = self.tmp / "setup-ok"
+        self.write_toml({"commands.setup": py_cmd(f"import pathlib, sys; sys.exit(0 if pathlib.Path({str(flag)!r}).exists() else 1)")})
+        r = self.failed_once()
+        try:
+            since = pauses.active(self.board)["setup_failed"].since
+            for _ in range(3):
+                self.clock.advance(15 * 60 + 1)
+                r.tick()                                              # the timed lift
+                self.assertNotIn("setup_failed", pauses.active(self.board))
+                self.drive(r, lambda: "setup_failed" in pauses.active(self.board) and not r.jobs)
+                self.assertEqual(pauses.active(self.board)["setup_failed"].since, since)
+            self.assertEqual(len(self.sent(r, "paused")), 1)
+            self.assertEqual(self.sent(r, "resumed"), [])
+            retries = [e for e in journal.recent_entries(self.board, kinds=["FAIL"]) if "setup retry failed again" in e.text]
+            self.assertEqual(len(retries), 3)
+            flag.write_text("ok", encoding="utf-8")                   # the retry now works
+            self.clock.advance(15 * 60 + 1)
+            self.drive(r, lambda: any(c["stage"] == "write" for c in self.calls()) and not r.jobs)
+            self.assertEqual([e.text for e in self.sent(r, "resumed")], ["setup_failed"])
+            self.assertEqual(len(self.sent(r, "paused")), 1)
+        finally:
+            r.shutdown()
+
     def test_setup_pause_lifts_after_setup_retry(self):
         r = self.failed_once()
         try:

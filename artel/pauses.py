@@ -13,6 +13,9 @@ PROBED_KINDS = ("limit", "agent_unavailable", "quota")      # probed when the pa
 TOKEN_FREE_KINDS = ("limit", "quota", "agent_unavailable")  # verify and integration continue under these only
 
 _KEY = "pauses"
+_PROBE_TIMES = "probe_times"
+_LAST_PROBE = "last_probe"
+PROBE_WINDOW = 24 * 3600.0         # probes are counted within this long (limit_probes, PD-55)
 _LEGACY_KEYS = ("pause_reason", "pause_detail", "pause_until")
 
 
@@ -75,9 +78,10 @@ def active(board) -> dict[str, Pause]:
 
 
 def add(board, kind: str, detail: str, *, now: float, until: float | None = None,
-        setting: str | None = None) -> bool:
+        setting: str | None = None, since: float | None = None) -> bool:
     """True when the kind is newly added (the caller notifies `paused`). On an active kind the cause is appended
-    (a cause with the same detail and setting is replaced); `since` and `exhausted` stay (PD-54)."""
+    (a cause with the same detail and setting is replaced); `since` and `exhausted` stay (PD-54). `since` is for
+    the one caller that re-adds a kind it lifted only to retry (an outage that goes on keeps its start)."""
     _check_kind(kind)
     cause = {"detail": detail, "setting": setting, "until": until}
     with board.tx():
@@ -85,7 +89,7 @@ def add(board, kind: str, detail: str, *, now: float, until: float | None = None
         record = records.get(kind)
         new = record is None
         if new:
-            record = records[kind] = {"since": now, "causes": [], "exhausted": False}
+            record = records[kind] = {"since": now if since is None else since, "causes": [], "exhausted": False}
         record["causes"] = [c for c in record["causes"]
                             if (c["detail"], c.get("setting")) != (detail, setting)] + [cause]
         _store(board, records)
@@ -129,6 +133,24 @@ def resume(board, *, force: bool) -> tuple[list[str], str | None]:
             board.set_meta("unavailable_streak", json.dumps({"signature": "", "count": 0}))
     error = f"pause {left[0]} ends by itself; use resume --force" if left else None
     return removed, error
+
+
+def probe_times(board, *, now: float) -> list[tuple[float, str]]:
+    """[ts, kind] of every probe within 24 h, across all kinds (PD-54): kept when a pause is removed, so a pause
+    added again soon after another does not get a fresh allowance."""
+    raw = board.get_meta(_PROBE_TIMES)
+    try:
+        pairs = [(float(ts), str(kind)) for ts, kind in (json.loads(raw) if raw else [])]
+    except (ValueError, TypeError):
+        pairs = []   # an unreadable record counts nothing; the next probe rewrites it
+    return [(ts, kind) for ts, kind in pairs if ts > now - PROBE_WINDOW]
+
+
+def record_probe(board, *, now: float, kind: str, outcome: str) -> None:
+    with board.tx():
+        pairs = probe_times(board, now=now) + [(now, kind)]
+        board.set_meta(_PROBE_TIMES, json.dumps([[ts, k] for ts, k in pairs]))
+        board.set_meta(_LAST_PROBE, json.dumps({"at": now, "kind": kind, "outcome": outcome}))
 
 
 def blocks_agents(board) -> bool:

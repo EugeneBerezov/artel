@@ -693,3 +693,30 @@ class CommandTest(RepoTestCase):
         for argv in (("explain",), ("set", "max_agents"), ("explain", "nope"), ("set", "max_agents", "x")):
             with self.assertRaises(UsageError, msg=str(argv)):
                 self.run_cmd(*argv)
+
+
+class ProfileListTest(RepoTestCase):
+    """Task 35 (T44 review minors): an empty item survives the TOML array form and is refused in the comma form."""
+    def load(self, env):
+        return C.load_config(Repo.discover(self.repo_path), env=env)
+
+    def test_comma_profile_empty_item_rejected(self):
+        """Mutation caught: the comma form silently dropping the empty value `--tools` takes."""
+        with self.assertRaises(UsageError) as ctx:
+            self.load({"ARTEL_PROFILES_PROBE": "--tools,,--max-turns,1"})
+        self.assertIn("profiles.probe", str(ctx.exception))
+        self.assertIn("TOML array", str(ctx.exception))
+
+    def test_comma_list_trailing_comma_still_ok(self):
+        """Mutation caught: the new check applied to every list setting."""
+        cfg = self.load({"ARTEL_SLOT_KEEP": "node_modules,dist,"})
+        self.assertEqual(cfg["slot_keep"], ["node_modules", "dist"])
+
+    def test_toml_array_keeps_empty_string(self):
+        """Mutation caught: `_toml_array` or `set_value` filtering `""` out of the list."""
+        cfg = self.load({"ARTEL_PROFILES_PROBE": '["--tools", ""]'})
+        self.assertEqual(cfg["profiles.probe"], ["--tools", ""])
+        path = self.repo_path / "artel.toml"
+        path.write_text("", encoding="utf-8", newline="\n")
+        C.set_value(path, "profiles.probe", '["--tools", ""]')
+        self.assertEqual(self.load({})["profiles.probe"], ["--tools", ""])

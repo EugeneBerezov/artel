@@ -64,11 +64,14 @@ def record_call(fake_dir: Path, record: dict, key: str) -> int:
         return counts[key]
 
 
+PROBE_ACTIONS = [{"assistant": {"input_tokens": 1, "output_tokens": 1}}, {"result": {"summary": "OK"}}]
+
+
 def pick_actions(scenario: dict, task: str, stage: str, n: int) -> list:
     for key in (f"{task}:{stage}#{n}", f"{task}:{stage}", stage, "*"):
         if key in scenario:
             return scenario[key]
-    return DEFAULT_ACTIONS
+    return PROBE_ACTIONS if stage == "probe" else DEFAULT_ACTIONS
 
 
 def run_git(*args: str) -> None:
@@ -91,7 +94,7 @@ def main() -> int:
     prompt = sys.stdin.read()
     fake_dir = Path(os.environ["ARTEL_FAKE_DIR"])
     task = os.environ.get("ARTEL_TASK", "")
-    stage = os.environ.get("ARTEL_STAGE", "")
+    stage = os.environ.get("ARTEL_STAGE", "") or "probe"   # no stage: the limit probe (PD-55), scenario key "probe"
     argv = sys.argv[1:]
     model = argv[argv.index("--model") + 1] if "--model" in argv and argv.index("--model") + 1 < len(argv) else None
     scenario_path = fake_dir / "scenario.json"
