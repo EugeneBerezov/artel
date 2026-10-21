@@ -32,7 +32,7 @@ _PROTECTED_PATHS = (
     "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock")
 _TEST_PATHS = ("tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
                "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*")
-_TEST_MARKERS = (r"^\s*@(unittest\.)?skip\b", r"\bmark\.skip\b", r"\bskip(If\(\s*True|Unless\(\s*False)\b",
+_TEST_MARKERS = (r"^\s*@(unittest\.)?skip\b", r"\bmark\.skip\b", r"\bskip([Ii]f\(\s*True|Unless\(\s*False)\b",
                  r"\b(it|test|describe)\.skip\(", r"\bx(it|describe|test)\(", r"\.only\(", r"pytest\.mark\.xfail",
                  r"\bxfail\(", r"@(unittest\.)?expectedFailure", r"os\._exit\(")
 _VERIFY_TEST_ID_REGEX = (r"^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$", r"^PASSED (\S+)")
