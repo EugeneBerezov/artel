@@ -4,11 +4,11 @@ Decisions come only from the structured result, git state and the board — neve
 """
 import json
 import threading
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
-from artel import agent_claude, cmd_agent, journal, procs, prompts, slots, templates, transitions
+from artel import agent_claude, cmd_agent, journal, procs, prompts, protect, slots, templates, transitions
 from artel.agent_claude import RateLimit, StreamParser, validate_result
 from artel.board import Task
 from artel.errors import ArtelError
@@ -34,19 +34,24 @@ def diff_lines(repo, task_id: int) -> int:
     return total
 
 
-def choose_model(cfg, task: Task, stage: str, diff: int) -> tuple[str, str]:
+def choose_model(cfg, task: Task, stage: str, diff: int, *, protected: Sequence[protect.Hit] = ()
+                 ) -> tuple[str, str]:
     if stage == "attack":
         return cfg["models.strong"], "attack stage always uses models.strong"
     if stage in ("write", "fix"):
         return cfg["models.write"], "models.write"
     if stage == "vet":
         return cfg["models.review"], "vet uses models.review"                       # PD-32
+    if closure_round(task, stage):
+        return cfg["models.review"], "closure check (models.review)"                # PD-67: a fix is checked cheaply
     if task.strong:
         return cfg["models.strong"], "task --strong"
     if task.attack:
         return cfg["models.strong"], "task --attack"
     if task.risky:
         return cfg["models.strong"], "task risky (vet)"                             # PD-37
+    if protected:                                                                   # PD-47, PD-67
+        return cfg["models.strong"], f"touches protected path {protected[0].path} ({protected[0].source})"
     if diff > cfg["models.strong_diff_lines"]:
         return cfg["models.strong"], f"diff {diff} lines > strong_diff_lines {cfg['models.strong_diff_lines']}"
     return cfg["models.review"], "models.review"
@@ -126,7 +131,9 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
     stage = STATE_TO_STAGE.get(task.state)
     if stage not in SUPPORTED_STAGES:
         raise ArtelError(f"task {task.id} in state {task.state} has no supported stage")
-    model, model_reason = choose_model(cfg, task, stage, diff_lines(repo, task.id) if stage == "review" else 0)
+    guarded = protect.hits(repo, cfg, task_branch(task.id)) if stage == "review" else []
+    model, model_reason = choose_model(cfg, task, stage, diff_lines(repo, task.id) if stage == "review" else 0,
+                                       protected=guarded)
     conflict_paths: tuple[str, ...] = ()
     try:   # any failure from the first slot command on must leave the slot (a half-started merge included)
         if branchless(task, stage, repo.branch_exists(task_branch(task.id))):

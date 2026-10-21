@@ -470,6 +470,93 @@ class IntegrateTaskTest(IntegrateCase):
         self.assertEqual(git(self.repo_path, "rev-parse", INTEGRATION), before)
         self.assertEqual(self.board.get_task(tid).state, "verified")
 
+    def test_green_verify_touching_protected_goes_awaiting_accept(self):
+        """Mutation caught: the protected check skipped on green (a CI-config change merging on its own)."""
+        tid = self.task_with_commit("verifying", ".claude/settings.json", "{}\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31b", "awaiting_accept"))
+        verdict = [e["text"] for e in self.entries("VERDICT") if e["text"].startswith("verify green")][0]
+        self.assertIn(".claude/settings.json", verdict)
+        self.assertIn("merge=ask: touches protected path(s)", verdict)
+        self.assertIn("protected_paths", verdict)
+
+    def test_protected_awaiting_accept_event_names_path(self):
+        """Mutation caught: the reason journaled apart from the transition (the notification would only say
+        `merge=ask`, not why)."""
+        tid = self.task_with_commit("verifying", "CLAUDE.md", "rules\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.to_state, "awaiting_accept")
+        self.assertEqual(tr.cause, "merge=ask: touches protected path(s) CLAUDE.md (protected_paths)")
+
+    def test_accepted_protected_task_goes_verified(self):
+        """Mutation caught: a loop accept -> re-verify -> awaiting_accept (PD-36) for a protected path."""
+        tid = self.task_with_commit("verifying", "CLAUDE.md", "rules\n")
+        self.finish(tid, self.verify(tid))
+        self.assertEqual(self.board.get_task(tid).state, "awaiting_accept")
+        T.apply(self.board, tid, "accept", T.Limits.from_cfg(self.board.get_task(tid), self.cfg))
+        self.commit_on_integration("b.txt")
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "reverify")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31a", "verified"))
+        self.assertEqual(integrate.integrate_task(self.repo, self.board, self.cfg, tid), "done")
+
+    def test_unprotected_change_auto_merges(self):
+        """Mutation caught: forcing merge=ask for every task."""
+        tid = self.task_with_commit("verifying", "src/app.py", "x\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31a", "verified"))
+        self.assertNotIn("protected", " ".join(e["text"] for e in self.entries("VERDICT")))
+
+    def test_protected_hit_uses_verified_sha(self):
+        """Mutation caught: checking the branch tip instead of the verified commit (PD-45): a commit made after
+        verify is not what was verified, and integrate refuses it anyway."""
+        tid = self.task_with_commit("verifying", "src/app.py", "x\n")
+        result = self.verify(tid)
+        path = self.temp_worktree(task_branch(tid))
+        self.commit_file("CLAUDE.md", "late\n", "late edit", cwd=path)
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        tr = self.finish(tid, result)
+        self.assertEqual((tr.rid, self.board.get_task(tid).state), ("R31a", "verified"))
+
+    def test_two_sources_are_both_named(self):
+        """Mutation caught: only the first hit's source named (N14: the user must know every lever)."""
+        self.commit_on_integration("tools/check.py", "import sys\nsys.exit(0)\n")
+        self.configure(**{"commands.verify": [sys.executable, "tools/check.py"]})
+        tid = self.task_with_commit("verifying", "tools/check.py", "import sys\nsys.exit(0)  # c\n")
+        path = self.temp_worktree(task_branch(tid))
+        self.commit_file("CLAUDE.md", "rules\n", "claude", cwd=path)
+        git(self.repo_path, "worktree", "remove", "--force", str(path))
+        tr = self.finish(tid, self.verify(tid))
+        self.assertIn("commands.verify, protected_paths", tr.cause)
+        self.assertIn("CLAUDE.md, tools/check.py", tr.cause)
+
+    def test_accepted_task_cause_does_not_claim_a_forced_ask(self):
+        """Mutation caught: the forced-ask text on R31a, where the task moves to verified."""
+        tid = self.task_with_commit("verifying", "CLAUDE.md", "rules\n")
+        self.finish(tid, self.verify(tid))
+        T.apply(self.board, tid, "accept", T.Limits.from_cfg(self.board.get_task(tid), self.cfg))
+        self.commit_on_integration("b.txt")
+        integrate.integrate_task(self.repo, self.board, self.cfg, tid)
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(tr.rid, "R31a")
+        self.assertNotIn("touches protected", tr.cause)
+
+    def test_protected_hit_with_merge_ask_keeps_plain_cause(self):
+        """Mutation caught: the protected reason replacing the cause of a task that was `merge = ask` anyway."""
+        self.configure(merge="ask")
+        tid = self.task_with_commit("verifying", "CLAUDE.md", "rules\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual((tr.to_state, tr.cause), ("awaiting_accept", "merge=ask"))
+
+    def test_derived_verify_script_protected(self):
+        """Mutation caught: a change to the list-form verify script merging on its own (source named)."""
+        self.commit_on_integration("tools/check.py", "import sys\nsys.exit(0)\n")
+        self.configure(**{"commands.verify": [sys.executable, "tools/check.py"]})
+        tid = self.task_with_commit("verifying", "tools/check.py", "import sys\nsys.exit(0)  # changed\n")
+        tr = self.finish(tid, self.verify(tid))
+        self.assertEqual(self.board.get_task(tid).state, "awaiting_accept")
+        self.assertIn("(commands.verify)", tr.cause)
+
     def test_accept_then_integration_moved_reverifies_then_done(self):
         """PD-36: merge=ask; the accept survives a re-verify; no second awaiting_accept."""
         self.configure(merge="ask")

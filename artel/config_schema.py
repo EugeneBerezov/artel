@@ -160,10 +160,10 @@ SETTINGS: tuple[Setting, ...] = (
        "A path matches case-insensitively on `/`-separated names. An entry without an inner `/` (a trailing `/`"
        " is allowed) matches any path with a component equal to it (`CLAUDE.md` matches `docs/CLAUDE.md`,"
        " `.claude/` matches `.claude/settings.json`); an entry with an inner `/` is a root-anchored prefix"
-       " (`scripts/verify.sh`, `tools/ci/`). Derived entries are added to this list: templates_dir, every"
-       " commands.setup_inputs entry, and files named by list-form setup/verify commands as exact paths"
-       " (string-form commands are not parsed: list their scripts here). An empty list disables only the"
-       " entries listed here.",
+       " (`scripts/verify.sh`, `tools/ci/`). templates_dir is matched like an entry of this list. Derived"
+       " entries are added as exact paths: every commands.setup_inputs entry and files named by list-form"
+       " setup/verify commands (string-form commands are not parsed: list their scripts here). An empty list"
+       " disables this list and templates_dir; the derived entries stay.",
        cost="A strong-model review for tasks that touch them."),
     _s("test_paths", "str_list", list(_TEST_PATHS), "Paths that are tests or test configuration.",
        "Changes to these paths are checked by the test guard: a deleted test, fewer assertions or an added"

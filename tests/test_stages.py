@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from artel import agent_claude, board as B, config as C, journal, slots, stages, transitions
+from artel import agent_claude, board as B, config as C, journal, protect, slots, stages, transitions
 from artel.agent_claude import RateLimit
 from artel.gitutil import INTEGRATION, Repo
 from tests.factories import make_task
@@ -121,6 +121,40 @@ class PureTest(StagesCase):
         for stage, fields, diff, model, reason in cases:
             with self.subTest(stage=stage, fields=fields, diff=diff):
                 self.assertEqual(stages.choose_model(cfg, make_task(**fields), stage, diff), (model, reason))
+
+    def test_choose_model_protected_review_is_strong(self):
+        """Mutation caught: escalating writers/fixers, a wrong reason, or protected winning over --strong."""
+        cfg = self.cfg
+        hit = [protect.Hit("CLAUDE.md", "protected_paths")]
+        self.assertEqual(stages.choose_model(cfg, make_task(), "review", 0, protected=hit),
+                         (cfg["models.strong"], "touches protected path CLAUDE.md (protected_paths)"))
+        derived = [protect.Hit("tools/check.py", "commands.verify")]
+        self.assertEqual(stages.choose_model(cfg, make_task(), "review", 0, protected=derived)[1],
+                         "touches protected path tools/check.py (commands.verify)")
+        self.assertEqual(stages.choose_model(cfg, make_task(strong=True), "review", 0, protected=hit)[1], "task --strong")
+        self.assertEqual(stages.choose_model(cfg, make_task(risky=True), "review", 0, protected=hit)[1],
+                         "task risky (vet)")
+        for stage, model in (("write", cfg["models.write"]), ("fix", cfg["models.write"]),
+                             ("vet", cfg["models.review"])):
+            self.assertEqual(stages.choose_model(cfg, make_task(), stage, 0, protected=hit)[0], model, stage)
+        self.assertEqual(stages.choose_model(cfg, make_task(), "review", 0), (cfg["models.review"], "models.review"))
+
+    def test_closure_kind_reviews_use_review_model(self):
+        """Mutation caught: a closure check escalated by --strong, risky, a protected hit or a big diff (PD-67)."""
+        cfg = self.cfg
+        hit = [protect.Hit("CLAUDE.md", "protected_paths")]
+        for fields in ({"round": 2}, {"review_closure": 1}, {"review_closure": 2}):
+            with self.subTest(fields=fields):
+                task = make_task(strong=True, attack=True, risky=True, **fields)
+                self.assertEqual(stages.choose_model(cfg, task, "review", 10_000, protected=hit),
+                                 (cfg["models.review"], "closure check (models.review)"))
+
+    def test_conflict_closure_review_uses_round1_range(self):
+        """Mutation caught: `review_closure == 2` widened to truthy (a stale fix_base narrows a conflict check)."""
+        stale = make_task(id=7, review_closure=1, fix_base="a" * 40)
+        self.assertEqual(stages._diff_range(stale), f"{INTEGRATION}...artel/7")
+        verify_fix = make_task(id=7, review_closure=2, fix_base="a" * 40)
+        self.assertEqual(stages._diff_range(verify_fix), f"{'a' * 40}..artel/7")
 
     def test_diff_lines(self):
         tid = self.task_in("reviewing", round=1)
@@ -264,6 +298,23 @@ class WriteTest(StagesCase):
         self.assertIn("FAIL write", verdict.text)
         self.assertIn("ready without new commits", verdict.text)
         self.assert_slot_left()
+
+    def test_write_ready_no_commits_adds_no_ask(self):
+        """Mutation caught: dropping `plan.stage == "fix"` from the ASK condition (a bogus "fixer made no change"
+        question on a task that goes back to the queue)."""
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [{"result": READY}]})
+        self.go(tid)
+        self.assertEqual(self.task(tid).state, "open")
+        self.assertEqual(self.entries(tid, "ASK"), [])
+
+    def test_write_ready_no_commits_verdict_names_max_attempts(self):
+        """Mutation caught: `ready_no_commits` dropped from _cause_verdict (the retry names no setting, §10)."""
+        tid = self.task_in("writing")
+        self.scenario({f"{tid}:write": [{"result": READY}]})
+        self.go(tid)
+        texts = [e.text for e in self.entries(tid, "VERDICT")]
+        self.assertTrue(any(t.startswith("RETRY write r") and "max_attempts" in t for t in texts), texts)
 
     def test_writer_ready_after_requeue_with_earlier_commits(self):
         # PD-35 catches: comparing HEAD with the run start, which resets finished work after a stopped run
@@ -656,6 +707,19 @@ class ReviewTest(StagesCase):
 
     def finding(self, severity="major", text="a bug", basis="work.txt:1"):
         return {"severity": severity, "text": text, "basis": basis}
+
+    def test_plan_stage_passes_protected_hits(self):
+        """Mutation caught: plan_stage not passing the hits (a branch editing CLAUDE.md reviewed on the cheap model)."""
+        tid = self.task_in("reviewing", round=1)
+        self.make_branch(tid, "CLAUDE.md", "rules\n")
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, self.task(tid), 1, base_env=self.base_env)
+        self.assertEqual(plan.model, self.cfg["models.strong"])
+        self.assertEqual(plan.model_reason, "touches protected path CLAUDE.md (protected_paths)")
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
+        other = self.review_task()   # work.txt: nothing protected
+        plan = stages.plan_stage(self.repo, self.board, self.cfg, self.task(other), 1, base_env=self.base_env)
+        self.assertEqual(plan.model, self.cfg["models.review"])
+        slots.leave_slot(self.repo, self.board, self.cfg, 1)
 
     def test_review_pass_goes_to_verifying(self):
         tid = self.review_task()
