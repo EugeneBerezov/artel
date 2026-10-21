@@ -32,9 +32,9 @@ _PROTECTED_PATHS = (
     "Pipfile.lock", "Cargo.lock", "go.sum", "Gemfile.lock", "composer.lock")
 _TEST_PATHS = ("tests/", "test/", "__tests__/", "spec/", "test_*", "*_test.*", "*.test.*", "*.spec.*",
                "conftest.py", "pytest.ini", "tox.ini", "noxfile.py", "jest.config.*", "vitest.config.*")
-_TEST_MARKERS = (r"^\s*@(unittest\.)?skip\(", r"^\s*@pytest\.mark\.skip\b(?!if)", r"\b(it|test|describe)\.skip\(",
-                 r"\bx(it|describe|test)\(", r"\.only\(", r"pytest\.mark\.xfail", r"\bxfail\(",
-                 r"@(unittest\.)?expectedFailure", r"os\._exit\(")
+_TEST_MARKERS = (r"^\s*@(unittest\.)?skip\b", r"\bmark\.skip\b", r"\bskip(If\(\s*True|Unless\(\s*False)\b",
+                 r"\b(it|test|describe)\.skip\(", r"\bx(it|describe|test)\(", r"\.only\(", r"pytest\.mark\.xfail",
+                 r"\bxfail\(", r"@(unittest\.)?expectedFailure", r"os\._exit\(")
 _VERIFY_TEST_ID_REGEX = (r"^(\w+ \([\w.]+\))(?:\r?\n[^\r\n]*)? \.\.\. ok\r?$", r"^PASSED (\S+)")
 _PROBE_PROFILE = ("-p", "--model", "{model}", "--output-format", "stream-json", "--verbose",
                   "--permission-prompts", "none", "--disable-slash-commands", "--strict-mcp-config",
@@ -173,14 +173,18 @@ SETTINGS: tuple[Setting, ...] = (
        " out; add them when the project's test configuration lives there."),
     _s("test_markers", "str_list", list(_TEST_MARKERS), "Regexes that mark an added test line as disabling a test.",
        "Each entry is a regular expression tried on every added line of a test_paths file; a match makes the"
-       " merge wait for `artel accept`. The defaults are unconditional skips, `.only(`, xfail and"
-       " `os._exit(`, not conditional skips. Every entry must compile."),
+       " merge wait for `artel accept`. The defaults are unconditional skips (`@skip` with or without"
+       " arguments, `pytest.mark.skip` also as `pytestmark`, `skipIf(True`, `skipUnless(False`), `.only(`,"
+       " xfail and `os._exit(`; conditional skips and skip calls in a test body (`skipTest`,"
+       " `pytest.skip`) are not markers. Every entry must compile."),
     _s("test_assert_markers", "str_list", ["assert", "expect("], "Substrings that count a line as an assertion.",
        "Case-sensitive. A test file that loses more lines containing one of these than it gains makes the"
        " merge wait for `artel accept`; comment lines count on neither side."),
     _s("verify_test_id_regex", "str_list", list(_VERIFY_TEST_ID_REGEX), "Regexes that read passed test ids from verify output.",
        "Each entry is a regular expression compiled with re.MULTILINE and with exactly one group: the id of a"
-       " passed test. The verify command must print test ids, e.g. `python -m unittest -v` or `pytest -rA`."
+       " passed test. The verify command must print test ids, e.g. `python -m unittest -v -b` (`-b` keeps a"
+       " test's own output from splitting its `ok` line, which would read as a test that did not pass) or"
+       " `pytest -rA`."
        " A task whose verify passes fewer of the base branch's tests makes the merge wait for `artel accept`."),
     _s("risk_signals", "str_list",
        ["deletes data", "quotas or money", "protocol or public contract", "visible to end users"],

@@ -179,7 +179,9 @@ def plan_stage(repo, board, cfg, task: Task, slot_n: int, *, base_env: Mapping[s
     guarded = []
     if stage == "review":   # protected paths first, then the test guard's hard and soft hits (PD-64)
         tip = task_branch(task.id)
-        guarded = protect.hits(repo, cfg, tip) + testguard.hard_hits(repo, cfg, tip) + testguard.soft_hits(repo, cfg, tip)
+        scanned = testguard.scan(repo, cfg, tip)   # one diff for both
+        guarded = (protect.hits(repo, cfg, tip) + testguard.hard_hits(repo, cfg, tip, scanned)
+                   + testguard.soft_hits(repo, cfg, tip, scanned))
     model, model_reason = choose_model(cfg, task, stage, diff_lines(repo, task.id) if stage == "review" else 0,
                                        protected=guarded)
     conflict_paths: tuple[str, ...] = ()
