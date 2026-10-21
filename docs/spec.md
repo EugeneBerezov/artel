@@ -219,14 +219,15 @@ removes another kind. Kinds:
 | `base_conflict` | base merge conflicts or its verify is red (§5); or `artel/integration` alone is red before a verify fix (§5 step 7) | `resume` after the human fixed `artel/integration` or the environment; `resume` forgets every cached base-check result (not the recorded test ids, §4), so the base is verified again before the board can pause on it again |
 | `integration_moved` | `artel/integration` is not at the commit the runner last left it (§5 step 8) | `resume` (the runner then records the current tip) |
 | `failures` | the failure breaker (§5 step 6) | `resume` (resets the breaker count) |
+| `repo_changed` | the repository check could not put back the shared `config` (§4 "Repository check") | `resume` after the human checked `.git/config` |
 | `limit` | usage limit reported by the agent CLI (§5 step 5) | by itself at the reset time; without one, when a probe passes (§5 step 5); after `limit_probes` failed probes, `resume` |
 | `agent_unavailable` | an `agent_unavailable` run (§5 step 6) | by itself when a probe passes (same schedule as `limit`); after `limit_probes` failed probes, `resume` |
 | `quota` | a usage window's utilization reached its `quota_stop_*`, or `night_budget_seven_day` is spent (§5 step 5) | by itself at that window's reset time (budget: 24 h after the baseline sample); a window with no future reset time is probed as for `limit`, but a probe ends a `quota` pause only when its own usage event shows every window below its `quota_stop_*`; after `limit_probes` failed probes, `resume` |
 | `disk` | free disk below `min_free_disk` | by itself when space is back |
 | `setup_failed` | `setup` failed before an agent started | by itself when `setup_inputs` change or the retry after `setup_retry` succeeds |
 
-Plain `resume` removes `manual`, `base_conflict`, `failures` and
-`integration_moved`, and a `limit`, `agent_unavailable` or `quota` pause
+Plain `resume` removes `manual`, `base_conflict`, `failures`,
+`integration_moved` and `repo_changed`, and a `limit`, `agent_unavailable` or `quota` pause
 only once its probes are spent; on any other active pause (a `quota` with a
 known reset time included) it says `pause <kind> ends by itself; use resume
 --force`. `resume --force` empties the set. Removing `failures` sets both
@@ -360,7 +361,12 @@ reported and restored, the FAIL entry names every overlapping task, and
 no stage is charged (so one person's `git remote add` cannot trip the
 failure breaker). The check itself never runs hooks or a file-system
 monitor an agent may have planted (`core.hooksPath` and `core.fsmonitor`
-are overridden for the runner's own git calls). Then the slot is left as
+are overridden for the runner's own git calls); a filter driver an agent
+defines in the config may still run during the check — hostile code is
+outside the trust model (§11). Changes that only the stage itself can
+make — its own branch, its slot's `HEAD`, tracked files a review left
+behind — always count as a failed stage, overlap or not. Config left
+unrestored pauses the runner (`repo_changed`) until `resume`. Then the slot is left as
 after every stage (§3.1 "Leaving a slot"), so every probe file is gone.
 
 **Protected paths.** A task whose diff `artel/integration...artel/<id>`
