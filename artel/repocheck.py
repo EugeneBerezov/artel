@@ -11,8 +11,11 @@ optional locks, no inherited GIT_DIR & co.), and `restore` rewrites files before
 """
 import os
 import re
+import shutil
 import tempfile
-from collections.abc import Collection, Sequence
+import threading
+import time
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -25,6 +28,9 @@ STASH = "refs/stash"
 _COMMON_DIRS = ("info", "hooks")
 _RUNNER_PREFIX = "branch.artel/"   # git writes `.remote` and `.merge` when `switch -C` makes a tracking branch
 _RUNNER_SUFFIXES = (".remote", ".merge")   # nothing else: `mergeOptions = -s ours` would change the runner's merges
+CHECK_LOCK = threading.RLock()   # take(after), compare and restore of all stages, one at a time (PD-66)
+LOCK_GRACE = 2.0                 # a new `*.lock` is stale only if it is still there this many seconds later
+_LINK = b"\0symlink\0"            # in `files`: a link under hooks/ or info/, compared and restored as a link
 _REF = re.compile(r"^ref (\S+) (moved|deleted|created)(?: \(.*\))?$")
 _FILE = re.compile(r"^file (.+) (changed|deleted|created)$")
 _IDLE = re.compile(r"^idle slot (\d+) changed$")
@@ -42,6 +48,17 @@ class Snapshot:
     modes: dict[str, int] = field(default_factory=dict)         # permission bits of the hook files
     config: dict[str, tuple[str, ...]] = field(default_factory=dict)         # parsed entries, without the runner's
     runner_config: dict[str, tuple[str, ...]] = field(default_factory=dict)  # the `branch.artel/*` entries
+    links: dict[str, str] = field(default_factory=dict)         # symbolic links among the watched files -> target
+    admin_dirs: frozenset = frozenset()                         # names under <common>/worktrees/ (live worktrees)
+
+
+@dataclass(frozen=True)
+class Restored:
+    """One item a restore put back: `removed` is what it took away, `written` what it wrote (PD-66 (x))."""
+    kind: str      # "ref" | "file"
+    name: str
+    removed: object
+    written: object
 
 
 def _g(repo: Repo, *args: str, cwd: Path | None = None, check: bool = True, input: str | None = None):
@@ -103,8 +120,10 @@ def _watched_paths(common: Path) -> list[Path]:
             paths.extend(sorted((common / base).rglob("*.lock")))
     for name in _COMMON_DIRS:
         base = common / name
-        if base.is_dir():
-            paths.extend(sorted(p for p in base.rglob("*") if p.is_file()))
+        if base.is_symlink():   # a linked directory is one entry, a link: never walked into (its files are not ours)
+            paths.append(base)
+        elif base.is_dir():
+            paths.extend(sorted(p for p in base.rglob("*") if p.is_file() or p.is_symlink()))
     return paths
 
 
@@ -118,9 +137,15 @@ def _is_config(key: str) -> bool:
 
 def _files(repo: Repo):
     common = repo.common_dir
-    files, modes, config, runner = {}, {}, {}, {}
+    files, modes, config, runner, links = {}, {}, {}, {}, {}
     for path in _watched_paths(common):
         key = path.relative_to(common).as_posix()
+        target = platform.read_link(path)
+        if target is not None:
+            links[key] = target
+            if not _is_config(key):   # a link under hooks/ or info/ is a link, not its target's content
+                files[key] = _LINK + target.encode("utf-8", "surrogateescape")
+                continue
         if key == "info/refs":   # `git gc` / `repack` rewrite it (update-server-info): git's own, runs no code
             continue
         if _is_lock(key):   # only its presence matters, and git may be writing it right now
@@ -137,7 +162,7 @@ def _files(repo: Repo):
             modes[key] = mode
         if _is_config(key):
             config[key], runner[key] = _config_entries(repo, path, data)
-    return files, modes, config, runner
+    return files, modes, config, runner, links
 
 
 def _worktrees(repo: Repo) -> tuple[str, ...]:
@@ -156,27 +181,47 @@ def _status(repo: Repo, path: Path) -> str:
 
 
 def take(repo: Repo, slot_path: Path, *, idle_slots: Sequence[tuple[int, Path]] = ()) -> Snapshot:
+    with CHECK_LOCK:
+        return _take(repo, slot_path, idle_slots)
+
+
+def _take(repo: Repo, slot_path: Path, idle_slots: Sequence[tuple[int, Path]]) -> Snapshot:
     refs, symrefs = _refs(repo)
-    files, modes, config, runner = _files(repo)
+    files, modes, config, runner, links = _files(repo)
+    admin = repo.common_dir / "worktrees"
     return Snapshot(refs=refs, files=files, worktrees=_worktrees(repo),
                     idle_status={n: _status(repo, p) for n, p in idle_slots},
                     head=_g(repo, "rev-parse", "HEAD", cwd=slot_path, check=False).stdout.strip(),
                     idle_paths={n: Path(p) for n, p in idle_slots}, symrefs=symrefs, modes=modes, config=config,
-                    runner_config=runner)
+                    runner_config=runner, links=links,
+                    admin_dirs=frozenset(p.name for p in admin.iterdir()) if admin.is_dir() else frozenset())
 
 
 def compare(before: Snapshot, after: Snapshot, *, own_branch: str | None, may_commit: bool,
             skip_refs: Collection[str], runner_changed_worktrees: bool = False,
-            repo: Repo | None = None, skip_files: Collection[str] = ()) -> list[str]:
+            repo: Repo | None = None, restored: Collection[Restored] = ()) -> list[str]:
+    with CHECK_LOCK:
+        return _compare(before, after, own_branch, may_commit, skip_refs, runner_changed_worktrees, repo, restored)
+
+
+def _compare(before: Snapshot, after: Snapshot, own_branch: str | None, may_commit: bool,
+             skip_refs: Collection[str], runner_changed_worktrees: bool, repo: Repo | None,
+             restored: Collection[Restored]) -> list[str]:
     """What the stage changed, one short text per change. `refs/heads/artel/integration` and `skip_refs` are the
     runner's. The own branch and the slot HEAD may move only for a writer adding commits (`repo` is needed to
     see that the new tip descends from the old one; without it any move counts). A symbolic ref under a watched
-    prefix is always a change. `skip_files` are files another restore of the runner rewrote meanwhile."""
+    prefix is always a change. `restored`: what another stage's restore put back meanwhile — an item is left out
+    only when this stage saw exactly the value that restore removed before and the one it wrote after."""
     ignored = {f"refs/heads/{INTEGRATION}", *skip_refs}
     own = f"refs/heads/{own_branch}" if own_branch else None
 
     def adds_commits(old: str, new: str) -> bool:
         return may_commit and repo is not None and bool(old) and bool(new) and repo.is_ancestor(old, new)
+
+    skipped = {(r.kind, r.name, _frozen(r.removed), _frozen(r.written)) for r in restored}
+
+    def put_back(kind: str, name: str, old, new) -> bool:
+        return (kind, name, _frozen(old), _frozen(new)) in skipped
 
     changes = []
     own_moved = False
@@ -185,6 +230,8 @@ def compare(before: Snapshot, after: Snapshot, *, own_branch: str | None, may_co
             continue
         old, new = before.refs.get(name), after.refs.get(name)
         if old == new and before.symrefs.get(name) == after.symrefs.get(name):
+            continue
+        if put_back("ref", name, _ref_value(before, name), _ref_value(after, name)):
             continue
         if old is None:
             changes.append(f"ref {name} created")
@@ -198,7 +245,13 @@ def compare(before: Snapshot, after: Snapshot, *, own_branch: str | None, may_co
         own_moved = own_moved or name == own
     for name in sorted(before.files.keys() | after.files.keys()):
         old, new = before.files.get(name), after.files.get(name)
-        if name in skip_files or (_is_lock(name) and old is not None):   # a lock already there is someone else's
+        if _is_lock(name):
+            ref = name[:-len(".lock")]   # the lock of a ref the runner or this stage's own git works on is live
+            if old is not None or ref in ignored or ref == own:   # a lock already there is someone else's
+                continue
+        elif name.startswith("worktrees/") and new is None and name.split("/")[1] not in after.admin_dirs:
+            continue   # `git worktree remove` took its admin directory (and the config.worktree in it) away
+        elif put_back("file", name, _file_value(before, name), _file_value(after, name)):
             continue
         if old is not None and new is not None and _is_config(name):
             same = before.config.get(name) == after.config.get(name)
@@ -221,6 +274,31 @@ def compare(before: Snapshot, after: Snapshot, *, own_branch: str | None, may_co
 
 
 # the tracked-file state of a slot (review stages) ---------------------------------------------------------------
+
+def _frozen(value):
+    return tuple(value) if isinstance(value, list) else value
+
+
+def _ref_value(snapshot: Snapshot, name: str):
+    return (snapshot.refs.get(name), snapshot.symrefs.get(name))
+
+
+def _file_value(snapshot: Snapshot, name: str):
+    if _is_config(name):
+        return snapshot.config.get(name)
+    return (snapshot.files.get(name), snapshot.modes.get(name))   # a chmod is a change too
+
+
+def restored_items(before: Snapshot, after: Snapshot, changes: Sequence[str]) -> list[Restored]:
+    """What a restore of `changes` took away (`after`'s value) and wrote (`before`'s): the runner's record."""
+    items = []
+    for change in changes:
+        if (m := _REF.match(change)):
+            items.append(Restored("ref", m.group(1), _ref_value(after, m.group(1)), _ref_value(before, m.group(1))))
+        elif (m := _FILE.match(change)) and not _is_lock(m.group(1)):
+            items.append(Restored("file", m.group(1), _file_value(after, m.group(1)), _file_value(before, m.group(1))))
+    return items
+
 
 def is_own(change: str, own_branch: str | None) -> bool:
     """A change only the stage itself can make: its own branch or its slot's HEAD."""
@@ -256,17 +334,62 @@ def restore_tracked(repo: Repo, path: Path, before: tuple[bytes, ...]) -> bool:
 
 # restore ---------------------------------------------------------------------------------------------------------
 
+def confirm_locks(repo: Repo, changes: Sequence[str]) -> list[str]:
+    """A new `*.lock` may be a live git's for a moment (PD-66 (ff)): wait LOCK_GRACE and keep as changes only the
+    locks that are still the very same file afterwards; the others were not stale."""
+    def mark(name: str):
+        try:
+            st = (repo.common_dir / name).stat()
+        except OSError:
+            return None
+        return (st.st_ino, st.st_mtime_ns)
+    locks = {}
+    for c in changes:
+        m = _FILE.match(c)
+        if m and _is_lock(m.group(1)):
+            locks[c] = m.group(1)
+    if not locks:
+        return list(changes)
+    seen = {c: mark(name) for c, name in locks.items()}
+    time.sleep(LOCK_GRACE)
+    return [c for c in changes if c not in locks or (seen[c] is not None and mark(locks[c]) == seen[c])]
+
+
 def _quarantine(quarantine: Path | None, name: str, source: Path) -> None:
-    """Copy what is on disk now to the quarantine directory. A failure is not an obstacle to the restore."""
+    """Copy what is on disk now to the quarantine directory (a link: its target text). A failure is not an
+    obstacle to the restore."""
     if quarantine is None:
         return
     try:
-        data = source.read_bytes()
+        target_text = platform.read_link(source)
+        data = _LINK + target_text.encode("utf-8", "surrogateescape") if target_text is not None else source.read_bytes()
         target = quarantine / name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(data)
     except OSError:
         pass
+
+
+def _under_link(common: Path, path: Path) -> bool:
+    """A parent of `path` inside the git directory is a symbolic link."""
+    parent = path.parent
+    while parent != common and common in parent.parents:
+        if platform.read_link(parent) is not None:
+            return True
+        parent = parent.parent
+    return False
+
+
+def _replace(source, target) -> None:
+    """os.replace, retried a few times: on Windows a reader holding the target open makes it fail."""
+    for attempt in range(4):
+        try:
+            os.replace(source, target)
+            return
+        except PermissionError:
+            if attempt == 3:
+                raise
+            time.sleep(0.1)
 
 
 def _replace_file(path: Path, data: bytes, mode: int | None) -> None:
@@ -275,7 +398,7 @@ def _replace_file(path: Path, data: bytes, mode: int | None) -> None:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
         platform.set_file_mode(Path(tmp), mode)
-        os.replace(tmp, path)
+        _replace(tmp, path)
     except BaseException:
         Path(tmp).unlink(missing_ok=True)
         raise
@@ -286,7 +409,7 @@ def _restore_config(repo: Repo, path: Path, name: str, before: Snapshot, after: 
     file. The runner's tracking entries are what they are at the end of the stage, removals included."""
     lock = path.with_name(path.name + ".lock")
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
     except OSError:
         return False
     done = False
@@ -302,7 +425,7 @@ def _restore_config(repo: Repo, path: Path, name: str, before: Snapshot, after: 
             if entry not in was:
                 key, _, value = entry.partition("\n")
                 _g(repo, "config", "-f", str(lock), "--add", key, value, check=False)
-        os.replace(lock, path)
+        _replace(lock, path)
         done = True
     finally:
         if not done:
@@ -313,25 +436,48 @@ def _restore_config(repo: Repo, path: Path, name: str, before: Snapshot, after: 
 def _restore_file(repo: Repo, name: str, how: str, before: Snapshot, after: Snapshot,
                   quarantine: Path | None) -> bool:
     path = repo.common_dir / name
-    if _is_lock(name):   # a lock that was not there before: stale, no live git of the runner owns it
+    if _is_lock(name):   # a lock that was not there before and is still there: stale (the caller waited)
         path.unlink(missing_ok=True)
         return True
-    if path.is_symlink():
-        path = path.resolve()
+    if _under_link(repo.common_dir, path):   # the agent linked the directory away: its files are not ours
+        return how == "created"              # (a file it hides is gone with the directory the link replaced)
     try:
-        if how == "created":
+        if name in _COMMON_DIRS and path.is_dir() and not path.is_symlink():
+            # a real directory where the owner had a link (or none): move it out of the way, keep a copy
+            if quarantine is not None:
+                shutil.copytree(path, quarantine / name, symlinks=True, dirs_exist_ok=True,
+                                ignore_dangling_symlinks=True)
+            shutil.rmtree(path)
+            if how == "deleted" and before.files[name].startswith(_LINK):
+                return platform.make_file_link(path, before.files[name][len(_LINK):].decode("utf-8", "surrogateescape"))
+            return True
+        if name in _COMMON_DIRS and how == "created":   # a link where a directory was: back to a directory
             _quarantine(quarantine, name, path)
             path.unlink(missing_ok=True)
+            path.mkdir(parents=True, exist_ok=True)
+            return True
+        if how == "created":
+            _quarantine(quarantine, name, path)
+            path.unlink(missing_ok=True)   # a link is removed itself, never followed
             return True
         if how == "changed":
             _quarantine(quarantine, name, path)
             if after.files.get(name) == before.files[name]:
-                platform.set_file_mode(path, before.modes.get(name))   # a mode-only change
+                if platform.read_link(path) is None:
+                    platform.set_file_mode(path, before.modes.get(name))   # a mode-only change
                 return True
         if _is_config(name):
+            # a configuration file may be a link by the owner's own doing: write through it only when it was
+            # that very link before the stage
+            if (target := before.links.get(name)) is not None and after.links.get(name) == target:
+                path = path.resolve()
             return _restore_config(repo, path, name, before, after)
+        was = before.files[name]
+        if was.startswith(_LINK):
+            path.unlink(missing_ok=True)
+            return platform.make_file_link(path, was[len(_LINK):].decode("utf-8", "surrogateescape"))
         path.parent.mkdir(parents=True, exist_ok=True)
-        _replace_file(path, before.files[name], before.modes.get(name))
+        _replace_file(path, was, before.modes.get(name))
     except OSError:
         return False
     return True
@@ -368,7 +514,19 @@ def _order(change: str) -> int:
 
 
 def restore(repo: Repo, before: Snapshot, after: Snapshot, changes: Sequence[str], *,
-            quarantine: Path | None = None, slot_keep: Sequence[str] = ()) -> list[str]:
+            quarantine: Path | None = None, slot_keep: Sequence[str] = (),
+            record: Callable[[list[Restored]], None] | None = None) -> list[str]:
+    """... `record` is told what was put back before the process-wide lock is released, so no other stage's
+    `take` can come between the restore and its record (PD-66 (x))."""
+    with CHECK_LOCK:
+        left = _restore(repo, before, after, changes, quarantine, slot_keep)
+        if record is not None:
+            record(restored_items(before, after, [c for c in changes if c not in left]))
+        return left
+
+
+def _restore(repo: Repo, before: Snapshot, after: Snapshot, changes: Sequence[str],
+             quarantine: Path | None, slot_keep: Sequence[str]) -> list[str]:
     """Put back what `changes` (from `compare`) lists: stale locks, files, refs, then idle slots; returns the
     changes that could not be restored. `refs/stash` is never set back. A file's changed version is copied to
     `quarantine` before it is rewritten. The slot HEAD is not repaired here (leaving the slot detaches it); a

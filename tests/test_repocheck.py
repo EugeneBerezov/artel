@@ -12,6 +12,9 @@ from tests.helpers import RepoTestCase, git
 class RepoCheckCase(RepoTestCase):
     def setUp(self):
         super().setUp()
+        patch = mock.patch.object(repocheck, "LOCK_GRACE", 0.05)   # the real 2 s only in the test about it
+        patch.start()
+        self.addCleanup(patch.stop)
         git(self.repo_path, "branch", INTEGRATION, "main")
         self.repo = Repo.discover(self.repo_path)
         self.board = B.open_board(self.repo.board_path)
@@ -421,18 +424,35 @@ class RoundTwoTest(RepoCheckCase):
         self.assertEqual({p.name for p in info.iterdir()}, names - {"attributes"})
 
     def test_parallel_restore_is_not_undone(self):
-        """Mutation caught: no skip_files (stage B, whose before held stage A's planted state, puts it back after
+        """Mutation caught: no `restored` (stage B, whose before held stage A's planted state, puts it back after
         A's restore removed it)."""
+        before_a = self.take()
         git(self.repo_path, "config", "core.hooksPath", "/evil-from-A")   # A's plant, present in B's before
         git(self.repo_path, "branch", "artel/evil", "main")
         before_b = self.take()
+        after_a = before_b
         git(self.repo_path, "config", "--unset", "core.hooksPath")        # A's restore
         git(self.repo_path, "branch", "-D", "artel/evil")
         after_b = self.take()
         changes = self.compare(before_b, after_b)
         self.assertEqual(sorted(changes), ["file config changed", "ref refs/heads/artel/evil deleted"])
-        self.assertEqual(self.compare(before_b, after_b, skip_refs={"refs/heads/artel/evil"},
-                                      skip_files={"config"}), [])
+        done = repocheck.restored_items(before_a, after_a, self.compare(before_a, after_a))
+        self.assertEqual(self.compare(before_b, after_b, restored=done), [])
+
+    def test_parallel_reintroduced_change_is_reported(self):
+        """Mutation caught: skipping by name (a stage that put the planted value back after the other stage's
+        restore, or planted a different one, escapes the report)."""
+        before_a = self.take()
+        git(self.repo_path, "config", "core.hooksPath", "/evil-from-A")
+        after_a = self.take()
+        done = repocheck.restored_items(before_a, after_a, self.compare(before_a, after_a))
+        before_b = before_a                                   # B started after A's restore: clean
+        git(self.repo_path, "config", "core.hooksPath", "/evil-from-B")   # B plants another value
+        after_b = self.take()
+        self.assertEqual(self.compare(before_b, after_b, restored=done), ["file config changed"])
+        git(self.repo_path, "config", "--unset", "core.hooksPath")
+        git(self.repo_path, "config", "core.hooksPath", "/evil-from-A")   # B plants the very value A planted
+        self.assertEqual(self.compare(before_b, self.take(), restored=done), ["file config changed"])
 
     def test_stash_deletion_names_the_sha(self):
         """Mutation caught: a FAIL text that cannot recover a dropped stash (`git stash store <sha>`)."""
@@ -460,6 +480,273 @@ class RoundTwoTest(RepoCheckCase):
         with mock.patch.dict(os.environ, {"GIT_DIR": str(other / ".git")}):
             snapshot = repocheck.take(self.repo, self.slot1)
         self.assertIn("refs/heads/artel/7", snapshot.refs)
+
+
+class RoundFourTest(RepoCheckCase):
+    def test_removed_worktree_config_is_not_a_change(self):
+        """Mutation caught: the `config.worktree` inside a removed worktree's admin directory reported as a
+        deleted file (a `repo_changed` pause for the runner's own `worktree remove`)."""
+        extra = self.tmp / "extra-wt"
+        git(self.repo_path, "worktree", "add", "-q", "--detach", str(extra), "main")
+        git(self.repo_path, "config", "extensions.worktreeConfig", "true")
+        git(extra, "config", "--worktree", "core.filemode", "false")
+        before = self.take()
+        git(self.repo_path, "worktree", "remove", "--force", str(extra))
+        after = self.take()
+        self.assertEqual(self.compare(before, after, runner_changed_worktrees=True), [])
+        self.assertEqual(repocheck.config_left(self.compare(before, after, runner_changed_worktrees=True)), [])
+
+    def test_hooks_override_alone_stops_planted_ref_hook(self):
+        """Mutation caught: dropping only `-c core.hooksPath=<empty dir>` from the hardened git calls: a held
+        `config.lock` keeps the planted hooksPath in the config, so only the override stops the hook."""
+        marker = self.tmp / "ran-z.txt"
+        evil = self.tmp / "evil-z"
+        RoundTwoTest.marker_hook(self, evil, "reference-transaction", marker)
+        before = self.take()
+        (self.repo.common_dir / "config.lock").write_bytes(b"")   # blocks the config restore, and stays
+        before = self.take()
+        with open(self.repo.common_dir / "config", "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(f"[core]\n\thooksPath = {evil.as_posix()}\n")
+        git(self.repo_path, "branch", "-D", "artel/8")
+        marker.unlink(missing_ok=True)   # the agent's own `branch -D` may have run the hook
+        after = self.take()
+        changes = self.compare(before, after)
+        left = repocheck.restore(self.repo, before, after, changes)
+        self.assertEqual(left, ["file config changed"])
+        self.assertFalse(marker.exists(), "the planted reference-transaction hook ran inside the restore")
+        self.assertEqual(git(self.repo_path, "rev-parse", "artel/8"), self.sha[8])
+
+    def test_restore_never_writes_through_hook_symlink(self):
+        """Mutation caught: following a link under hooks/ (the restore would write the pre-stage content into
+        the file the agent pointed the link at, e.g. a tracked script)."""
+        target = self.repo_path / "pre-commit-script"
+        target.write_text("tracked\n", encoding="utf-8", newline="\n")
+        before = self.take()
+        link = self.repo.common_dir / "hooks" / "pre-commit"
+        if not P.make_file_link(link, "../../pre-commit-script"):
+            self.skipTest("file links are not available")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(changes, ["file hooks/pre-commit created"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertEqual(P.read_link(link), None)
+        self.assertFalse(link.exists())
+        self.assertEqual(target.read_text(encoding="utf-8"), "tracked\n")
+
+    def test_changed_hook_link_is_restored_as_a_link(self):
+        """Mutation caught: a link the agent re-pointed restored by writing the old target's text into the new
+        target's file."""
+        victim = self.repo_path / "victim"
+        victim.write_text("keep\n", encoding="utf-8", newline="\n")
+        link = self.repo.common_dir / "hooks" / "post-commit"
+        if not P.make_file_link(link, "../../README"):
+            self.skipTest("file links are not available")
+        before = self.take()
+        link.unlink()
+        P.make_file_link(link, "../../victim")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(changes, ["file hooks/post-commit changed"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertEqual(P.read_link(link), "../../README")
+        self.assertEqual(victim.read_text(encoding="utf-8"), "keep\n")
+
+    def test_config_replaced_by_a_link_is_restored_as_a_file(self):
+        """Mutation caught: writing through a link the agent made out of `config` (the pre-stage content would
+        overwrite the file the link points at)."""
+        elsewhere = self.repo_path / "elsewhere.cfg"
+        elsewhere.write_text("[core]\n\thooksPath = /evil\n", encoding="utf-8", newline="\n")
+        before = self.take()
+        config = self.repo.common_dir / "config"
+        config.unlink()
+        if not P.make_file_link(config, "../elsewhere.cfg"):
+            config.write_bytes(before.files["config"])
+            self.skipTest("file links are not available")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(changes, ["file config changed"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertIsNone(P.read_link(config))
+        self.assertEqual(elsewhere.read_text(encoding="utf-8"), "[core]\n\thooksPath = /evil\n")
+        self.assertEqual(git(self.repo_path, "config", "--get", "core.hooksPath", check=False), "")
+
+    def test_config_that_was_a_link_is_written_through(self):
+        """Mutation caught: replacing the owner's own `config` link by a regular file (their link and the file it
+        names are theirs to keep)."""
+        real = self.repo.common_dir / "config"
+        moved = self.repo.common_dir / "config.real"
+        moved.write_bytes(real.read_bytes())
+        real.unlink()
+        if not P.make_file_link(real, "config.real"):
+            real.write_bytes(moved.read_bytes())
+            moved.unlink()
+            self.skipTest("file links are not available")
+        before = self.take()
+        with open(moved, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("[core]\n\thooksPath = /evil\n")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(changes, ["file config changed"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertEqual(P.read_link(real), "config.real")
+        self.assertEqual(git(self.repo_path, "config", "--get", "core.hooksPath", check=False), "")
+
+    def test_lock_of_a_runner_or_own_ref_is_not_reported(self):
+        """Mutation caught: removing the `<ref>.lock` of a branch the runner (or the stage's own git) is updating
+        right now: that update would fail."""
+        before = self.take()
+        for n in (7, 8):
+            (self.repo.common_dir / "refs" / "heads" / "artel" / f"{n}.lock").write_bytes(b"")
+        after = self.take()
+        self.assertEqual(self.compare(before, after, skip_refs={"refs/heads/artel/8"}), [])
+        self.assertEqual(self.compare(before, after, skip_refs=()),
+                         ["file refs/heads/artel/8.lock created"])
+
+    def test_a_new_lock_is_kept_as_a_change_only_if_still_there_after_the_grace(self):
+        """Mutation caught: no wait (a live git's lock of a moment is reported and deleted); a lock that went
+        away during the wait still reported (the stage would be failed for nothing)."""
+        before = self.take()
+        stale = self.repo.common_dir / "refs" / "heads" / "artel" / "8.lock"
+        gone = self.repo.common_dir / "refs" / "heads" / "artel" / "9.lock"
+        stale.write_bytes(b"")
+        gone.write_bytes(b"")
+        changes = self.compare(before, self.take())
+        self.assertEqual(len(changes), 2)
+
+        def vanish(seconds):
+            gone.unlink()
+        with mock.patch.object(repocheck.time, "sleep", side_effect=vanish) as sleep:
+            kept = repocheck.confirm_locks(self.repo, changes)
+        sleep.assert_called_once_with(repocheck.LOCK_GRACE)
+        self.assertEqual(kept, ["file refs/heads/artel/8.lock created"])
+        with mock.patch.object(repocheck.time, "sleep") as sleep:
+            self.assertEqual(repocheck.confirm_locks(self.repo, ["ref refs/heads/artel/8 moved"]),
+                             ["ref refs/heads/artel/8 moved"])
+        sleep.assert_not_called()
+
+    def test_symlinked_hooks_directory_is_never_walked_or_written_through(self):
+        """Mutation caught: following a linked `hooks/` (the restore deleted the owner's tracked scripts and
+        wrote the *.sample files into them)."""
+        import shutil
+        scripts = self.repo_path / "scripts-hooks"
+        scripts.mkdir()
+        (scripts / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+        hooks = self.repo.common_dir / "hooks"
+        before = self.take()
+        shutil.rmtree(hooks)
+        if not P.make_file_link(hooks, "../scripts-hooks"):
+            hooks.mkdir()
+            self.skipTest("file links are not available")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertIn("file hooks created", changes)
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertIsNone(P.read_link(hooks))
+        self.assertTrue(hooks.is_dir())
+        self.assertEqual((scripts / "pre-commit").read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+        self.assertEqual([p.name for p in scripts.iterdir()], ["pre-commit"])
+        self.assertEqual(self.compare(before, self.take()), [])
+
+    def test_real_directory_replacing_the_owners_hooks_link_spares_the_target(self):
+        """Mutation caught: no guard against a link parent (after the link is back, the stale `hooks/pre-commit
+        created` would delete the owner's own `scripts-hooks/pre-commit` through it)."""
+        import shutil
+        scripts = self.repo_path / "scripts-hooks"
+        scripts.mkdir()
+        (scripts / "pre-commit").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8", newline="\n")
+        hooks = self.repo.common_dir / "hooks"
+        shutil.rmtree(hooks)
+        if not P.make_file_link(hooks, "../scripts-hooks"):
+            hooks.mkdir()
+            self.skipTest("file links are not available")
+        before = self.take()
+        hooks.unlink()
+        hooks.mkdir()
+        (hooks / "pre-commit").write_text("planted\n", encoding="utf-8", newline="\n")
+        after = self.take()
+        changes = self.compare(before, after)
+        self.assertEqual(sorted(changes), ["file hooks deleted", "file hooks/pre-commit created"])
+        self.assertEqual(repocheck.restore(self.repo, before, after, changes), [])
+        self.assertEqual(P.read_link(hooks), "../scripts-hooks")
+        self.assertEqual((scripts / "pre-commit").read_text(encoding="utf-8"), "#!/bin/sh\nexit 0\n")
+
+    def test_restore_record_is_made_before_the_lock_is_released(self):
+        """Mutation caught: recording after `restore` returned (another stage's take can run in between)."""
+        before = self.take()
+        git(self.repo_path, "config", "core.hooksPath", "/evil")
+        after = self.take()
+        held = []
+        repocheck.restore(self.repo, before, after, self.compare(before, after),
+                          record=lambda items: held.append((repocheck.CHECK_LOCK._is_owned(), list(items))))
+        ((owned, items),) = held
+        self.assertTrue(owned)
+        self.assertEqual([(i.kind, i.name) for i in items], [("file", "config")])
+
+    def test_mode_change_in_another_restore_window_is_still_reported(self):
+        """Mutation caught: a `Restored` value without the mode (a `chmod -x` of the hook another stage's restore
+        had just made executable again is hidden)."""
+        hook = self.repo.common_dir / "hooks" / "pre-push"
+        hook.write_text("#!/bin/sh\n", encoding="utf-8", newline="\n")
+        P.set_file_mode(hook, 0o755)
+        a_before = self.take()
+        P.set_file_mode(hook, 0o644)
+        a_after = self.take()
+        if a_before.modes.get("hooks/pre-push") == a_after.modes.get("hooks/pre-push"):
+            self.skipTest("file modes are not available")
+        done = repocheck.restored_items(a_before, a_after, self.compare(a_before, a_after))
+        P.set_file_mode(hook, 0o755)          # A's restore
+        b_before = self.take()
+        P.set_file_mode(hook, 0o644)          # B's own chmod -x
+        b_after = self.take()
+        self.assertEqual(self.compare(b_before, b_after, restored=done), ["file hooks/pre-push changed"])
+
+    def test_checks_of_all_stages_are_serialised(self):
+        """Mutation caught: no process-wide lock (one stage's restore interleaving with another's take)."""
+        import threading
+        done = threading.Event()
+        with repocheck.CHECK_LOCK:
+            worker = threading.Thread(target=lambda: (self.take(), done.set()))
+            worker.start()
+            self.assertFalse(done.wait(0.4), "take ran while another check held the lock")
+        self.assertTrue(done.wait(30))
+        worker.join()
+
+    def test_replace_is_retried_on_permission_error(self):
+        """Mutation caught: a single os.replace (a reader holding the file on Windows fails the restore)."""
+        real = os.replace
+        calls = []
+
+        def flaky(src, dst):
+            calls.append(src)
+            if len(calls) < 3:
+                raise PermissionError("busy")
+            real(src, dst)
+        target = self.tmp / "x.txt"
+        with mock.patch.object(repocheck.os, "replace", flaky), mock.patch.object(repocheck.time, "sleep"):
+            repocheck._replace_file(target, b"data", None)
+        self.assertEqual((len(calls), target.read_bytes()), (3, b"data"))
+        calls.clear()
+        with mock.patch.object(repocheck.os, "replace", mock.Mock(side_effect=PermissionError("busy"))) as always, \
+                mock.patch.object(repocheck.time, "sleep"):
+            with self.assertRaises(PermissionError):
+                repocheck._replace_file(target, b"data", None)
+        self.assertEqual(always.call_count, 4)
+        self.assertEqual([p.name for p in self.tmp.iterdir() if p.name.startswith("x.txt.")], [])
+
+    def test_config_lock_is_opened_in_binary_mode(self):
+        """Mutation caught: no O_BINARY (Windows text mode turns the config's newlines into CRLF)."""
+        before = self.take()
+        git(self.repo_path, "config", "core.hooksPath", "/evil")
+        after = self.take()
+        flags = []
+        real = os.open
+
+        def spy(path, flag, *a, **kw):
+            flags.append(flag)
+            return real(path, flag & ~0x8000, *a, **kw)   # 0x8000 is not a flag on POSIX
+        with mock.patch.object(os, "O_BINARY", 0x8000, create=True), mock.patch.object(repocheck.os, "open", spy):
+            self.assertEqual(repocheck.restore(self.repo, before, after, self.compare(before, after)), [])
+        self.assertTrue(flags and all(f & 0x8000 for f in flags))
 
 
 class SkipWorktreeTest(RepoCheckCase):

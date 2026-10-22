@@ -92,7 +92,8 @@ class Runner:
         self.jobs: list[Job] = []
         self.activity: dict[int, float] = {}           # PD-66: when the runner last started, ended or moved a task
         self.stage_activity: dict[int, float] = {}     # ... an agent stage, setup or verify job (0: the base job)
-        self.restores: list[tuple[float, frozenset, frozenset]] = []   # (when, refs, files) the checks put back
+        self._restores_lock = threading.Lock()
+        self.restores: list[tuple[float, tuple]] = []   # (when the restore ended, repocheck.Restored items)
         self._rate_events: queue.SimpleQueue = queue.SimpleQueue()   # RateLimit events from worker threads
         self._setup_lifted_at: float = 0.0             # the last timed lift: only a stage started after it proves setup
         self._setup_outage: dict | None = None         # PD-31: the setup_failed outage a timed retry goes on with
@@ -810,9 +811,6 @@ class Runner:
         tasks |= {j.task_id for j in list(self.jobs) if j.task_id is not None}
         tasks.discard(job.task_id)
         refs = {f"refs/heads/{task_branch(t)}" for t in tasks}
-        for at, restored, _ in list(self.restores):   # a restore of another stage put these back: not ours to undo
-            if at >= started:
-                refs |= restored
         return refs
 
     def _overlapping(self, job: Job, started: float) -> set[int]:
@@ -822,8 +820,19 @@ class Runner:
         others.discard(job.task_id)
         return others
 
-    def _skip_files(self, started: float) -> set[str]:
-        return {f for at, _, files in list(self.restores) if at >= started for f in files}
+    def _restored(self, started: float) -> list:
+        """What the restores of other stages put back since `started` (compared by value, PD-66 (x))."""
+        with self._restores_lock:
+            return [item for at, items in list(self.restores) if at >= started for item in items]
+
+    def _record_restore(self, items) -> None:
+        """Stamped when the restore ended; a record older than the oldest running job can match nothing (gg)."""
+        now = self.clock()
+        oldest = min((j.started_at for j in list(self.jobs)), default=now)
+        with self._restores_lock:   # called from the worker threads of different stages
+            if items:
+                self.restores.append((now, tuple(items)))
+            self.restores[:] = [r for r in self.restores if r[0] >= oldest]
 
     def touch(self, task_id: int) -> None:
         """A request may move or delete the branch of its task: stamped right before its git effect (PD-66 N1)."""
@@ -866,9 +875,8 @@ class Runner:
             return self._overlapping(job, started)
         run = stages.run_stage(self.repo, board, self.cfg, plan, job.slot, on_start=self._on_start(board, job),
                                on_rate_limit=self.on_rate_limit, stop_event=job.stop, skip_refs=skip_refs,
-                               overlapping=overlapping, skip_files=lambda: self._skip_files(started),
-                               on_restore=lambda refs, files: self.restores.append(
-                                   (self.clock(), frozenset(refs), frozenset(files))))
+                               overlapping=overlapping, restored=lambda: self._restored(started),
+                               on_restore=self._record_restore)
         return plan, run
 
     def _verify_work(self, board: Board, job: Job, queued_at: float | None = None):
@@ -1087,10 +1095,11 @@ class Runner:
             return
         if job.kind == "stage":
             plan, run = job.result
-            tr = stages.finish_stage(self.repo, board, self.cfg, job.task_id, plan, run)
-            stuck = repocheck.config_left(run.unrestored)
-            if stuck:   # the shared config could not be put back: no later git call may run with it
-                self.pause("repo_changed", f"#{job.task_id} {plan.stage} left {'; '.join(stuck)} unrestored")
+            try:
+                tr = stages.finish_stage(self.repo, board, self.cfg, job.task_id, plan, run)
+            finally:   # the shared config could not be put back: no later git call may run with it
+                if (stuck := repocheck.config_left(run.unrestored)):
+                    self.pause("repo_changed", f"#{job.task_id} {plan.stage} left {'; '.join(stuck)} unrestored")
             detail = f"setup {run.setup}"
             # T35-2 F1: a skipped setup (inputs unchanged) got past setup too; a conflict fix's `not_run` did not
             if run.setup in ("ok", "skipped"):

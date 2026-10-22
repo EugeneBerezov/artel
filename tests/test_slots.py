@@ -108,6 +108,20 @@ class EnsureTest(SlotsCase):
         slots.prepare_slot(self.repo, self.board, self.cfg, n, 6)
         self.assertEqual(git(path, "status", "--porcelain"), "")
 
+    def test_scrub_resets_a_file_the_skip_worktree_flag_hid(self):
+        """Mutation caught: scrub resetting once, before the flags are cleared: a tracked file edited under
+        `skip-worktree` then stays edited and the next slot user starts from it (PD-66 (aa))."""
+        [n] = self.slot(1)
+        path = slots.slot_path(self.repo, self.cfg, n)
+        git(path, "update-index", "--skip-worktree", "README")
+        (path / "README").write_text("edited under the flag\n", encoding="utf-8", newline="\n")
+        self.assertEqual(git(path, "status", "--porcelain"), "")   # hidden
+        slots.leave_slot(self.repo, self.board, self.cfg, n)   # one scrub: it alone must leave the file clean
+        self.assertNotEqual((path / "README").read_text(encoding="utf-8"), "edited under the flag\n")
+        slots.prepare_slot(self.repo, self.board, self.cfg, n, 6)
+        self.assertEqual(git(path, "status", "--porcelain"), "")
+        self.assertNotIn("S README", git(path, "ls-files", "-v"))
+
     def test_slots_dir_with_dotdot_is_normalized(self):
         """Mutation caught: the unnormalized `relative_to` (`x/../.artel/slots` writes a '/x/../.artel/slots/' line
         that hides nothing; `../outside` must still write none)."""

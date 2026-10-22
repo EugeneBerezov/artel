@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 
-from artel import agent_claude, board as B, config as C, journal, procs, protect, slots, stages, testguard, transitions
+from artel import agent_claude, board as B, config as C, journal, procs, protect, repocheck, slots, stages, testguard, transitions
 from artel.agent_claude import RateLimit
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION, Repo
@@ -1182,8 +1182,11 @@ class NightGuardTest(StagesCase):
                        f"{tid}:review#4": [TURN, {"exit": 2}],                   # stage_failed (R13): counted
                        f"{tid}:review#5": [{"result": {"outcome": "pass", "summary": "ok"}}]})   # counted
         stop = threading.Event()
-        threading.Timer(1.0, stop.set).start()
-        self.go(tid, stop=stop)
+
+        def stop_soon(kind, *rest):   # one second after the AGENT started: the repository check before it is slow
+            if kind == "agent":       # on Windows, a timer from the start of the stage could fire before the spawn
+                threading.Timer(1.0, stop.set).start()
+        self.go(tid, stop=stop, on_start=stop_soon)
         self.go(tid)
         self.go(tid)
         self.assertEqual((self.task(tid).stage_runs, self.task(tid).attempts), (0, 0))
@@ -1394,15 +1397,57 @@ class RepoCheckStageTest(StagesCase):
         self.assertEqual(len(saved), 1)
         self.assertEqual(saved[0].read_bytes(), b"* text\n")
 
+    def test_restore_is_announced_with_the_values_it_removed_and_wrote(self):
+        """Mutation caught: `on_restore` never called, or called before the restore (with changes that are not
+        put back yet), or with names only."""
+        tid = self.review_task()
+        self.attributes_scenario(tid)
+        told = []
+        self.go(tid, on_restore=lambda items: told.append((list(items),
+                                                           (self.repo.common_dir / "info" / "attributes").exists())))
+        ((items, exists),) = told
+        self.assertFalse(exists)   # called after the restore ended
+        (item,) = items
+        self.assertEqual((item.kind, item.name, item.removed, item.written),
+                         ("file", "info/attributes", (b"* text\n", item.removed[1]), (None, None)))
+
+    def test_what_another_restore_put_back_is_not_reported_again(self):
+        """Mutation caught: `run_stage` not handing the runner's `restored` to `compare` (the stage that began
+        with another stage's plant in its before reports the other stage's restore as its own change)."""
+        tid = self.review_task()
+        self.attributes_scenario(tid)
+        # the scenario creates the file (None -> text); a restore record of that very transition hides it
+        attributes = self.repo.common_dir / "info" / "attributes"
+        attributes.write_bytes(b"* text\n")
+        planted = repocheck._file_value(repocheck.take(self.repo, self.slot_dir()), "info/attributes")
+        attributes.unlink()
+        gone = (None, None)
+        plan, run, tr = self.go(tid, restored=lambda: [repocheck.Restored("file", "info/attributes", planted, gone)])
+        self.assertEqual(run.repo_changes, ("file info/attributes created",))   # other direction: still reported
+        tid2 = self.review_task()
+        self.attributes_scenario(tid2)
+        plan, run, tr = self.go(tid2, restored=lambda: [repocheck.Restored("file", "info/attributes", gone, planted)])
+        self.assertEqual(run.repo_changes, ())
+
+    def test_a_lock_that_goes_away_meanwhile_does_not_fail_the_stage(self):
+        """Mutation caught: `confirm_locks` not called (a lock of a live git, seen at the end of the stage, fails
+        a stage that did nothing wrong)."""
+        tid = self.review_task()
+        lock = self.repo.common_dir / "refs" / "heads" / "artel" / "77.lock"
+        self.scenario({f"{tid}:review": [{"write": [str(lock), ""]}, self.PASS]})
+        with mock.patch.object(repocheck.time, "sleep", side_effect=lambda s: lock.unlink(missing_ok=True) if s == repocheck.LOCK_GRACE else None):
+            plan, run, tr = self.go(tid)
+        self.assertEqual((run.repo_changes, tr.event), ((), "review_clear"))
+
     def test_overlapping_stages_report_without_failing(self):
         """Mutation caught: charging a stage for a change another stage or setup may have made (owner decision):
         it is reported and restored, the stage keeps its own outcome."""
         tid = self.review_task()
         self.attributes_scenario(tid)
         plan, run, tr = self.go(tid, overlapping=lambda: [tid, 99])
-        self.assertEqual((tr, run.overlapped), (None, (99,)))   # requeued: nothing judged, nothing charged
+        self.assertEqual((tr.event, run.overlapped), ("review_clear", (99,)))   # the verdict stands, once
         self.assertEqual((self.task(tid).state, self.task(tid).attempts, self.task(tid).stage_runs),
-                         ("reviewing", 0, 0))
+                         ("verifying", 0, 1))
         self.assertFalse((self.repo.common_dir / "info" / "attributes").exists())
         (fail,) = self.fail_entries(tid)
         self.assertIn("others running meanwhile: #99; stage not failed", fail)
@@ -1440,9 +1485,9 @@ class RepoCheckStageTest(StagesCase):
         plan, run, tr = self.go(tid, overlapping=lambda: [99])
         self.assertEqual((tr.event, run.own_change), ("stage_failed", True))
 
-    def test_shared_change_with_overlap_closes_nothing(self):
-        """Mutation caught: a review that touched the shared repository (overlap: not charged) still closing the
-        finding it names."""
+    def test_overlapped_shared_change_judges_review_once(self):
+        """Mutation caught: a requeue for an overlapped shared change (the reviewer's tool sets the key on every
+        run: an endless loop of review runs); the verdict is recorded, with one FAIL entry as the report."""
         tid = self.review_task(round=2)
         found = journal.add_finding(self.board, task_id=tid, stage="review", round=1, severity="major",
                                     text="open one", basis="", author="agent:review")
@@ -1450,9 +1495,12 @@ class RepoCheckStageTest(StagesCase):
         self.scenario({f"{tid}:review": [{"write": [target, "x\n"]},
                                          {"result": {"outcome": "pass", "summary": "fine", "closed": [found]}}]})
         plan, run, tr = self.go(tid, overlapping=lambda: [99])
-        self.assertIsNone(tr)
-        self.assertEqual([e.id for e in journal.open_findings(self.board, tid)], [found])
-        self.assertIn("others running meanwhile: #99; stage not failed", self.fail_entries(tid)[0])
+        self.assertIsNotNone(tr)
+        self.assertNotEqual(tr.event, "requeue")
+        self.assertEqual(self.task(tid).stage_runs, 1)
+        self.assertEqual(journal.open_findings(self.board, tid), [])   # the verdict stands
+        (fail,) = self.fail_entries(tid)
+        self.assertIn("others running meanwhile: #99; stage not failed", fail)
 
     def test_base_job_is_named_in_the_overlap_text(self):
         """Mutation caught: the base job shown as `#0`."""

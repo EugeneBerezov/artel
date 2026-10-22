@@ -253,6 +253,7 @@ def scrub(repo: Repo, path: Path, keep: Sequence[str]) -> None:
         git_hardened(repo, "merge", "--abort", cwd=path, check=False)
     git_hardened(repo, "reset", "--hard", cwd=path)
     clear_index_flags(repo, path)   # after the reset: an unmerged entry is gone by then
+    git_hardened(repo, "reset", "--hard", cwd=path)   # a file the flags hid is now compared with HEAD (PD-66 (aa))
     excludes = [arg for pattern in keep for arg in ("-e", pattern)]
     git_hardened(repo, "clean", "-ffdx", *excludes, cwd=path)
 

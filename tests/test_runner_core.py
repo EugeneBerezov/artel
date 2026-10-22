@@ -6,10 +6,11 @@ import subprocess
 import sys
 import threading
 import time
+import types
 import unittest
 from unittest import mock
 
-from artel import events, integrate, journal, pauses, platform, procs, prompts, requests, slots, stages, transitions
+from artel import events, integrate, journal, pauses, platform, procs, prompts, repocheck, requests, slots, stages, transitions
 from artel import runner as runner_module
 from artel.errors import ArtelError
 from artel.gitutil import INTEGRATION
@@ -234,17 +235,76 @@ class RunnerCoreTest(E2ECase):
         r.stage_activity = {7: 9.0, 9: 5.0, 10: 1.0}
         self.assertEqual(r._overlapping(own, 4.0), {0, 8, 9})
 
-    def test_restores_of_other_stages_are_skipped(self):
-        """Mutation caught: refs and files another stage's restore put back being compared (and put back again)."""
+    def test_restores_of_other_stages_are_handed_to_stages_by_time(self):
+        """Mutation caught: records older than the stage's start handed over (a stale restore would hide a real
+        change), or none handed over."""
         r = self.runner(max_agents=1)
+        new = repocheck.Restored("file", "config", ("a",), ("b",))
+        old = repocheck.Restored("file", "hooks/old", b"x", None)
+        r.restores = [(5.0, (new,)), (1.0, (old,))]
+        self.assertEqual(r._restored(4.0), [new])
+
+    def test_restore_record_is_stamped_when_the_restore_ends_and_pruned(self):
+        """Mutation caught: stamping at the stage's start (a stage that began meanwhile misses it); records never
+        pruned (the list grows for the life of the runner)."""
+        r = self.runner(max_agents=1)
+        ticks = iter([10.0, 20.0, 30.0])
+        r.clock = lambda: next(ticks)
+        item = repocheck.Restored("ref", "refs/heads/artel/9", ("a", None), ("b", None))
+        r._record_restore([item])
+        self.assertEqual(r.restores, [(10.0, (item,))])
         gone = threading.Thread(target=lambda: None)
         gone.start()
         gone.join()
-        own = Job("stage", 7, 1, gone, threading.Event())
-        r.restores = [(5.0, frozenset({"refs/heads/artel/evil"}), frozenset({"config"})),
-                      (1.0, frozenset({"refs/heads/artel/old"}), frozenset({"hooks/old"}))]
-        self.assertEqual(r._skip_refs(own, 4.0), {"refs/heads/artel/evil"})
-        self.assertEqual(r._skip_files(4.0), {"config"})
+        r.jobs = [Job("stage", 7, 1, gone, threading.Event(), started_at=15.0)]   # the oldest running job began at 15
+        r._record_restore([item])   # the clock says 20
+        self.assertEqual(r.restores, [(20.0, (item,))])   # the record of 10 can match no running stage
+        r._record_restore([])
+        self.assertEqual(len(r.restores), 1)
+
+    def test_runner_passes_restore_record_to_stages(self):
+        """Mutation caught: `restored` / `on_restore` not wired (a restore of one stage is then reported by the
+        next as a fresh change, or never recorded); `restored` ignoring the stage's own start time."""
+        tid = self.add_task("A")
+        r = self.runner(max_agents=1)
+        ticks = iter(range(100, 1000, 10))
+        r.clock = lambda: float(next(ticks))
+        gone = threading.Thread(target=lambda: None)
+        gone.start()
+        gone.join()
+        job = Job("stage", tid, 1, gone, threading.Event(), started_at=0.0)
+        item = repocheck.Restored("file", "config", ("a",), ("b",))
+        seen = {}
+
+        def fake_run_stage(repo, board, cfg, plan, slot, **kw):
+            seen.update(kw)
+            kw["on_restore"]([item])      # this stage's restore ended: stamped now
+            return "run"
+        r.restores = [(50.0, (repocheck.Restored("file", "hooks/early", b"x", None),))]   # before the stage began
+        with mock.patch.object(stages, "plan_stage", return_value="plan"), \
+                mock.patch.object(stages, "run_stage", fake_run_stage):
+            self.assertEqual(r._stage_work(self.board, job), ("plan", "run"))
+        self.assertEqual(seen["restored"](), [item])   # the old record predates this stage; its own is its own
+        self.assertEqual(len(r.restores), 1)
+        self.assertEqual(r.restores[0][1], (item,))
+
+    def test_pause_is_set_even_when_finish_stage_raises(self):
+        """Mutation caught: the `repo_changed` pause set after `finish_stage` (an exception there leaves the
+        planted config in place and the runner going)."""
+        tid = self.add_task("A")
+        r = self.runner(max_agents=1)
+        r.board = runner_module.open_board(self.repo.board_path)
+        self.addCleanup(r.board.close)
+        gone = threading.Thread(target=lambda: None)
+        gone.start()
+        gone.join()
+        plan = types.SimpleNamespace(stage="review")
+        run = types.SimpleNamespace(unrestored=("file config changed",))
+        job = Job("stage", tid, 1, gone, threading.Event(), result=(plan, run), finished=True)
+        with mock.patch.object(stages, "finish_stage", side_effect=RuntimeError("boom")):
+            with self.assertRaises(RuntimeError):
+                r._finish(job)
+        self.assertIn("repo_changed", pauses.active(r.board))
 
     def test_unrestored_config_pauses(self):
         """Mutation caught: a config the check could not put back leaving the runner going (the planted
