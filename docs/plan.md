@@ -192,7 +192,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 | W4 | **10 Slots** · 11 Templates + agent commands · 12 Prompts · 29 T7 test hardening |
 | W5 | **13 Stages** · **14 Verify + integrate** |
 | W6 | **15 Runner core + happy-path e2e (vertical slice; reopened)** · 30 Owner defaults + revision settings → **34 Agent shim isolation** · 42 T4 test port |
-| W7 | 16 Live slice check (controller) · 17 Notifier · 18 Requests + pause set → **31 Transitions follow-up** · **43 T34 follow-up** · **44 Tool allowlists** |
+| W7 | 16 Live slice check (controller) · 17 Notifier · 18 Requests + pause set → **31 Transitions follow-up** · **43 T34 follow-up** · **44 Tool allowlists** · 45 OOM mark for tests |
 | W8 | **22 Runner operations: pause wiring, disk, stop, reconcile** · **32 Protected paths** · **33 Counters and rows** |
 | W9 | **35 Limits, quota windows, probes** · **36 Verify rerun and flaky** |
 | W10 | **37 Runner guards: breaker, agent_unavailable, stage_runs cap, run records** |
@@ -253,7 +253,7 @@ Tasks within a wave touch disjoint files and may run in parallel (≤ 4 agents);
 8. `CLAUDE.md` split (the s1/s2 loop moves to `docs/dev-process.md`; artel's agents must not read "integrate", "push" or `dev/board.py` instructions). Done 2026-10-20.
 There is no `artel status` in phase 1 (Task 19 is phase 2); the controller reads the board as its owner, `sudo -u artel-dog sqlite3 -readonly /home/artel-dog/artel-dogfood/.git/artel/board.db` (a WAL board needs write access to its `-shm` file), with: `select id, state, attempts, resets, stage_runs, flaky, running, round from tasks order by id;` · `select key, value from meta where key in ('pauses', 'failure_streak', 'unavailable_streak', 'usage_windows', 'probe_times', 'runner_pid', 'integration_tip', 'base_verify', 'shadow_queue');` · `select id, command, task_id, error from requests where applied_at is null;` · `select id, kind, task_id, substr(text, 1, 120) from entries order by id desc limit 20;`. Phase-2 tasks then enter that artel as `artel add` tasks (title = plan heading; body = "implement docs/plan.md 'Task N: <heading>'"; `--area` = its Files; dependencies = its `**Depends on:**` plus the shared-file order below — areas prevent overlap, not order; `--strong` for RISKY). The controller merges finished work from the clone's `artel/integration` into `main` after its own review and CI (step 7), and marks the task `done` on this board.
 
-**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/__init__.py` (1 → 18), `.github/workflows/ci.yml` (2 → 28 → 18), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15 → 18, then read-only), `artel/config_schema.py` (5 → 30 → 44 → 27; Task 30 adds every setting the revised spec needs — later tasks must not add settings without a plan change; Task 27 only touches `defaults_markdown()` columns), `artel/config.py` (5 → 30 → 35), `artel/cmd_config.py` (5 → 11), `artel/cmd_agent.py` (11 → 30 → 34), `tests/test_cmd_agent.py` (11 → 30 → 34 → 43), `artel/platform.py` (3 → 34 → 43), `tests/test_platform.py` (3 → 34 → 43), `artel/slots.py` and `tests/test_slots.py` (10 → 30 → 39), `artel/procs.py` and `tests/test_procs.py` (8 → 39), `artel/agent_claude.py` (9 → 35 → 39), `tests/test_agent_claude.py` (9 → 44 → 35 → 39), `tests/test_runner_ops.py` (22 → 41 → 27), `artel/events.py` (15 only), `artel/pauses.py` (18 → 22 → 35 → 37), `tests/test_pauses.py` (18 → 22 → 35 → 37), `artel/runner.py` (15 → 18 → 22 → 35 → 37 → 40 → 26 → 41 → 27), `artel/stages.py` (13 → 15 → 31 → 32 → 37 → 38 → 39 → 21 → 26), `tests/test_stages.py` (13 → 31 → 32 → 37 → 38 → 39), `artel/prompts.py` (12 → 31 → 39 → 21), `artel/transitions.py` (7 → 29 → 31 → 33), `tests/test_transitions.py` (7 → 29 → 31 → 33), `artel/templates.py` and `artel/builtin_templates/*.md` (11 → 31 → 39), `artel/integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `tests/test_integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `artel/board.py` (4 → 31 → 33), `tests/test_board.py` (4 → 42 → 31 → 33), `artel/pick.py` (6 → 37), `artel/journal.py` (6 → 40), `artel/requests.py` (18 → 41), `tests/test_runner_core.py` (15 → 18 → 31), `tests/fake_agent.py` (9 → 35 → 37 → 39 → 26), `tests/test_runner_e2e.py` (24 → 21), `artel/cmd_human.py` (19 → 26 → 41). The wave table and the `**Depends on:**` lines respect this.
+**Shared files — strictly sequential across tasks:** `tests/helpers.py` (1 → 3), `tests/__init__.py` (1 → 18 → 45), `.github/workflows/ci.yml` (2 → 28 → 18), `tests/test_portability_lint.py` (2 → 3 → 28), `tests/test_zipapp.py` (2 → 28 → 11), `tests/e2e.py` (15 → 18, then read-only), `artel/config_schema.py` (5 → 30 → 44 → 27; Task 30 adds every setting the revised spec needs — later tasks must not add settings without a plan change; Task 27 only touches `defaults_markdown()` columns), `artel/config.py` (5 → 30 → 35), `artel/cmd_config.py` (5 → 11), `artel/cmd_agent.py` (11 → 30 → 34), `tests/test_cmd_agent.py` (11 → 30 → 34 → 43), `artel/platform.py` (3 → 34 → 43 → 45), `tests/test_platform.py` (3 → 34 → 43 → 45), `artel/slots.py` and `tests/test_slots.py` (10 → 30 → 39), `artel/procs.py` and `tests/test_procs.py` (8 → 39), `artel/agent_claude.py` (9 → 35 → 39), `tests/test_agent_claude.py` (9 → 44 → 35 → 39), `tests/test_runner_ops.py` (22 → 41 → 27), `artel/events.py` (15 only), `artel/pauses.py` (18 → 22 → 35 → 37), `tests/test_pauses.py` (18 → 22 → 35 → 37), `artel/runner.py` (15 → 18 → 22 → 35 → 37 → 40 → 26 → 41 → 27), `artel/stages.py` (13 → 15 → 31 → 32 → 37 → 38 → 39 → 21 → 26), `tests/test_stages.py` (13 → 31 → 32 → 37 → 38 → 39), `artel/prompts.py` (12 → 31 → 39 → 21), `artel/transitions.py` (7 → 29 → 31 → 33), `tests/test_transitions.py` (7 → 29 → 31 → 33), `artel/templates.py` and `artel/builtin_templates/*.md` (11 → 31 → 39), `artel/integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `tests/test_integrate.py` (14 → 18 → 32 → 36 → 38 → 40), `artel/board.py` (4 → 31 → 33), `tests/test_board.py` (4 → 42 → 31 → 33), `artel/pick.py` (6 → 37), `artel/journal.py` (6 → 40), `artel/requests.py` (18 → 41), `tests/test_runner_core.py` (15 → 18 → 31), `tests/fake_agent.py` (9 → 35 → 37 → 39 → 26), `tests/test_runner_e2e.py` (24 → 21), `artel/cmd_human.py` (19 → 26 → 41). The wave table and the `**Depends on:**` lines respect this.
 
 ---
 
@@ -3806,6 +3806,28 @@ Not in this task (recorded): the agent's environment is inherited whole (`Runner
 - [ ] Steps: failing tests → implement → whole suite → commit `T41: artel workers N (runtime worker count)`.
 
 **Acceptance:** the worker count changes without a restart and without killing work; `stats` (Task 20) can group runs by it.
+
+---
+
+### Task 45: The test suite is the first victim of an out-of-memory killer (Linux)
+
+**Depends on:** Task 18, Task 43
+
+**Spec:** §12 (portability), §13 (tests must be able to fail). Source: the owner, 2026-10-22, after the shared VPS hung for ~4 h out of memory: parallel test runs of several projects filled RAM and swap. The machine now runs `earlyoom`, which kills the process with the highest `oom_score`; every test process must outrank the owner's sessions and services. Controller-added 2026-10-22.
+
+**Context for the writer:** Global Constraints + this task. On Linux `oom_score_adj` is inherited by children at fork, and any process may raise its own value without privileges (lowering it needs `CAP_SYS_RESOURCE`).
+
+**Files:**
+- Modify: `artel/platform.py` (`prefer_oom_kill`), `tests/test_platform.py`, `tests/__init__.py` (one call). Nothing else.
+
+**Interfaces:**
+- `platform.prefer_oom_kill() -> bool`: on Linux opens `/proc/self/oom_score_adj` with mode `"r+"` and `encoding="utf-8"`, writes `1000`, returns `True`; any `OSError` → `False`, silently. On every other platform returns `False` without touching the file system. Never creates a file (no `"w"`, no `Path.write_text`).
+- `tests/__init__.py` calls it once, so the test process and every child it starts (fake agents, git, the runner under test) are marked.
+- Tests (pairs, as the Global Constraints require for OS-conditional skips): `test_prefer_oom_kill_sets_1000_on_linux` (a `[sys.executable, …]` child calls it and prints its own `oom_score_adj` — catches not writing, or writing to another path); `test_prefer_oom_kill_is_false_off_linux` (the pair: off Linux returns `False` — catches raising); `test_prefer_oom_kill_never_creates_file` (with the path pointed at a missing file in a temp dir through a module-level constant the test patches — catches mode `"w"` or `write_text`); `test_prefer_oom_kill_swallows_oserror` (path is a directory — catches an unguarded `open`); `test_suite_process_marked` (Linux: the test process itself reads `1000` — catches removing the call from `tests/__init__.py`).
+
+- [ ] Steps: failing tests → implement → whole suite (with the CI encoding env) → commit `T45: mark the test suite as the first OOM victim`.
+
+**Acceptance:** on Linux every test process has `oom_score_adj` 1000; Windows and macOS CI stay green; the portability lint passes (the only `sys.platform` branch is in `artel/platform.py`).
 
 ---
 
