@@ -690,6 +690,83 @@ class OsPairTest(unittest.TestCase):
         self.assertEqual(P.group_of(proc), proc.pid)
 
 
+class OomMarkTest(unittest.TestCase):
+    """Task 45: the test suite is the first victim of an out-of-memory killer."""
+
+    def _adj_file(self, text):
+        d = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(d.cleanup)
+        path = Path(d.name) / "oom_score_adj"
+        path.write_text(text, encoding="utf-8")
+        return path
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_prefer_oom_kill_sets_1000_on_linux(self):
+        """Mutation caught: not writing, or writing another path or value."""
+        code = ("from artel import platform as P\n"
+                "try:\n"
+                "    with open(P.OOM_SCORE_ADJ, 'r+', encoding='utf-8') as f:\n        f.write('0')\n"
+                "except OSError:\n    print('cannot-lower')\n    raise SystemExit(0)\n"
+                "before = P.OOM_SCORE_ADJ.read_text(encoding='utf-8').strip()\n"
+                "ok = P.prefer_oom_kill()\n"
+                "print(before, ok, P.OOM_SCORE_ADJ.read_text(encoding='utf-8').strip())\n")
+        out = subprocess.run(py_cmd(code), capture_output=True, encoding="utf-8",
+                             env=subprocess_env(), check=True).stdout.split()
+        if out == ["cannot-lower"]:
+            self.skipTest("this process may not lower oom_score_adj (oom_score_adj_min or read-only /proc)")
+        self.assertEqual(out, ["0", "True", "1000"])
+
+    @unittest.skipIf(sys.platform.startswith("linux"), "not Linux")
+    def test_prefer_oom_kill_is_false_off_linux(self):
+        """Pair of the Linux test. Mutation caught: raising off Linux."""
+        self.assertFalse(P.prefer_oom_kill())
+
+    def test_is_linux_matches_the_platform(self):
+        """Mutation caught: IS_LINUX hard-wired (the other tests patch it)."""
+        self.assertEqual(P.IS_LINUX, sys.platform.startswith("linux"))
+
+    def test_prefer_oom_kill_writes_only_on_linux(self):
+        """Mutation caught: dropping the platform check (another OS gets a write)."""
+        path = self._adj_file("0")
+        with mock.patch.object(P, "OOM_SCORE_ADJ", path), mock.patch.object(P, "IS_LINUX", False):
+            self.assertFalse(P.prefer_oom_kill())
+        self.assertEqual(path.read_text(encoding="utf-8"), "0")
+
+    def test_prefer_oom_kill_writes_1000(self):
+        """Mutation caught: a wrong value, or the result ignored."""
+        path = self._adj_file("0")
+        with mock.patch.object(P, "OOM_SCORE_ADJ", path), mock.patch.object(P, "IS_LINUX", True):
+            self.assertTrue(P.prefer_oom_kill())
+        self.assertEqual(path.read_text(encoding="utf-8"), "1000")
+
+    def test_prefer_oom_kill_never_creates_file(self):
+        """Mutation caught: mode "w" or Path.write_text, which create a missing file."""
+        path = self._adj_file("0").with_name("missing")
+        with mock.patch.object(P, "OOM_SCORE_ADJ", path), mock.patch.object(P, "IS_LINUX", True):
+            self.assertFalse(P.prefer_oom_kill())
+        self.assertFalse(path.exists())
+
+    def test_prefer_oom_kill_swallows_oserror(self):
+        """Mutation caught: an unguarded open (a directory raises IsADirectoryError/PermissionError)."""
+        path = self._adj_file("0").parent
+        with mock.patch.object(P, "OOM_SCORE_ADJ", path), mock.patch.object(P, "IS_LINUX", True):
+            self.assertFalse(P.prefer_oom_kill())
+
+    @unittest.skipUnless(sys.platform.startswith("linux"), "Linux only")
+    def test_suite_process_marked(self):
+        """Mutation caught: removing the call from tests/__init__.py; a child not inheriting the mark."""
+        self.assertEqual(P.OOM_SCORE_ADJ.read_text(encoding="utf-8").strip(), "1000")
+        code = "import sys\nsys.stdout.write(open(sys.argv[1], encoding='utf-8').read())"
+        out = subprocess.run(py_cmd(code) + [str(P.OOM_SCORE_ADJ)], capture_output=True,
+                             encoding="utf-8", check=True).stdout.strip()
+        self.assertEqual(out, "1000")
+
+    @unittest.skipIf(sys.platform.startswith("linux"), "not Linux")
+    def test_suite_process_mark_is_noop_off_linux(self):
+        """Pair of the Linux suite test: importing the tests package did not fail and wrote nothing."""
+        self.assertFalse(P.OOM_SCORE_ADJ.exists())
+
+
 class MiscTest(unittest.TestCase):
     def test_which_finds_python(self):
         self.assertTrue(P.which(Path(sys.executable).name) or P.which("python3") or P.which("python"))
