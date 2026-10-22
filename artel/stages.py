@@ -314,12 +314,14 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
               idle_slots: Callable[[], Sequence[tuple[int, Path]]] = lambda: (),
               extra_time: Callable[[], float] = lambda: 0.0,
               overlapping: Callable[[], Collection[int]] = lambda: (),
-              skip_files: Callable[[], Collection[str]] = lambda: (),
-              on_restore: Callable[[Collection[str], Collection[str]], None] = lambda refs, files: None) -> StageRun:
+              restored: Callable[[], Collection[repocheck.Restored]] = lambda: (),
+              on_restore: Callable[[Sequence[repocheck.Restored]], None] = lambda items: None) -> StageRun:
     """`skip_refs`, `runner_changed_worktrees`, `idle_slots` and `extra_time` are the runner's view of the stage
     (PD-66, PD-74): the task branches it moved itself, whether it added or removed a slot, the slots without a
     job, and the time the agent spent waiting for the machine-wide lock. `overlapping`: the other tasks whose agent
-    stage or setup ran during this one (owner 2026-10-21: a shared change is then reported, not charged)."""
+    stage or setup ran during this one (owner 2026-10-21: a shared change is then reported, not charged).
+    `restored`: what the restores of other stages put back since this one started; `on_restore` is told what this
+    stage's restore put back, when it ended (PD-66 (x))."""
     parser = StreamParser()
     setup = "skipped"
     outcome, exit_code, timed_out, stopped = "error", None, False, False
@@ -371,16 +373,15 @@ def run_stage(repo, board, cfg, plan: StagePlan, slot_n: int, *, on_start: OnSta
             after = repocheck.take(repo, path, idle_slots=idle_slots())
             repo_changes = repocheck.compare(before, after, own_branch=own, may_commit=plan.stage in ("write", "fix"),
                                              skip_refs=skip_refs(), runner_changed_worktrees=runner_changed_worktrees(),
-                                             repo=repo, skip_files=skip_files())
+                                             repo=repo, restored=restored())
+            repo_changes = repocheck.confirm_locks(repo, repo_changes)   # a lock that went away was not stale
             if repo_changes:
                 overlapped = sorted(set(overlapping()) - {plan.task_id})
                 own_change = any(repocheck.is_own(c, own) for c in repo_changes)
-                on_restore({m.group(1) for c in repo_changes if (m := re.match(r"ref (\S+) ", c))},
-                           {m.group(1) for c in repo_changes if (m := re.match(r"file (.+) (?:changed|deleted|created)$", c))})
                 stamp = time.strftime("%Y%m%dT%H%M%S", time.gmtime())
                 quarantine = repo.artel_dir / "repo-changes" / f"{stamp}-T{plan.task_id}-{plan.stage}"
                 unrestored = repocheck.restore(repo, before, after, repo_changes, quarantine=quarantine,
-                                               slot_keep=cfg["slot_keep"])
+                                               slot_keep=cfg["slot_keep"], record=on_restore)
                 for change in repo_changes:   # an idle slot the restore cleaned may have lost its setup output
                     m = re.match(r"idle slot (\d+) changed$", change)
                     if m:
@@ -441,8 +442,6 @@ def classify(task: Task, stage: str, run: StageRun, board) -> str:
         return "agent_unavailable"
     if run.blamed:                                                                  # PD-66: the verdict is void
         return "stage_failed"
-    if run.repo_changes and stage in ("review", "attack"):   # an overlapped shared change: nothing is charged and
-        return "requeue"                                      # nothing judged (it would close findings), run again
     if run.setup in ("failed", "timeout"):
         return "setup_failed"
     if run.timed_out or run.result is None:
@@ -495,7 +494,7 @@ def record_stage(board, task: Task, plan: StagePlan, run: StageRun, event: str) 
     common = dict(task_id=task.id, stage=plan.stage, round=plan.round)
     result = run.result
     judged = (result is not None and result["outcome"] in ("pass", "findings")   # not for fail / ask results
-              and not run.void)                                                   # a void stage closes nothing
+              and not run.blamed)                                                 # a blamed stage closes nothing
     if judged and plan.stage == "review":
         open_ids = {e.id for e in journal.open_findings(board, task.id)}
         for finding_id in dict.fromkeys(result["closed"]):

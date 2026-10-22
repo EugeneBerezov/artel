@@ -579,6 +579,25 @@ def is_link_or_junction(path: Path) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
+def read_link(path: Path) -> str | None:
+    """The target text of a symbolic link, or None when `path` is not one."""
+    try:
+        return os.readlink(path)
+    except OSError:
+        return None
+
+
+def make_file_link(link: Path, target: str) -> bool:
+    """A symbolic link to a file, where the platform allows it without privilege; False otherwise (Windows)."""
+    if IS_WINDOWS:
+        return False
+    try:
+        os.symlink(target, link)
+    except OSError:
+        return False
+    return True
+
+
 def link_dir(link: Path, target: Path) -> None:
     """Make `link` a directory link to `target` (symlink; a junction on Windows, which needs no privilege).
     Only tests and tools use it: artel itself never creates links."""
