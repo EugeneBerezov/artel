@@ -344,7 +344,16 @@ during the stage are left out (their agents move them), and so is
 `artel/integration` (the runner checks it itself, §5 step 8), and so is every ref the runner
 itself moved or deleted during the stage (integrating, rejecting,
 accepting, resetting or deleting another task's branch) and every slot it
-added; the runner keeps that record. For a vet,
+added; the runner keeps that record. The **shared files** — `config`,
+every `config.worktree`, `info/` and `hooks/` (contents, modes, links) —
+are not compared per stage but against **one baseline the runner keeps**
+(owner, 2026-10-22): taken when the runner starts, again after `resume`
+(a person's accepted change becomes the baseline), and updated by the
+runner's own writes to those files. Right before an agent starts and
+right after it ends, the runner compares the shared files with the
+baseline under one lock and puts every difference back to the baseline;
+a difference found before the agent started is reported and charged to
+no one. This way parallel stages never restore one another's state. For a vet,
 attack or review stage the task's own branch and the slot's `HEAD` must
 also be unchanged; a writer or fixer may only add commits to its own
 branch. On any other change the runner restores what it can (refs set back
