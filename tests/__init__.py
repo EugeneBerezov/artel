@@ -9,3 +9,8 @@ for key, value in {
     os.environ[key] = value
 for key in ("ARTEL_TASK", "ARTEL_STAGE", "ARTEL_ROUND", "ARTEL_CHILD"):
     os.environ.pop(key, None)
+
+# The suite and every child it starts are the first OOM victims on a shared machine (Task 45).
+from artel import platform as _platform  # noqa: E402
+
+_platform.prefer_oom_kill()

@@ -17,6 +17,7 @@ from typing import Callable, Mapping, Sequence
 from artel.errors import ArtelError
 
 IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
 
 if IS_WINDOWS:
     import ctypes
@@ -24,6 +25,27 @@ if IS_WINDOWS:
     from ctypes import wintypes
 else:
     import fcntl
+
+
+# Linux: a process may raise its own oom_score_adj without privileges, and
+# children inherit it at fork (Task 45).
+OOM_SCORE_ADJ = Path("/proc/self/oom_score_adj")
+
+
+def prefer_oom_kill() -> bool:
+    """Make this process and its future children the first victims of an OOM killer.
+
+    Linux only; elsewhere, and on any OSError, returns False. Opens with "r+" so a
+    missing file is never created.
+    """
+    if not IS_LINUX:
+        return False
+    try:
+        with open(OOM_SCORE_ADJ, "r+", encoding="utf-8") as f:
+            f.write("1000")
+    except OSError:
+        return False
+    return True
 
 
 class FileLock:
